@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/panel", "crates/probe"]   # each following crate adds itself here, in its own task
+members = ["crates/core", "crates/panel", "crates/probe", "crates/ssh"]   # each following crate adds itself here, in its own task
 
 [workspace.package]
 version = "0.1.0"

@@ -984,6 +984,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "remnawave-healthcheck-ssh"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "remnawave-healthcheck-core",
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
