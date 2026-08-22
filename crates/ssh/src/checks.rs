@@ -196,6 +196,14 @@ fn cert(
     now: DateTime<Utc>,
     warn_days: i64,
 ) -> CheckResult {
+    if facts.cert.trim().is_empty() {
+        return CheckResult::new(
+            key,
+            title,
+            Severity::Ok,
+            "no TLS endpoint known for this node",
+        );
+    }
     let Some(raw) = facts.cert.split("notAfter=").nth(1) else {
         return CheckResult::new(key, title, Severity::Warn, "certificate not parsed");
     };
@@ -580,6 +588,16 @@ mod tests {
         let renewal = r.iter().find(|c| c.key.ends_with(":cert-renewal")).unwrap();
         assert_eq!(renewal.severity, Severity::Ok);
         assert!(renewal.detail.contains("managed elsewhere"));
+    }
+
+    #[test]
+    fn a_node_without_a_tls_endpoint_is_silent_about_its_certificate() {
+        let mut facts = healthy_facts();
+        facts.cert = String::new();
+        let r = check_host(&node(), &facts, now(), 14, 7);
+        let cert = r.iter().find(|c| c.key.ends_with(":cert")).unwrap();
+        assert_eq!(cert.severity, Severity::Ok);
+        assert!(cert.detail.contains("no TLS endpoint"));
     }
 
     #[test]
