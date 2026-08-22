@@ -75,16 +75,31 @@ fn icon(value: &str) -> &'static str {
     }
 }
 
+/// Escape the characters Telegram's HTML parse mode treats specially. A check's own key or detail
+/// text (xray stderr, a panel status message) is not under our control and can contain a stray
+/// `<` or bare `&`; unescaped, that either mangles the message's markup or makes Telegram reject
+/// the whole alert with "can't parse entities" — losing the alert entirely, which is exactly the
+/// failure this tool exists to prevent.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Telegram message body, HTML parse mode.
 pub fn format_message(d: &Diff, run_url: Option<&str>) -> String {
     let mut lines = vec!["<b>Healthcheck</b>".to_string()];
     for (k, v) in &d.new {
-        lines.push(format!("{} NEW  {k} — {v}", icon(v)));
+        let mark = icon(v);
+        let (k, v) = (escape_html(k), escape_html(v));
+        lines.push(format!("{mark} NEW  {k} — {v}"));
     }
     for (k, v) in &d.escalated {
+        let (k, v) = (escape_html(k), escape_html(v));
         lines.push(format!("\u{1F53A} WORSE  {k} — {v}"));
     }
     for (k, v) in &d.recovered {
+        let (k, v) = (escape_html(k), escape_html(v));
         lines.push(format!("\u{1F7E2} RECOVERED  {k} — {v}"));
     }
     if let Some(url) = run_url {
@@ -159,6 +174,29 @@ mod tests {
         assert_eq!(from_json(&to_json(&s)), s);
         assert!(from_json("not json at all").is_empty());
         assert!(from_json("[1,2,3]").is_empty());
+    }
+
+    #[test]
+    fn html_special_characters_in_keys_and_values_are_escaped() {
+        let d = Diff {
+            new: ps(&[("channel:<script>", "FAIL: xray said <boom> & died")]),
+            recovered: ps(&[]),
+            escalated: ps(&[]),
+        };
+        let msg = format_message(&d, None);
+        assert!(
+            !msg.contains("<script>"),
+            "raw tag must not reach Telegram: {msg}"
+        );
+        assert!(
+            !msg.contains("<boom>"),
+            "raw tag must not reach Telegram: {msg}"
+        );
+        assert!(msg.contains("&lt;script&gt;"));
+        assert!(msg.contains("&lt;boom&gt;"));
+        assert!(msg.contains("&amp;"));
+        // The template's own markup must still work as HTML.
+        assert!(msg.contains("<b>Healthcheck</b>"));
     }
 
     #[test]
