@@ -10,20 +10,31 @@ fn is_proxy(outbound: &Value) -> bool {
     )
 }
 
-/// One rendered config: its remark and the first proxy outbound in it.
-///
+/// One config the subscription rendered: its remark and the first proxy outbound in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderedConfig {
+    /// The only thing that joins a served config to the channel the panel resolved
+    /// (see `map::build_snapshot`).
+    pub remark: String,
+    /// Handed to the probe verbatim.
+    pub outbound: Value,
+}
+
 /// The remark is mandatory, because the remark is the only thing that joins a served config to
-/// the channel the panel resolved (see `map::build_snapshot`). A config without one cannot be
-/// attributed to a channel, and guessing — keying by an outbound's `tag`, say — would attach some
-/// other channel's outbound to it and probe a channel with evidence that is not its own.
-fn config_entry(config: &Value) -> Option<(String, Value)> {
+/// the channel the panel resolved. A config without one cannot be attributed to a channel, and
+/// guessing — keying by an outbound's `tag`, say — would attach some other channel's outbound to
+/// it and probe a channel with evidence that is not its own.
+fn config_entry(config: &Value) -> Option<RenderedConfig> {
     let remark = config.get("remarks").and_then(Value::as_str)?.to_string();
     let outbound = config
         .get("outbounds")?
         .as_array()?
         .iter()
         .find(|o| is_proxy(o))?;
-    Some((remark, outbound.clone()))
+    Some(RenderedConfig {
+        remark,
+        outbound: outbound.clone(),
+    })
 }
 
 /// Ready-made client outbounds keyed by their remark, taken from the panel's JSON subscription.
@@ -35,7 +46,7 @@ fn config_entry(config: &Value) -> Option<(String, Value)> {
 /// Anything else yields nothing rather than a guess: `subscription:coverage` then reports every
 /// resolved channel as not served, which is loud and points straight at the subscription — far
 /// better than silently pairing channels with the wrong outbounds.
-pub fn parse(raw: &str) -> anyhow::Result<Vec<(String, Value)>> {
+pub fn parse(raw: &str) -> anyhow::Result<Vec<RenderedConfig>> {
     let value: Value = serde_json::from_str(raw)?;
 
     if let Some(configs) = value.as_array() {
@@ -61,9 +72,9 @@ mod tests {
         .to_string();
         let got = parse(&raw).unwrap();
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0].0, "alpha direct");
-        assert_eq!(got[0].1["protocol"], "vless");
-        assert_eq!(got[1].0, "beta cdn");
+        assert_eq!(got[0].remark, "alpha direct");
+        assert_eq!(got[0].outbound["protocol"], "vless");
+        assert_eq!(got[1].remark, "beta cdn");
     }
 
     #[test]
@@ -77,10 +88,10 @@ mod tests {
         let got = parse(&raw).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(
-            got[0].0, "alpha direct",
+            got[0].remark, "alpha direct",
             "keyed by remark, as the join needs"
         );
-        assert_eq!(got[0].1["protocol"], "vless");
+        assert_eq!(got[0].outbound["protocol"], "vless");
     }
 
     #[test]

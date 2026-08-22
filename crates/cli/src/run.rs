@@ -23,7 +23,7 @@ pub async fn run(args: Args) -> Result<Outcome> {
         .context("subscription URL has no shortUuid in its last path segment")?;
     let client = PanelClient::new(&args.panel_url, &args.api_token)?;
     let snapshot = match client
-        .snapshot(&short_uuid)
+        .snapshot(short_uuid)
         .await
         .context("reading the panel")
     {

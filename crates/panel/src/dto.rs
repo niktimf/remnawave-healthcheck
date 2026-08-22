@@ -1,5 +1,5 @@
 use remnawave_healthcheck_core::model::{Node, Profile};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 
 /// Every panel response is wrapped in `{"response": ...}`.
 #[derive(Deserialize)]
@@ -90,35 +90,36 @@ struct RawSubscriptionData {
     resolved_proxy_configs: Vec<ResolvedDto>,
 }
 
+/// Unwrap one panel response. The envelope is the same for every endpoint; only what sits
+/// inside it differs.
+fn parse_response<T: DeserializeOwned>(body: &str) -> anyhow::Result<T> {
+    Ok(serde_json::from_str::<Envelope<T>>(body)?.response)
+}
+
 pub fn parse_nodes(body: &str) -> anyhow::Result<Vec<NodeDto>> {
-    Ok(serde_json::from_str::<Envelope<Vec<NodeDto>>>(body)?.response)
+    parse_response(body)
 }
 
 pub fn parse_profiles(body: &str) -> anyhow::Result<Vec<ProfileDto>> {
-    Ok(serde_json::from_str::<Envelope<ProfilesData>>(body)?
-        .response
-        .config_profiles)
+    Ok(parse_response::<ProfilesData>(body)?.config_profiles)
 }
 
 pub fn parse_resolved(body: &str) -> anyhow::Result<Vec<ResolvedDto>> {
-    Ok(serde_json::from_str::<Envelope<RawSubscriptionData>>(body)?
-        .response
-        .resolved_proxy_configs)
+    Ok(parse_response::<RawSubscriptionData>(body)?.resolved_proxy_configs)
 }
 
 impl From<&NodeDto> for Node {
     fn from(dto: &NodeDto) -> Self {
         let profile = dto.config_profile.as_ref();
+        // Taken once: a node with no profile simply has no active inbounds, and both lists below
+        // are then empty for the same reason.
+        let inbounds: &[InboundDto] = profile.map_or(&[], |p| p.active_inbounds.as_slice());
         Node {
             name: dto.name.clone(),
             address: dto.address.clone(),
             profile_uuid: profile.and_then(|p| p.active_config_profile_uuid.clone()),
-            inbound_tags: profile
-                .map(|p| p.active_inbounds.iter().map(|i| i.tag.clone()).collect())
-                .unwrap_or_default(),
-            inbound_ports: profile
-                .map(|p| p.active_inbounds.iter().filter_map(|i| i.port).collect())
-                .unwrap_or_default(),
+            inbound_tags: inbounds.iter().map(|i| i.tag.clone()).collect(),
+            inbound_ports: inbounds.iter().filter_map(|i| i.port).collect(),
             is_disabled: dto.is_disabled,
             is_connected: dto.is_connected,
             last_status_message: dto.last_status_message.clone(),

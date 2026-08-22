@@ -1,4 +1,5 @@
 use crate::dto::{NodeDto, ProfileDto, ResolvedDto};
+use crate::subscription::RenderedConfig;
 use remnawave_healthcheck_core::model::{Channel, Node, Profile, Snapshot};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -9,15 +10,18 @@ use std::collections::HashMap;
 /// serve it — `served_remarks` carries what the subscription did serve, duplicates included, so
 /// `subscription:coverage` can compare the two sets instead of the gap disappearing.
 pub fn build_snapshot(
-    nodes: Vec<NodeDto>,
+    nodes: &[NodeDto],
     profiles: Vec<ProfileDto>,
     resolved: Vec<ResolvedDto>,
-    outbounds: Vec<(String, Value)>,
+    rendered: Vec<RenderedConfig>,
 ) -> Snapshot {
     // Recorded before the map collapses duplicates: a remark served twice is exactly what the
     // coverage check needs to see, and the map would hide it.
-    let served_remarks: Vec<String> = outbounds.iter().map(|(remark, _)| remark.clone()).collect();
-    let served: HashMap<String, Value> = outbounds.into_iter().collect();
+    let served_remarks: Vec<String> = rendered.iter().map(|c| c.remark.clone()).collect();
+    let served: HashMap<String, Value> = rendered
+        .into_iter()
+        .map(|c| (c.remark, c.outbound))
+        .collect();
 
     let channels: Vec<Channel> = resolved
         .into_iter()
@@ -108,9 +112,12 @@ mod tests {
                 config_profile_uuid: Some("p-1".into()),
             },
         }];
-        let outbounds = vec![("alpha direct".to_string(), json!({"protocol": "vless"}))];
+        let rendered = vec![RenderedConfig {
+            remark: "alpha direct".to_string(),
+            outbound: json!({"protocol": "vless"}),
+        }];
 
-        let snap = build_snapshot(nodes, profiles, resolved, outbounds);
+        let snap = build_snapshot(&nodes, profiles, resolved, rendered);
         assert_eq!(snap.channels.len(), 1);
         assert_eq!(snap.channels[0].inbound_tag, "in-a");
         assert_eq!(snap.channels[0].profile_uuid.as_deref(), Some("p-1"));
@@ -132,7 +139,7 @@ mod tests {
                 config_profile_uuid: Some("p-1".into()),
             },
         }];
-        let snap = build_snapshot(vec![], vec![], resolved, vec![]);
+        let snap = build_snapshot(&[], vec![], resolved, vec![]);
         assert_eq!(
             snap.channels.len(),
             1,
