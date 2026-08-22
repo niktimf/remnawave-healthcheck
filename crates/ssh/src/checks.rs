@@ -1,8 +1,13 @@
 use crate::facts::HostFacts;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use remnawave_healthcheck_core::model::{parse_ip, CheckResult, Node, Severity};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::net::IpAddr;
+
+/// One node-side check, ready to run: it is handed the key and the title built from its suffix.
+type NodeCheck<'a> = &'a dyn Fn(&str, &str) -> CheckResult;
 
 pub fn check_host(
     node: &Node,
@@ -13,39 +18,47 @@ pub fn check_host(
 ) -> Vec<CheckResult> {
     let key = |suffix: &str| format!("node:{}:{}", node.name, suffix);
     let title = |suffix: &str| format!("{} {}", node.name, suffix);
-    let suffixes = [
-        "containers",
-        "ports",
-        "users",
-        "config-age",
-        "cert",
-        "cert-renewal",
-        "egress-ip",
+
+    // One list, so an unreachable host cannot report a different set of checks than a reachable
+    // one. A suffix is part of a check's key and therefore of the tool's memory across runs:
+    // renaming one makes the old key look recovered and the new one look new.
+    let checks: [(&str, NodeCheck); 7] = [
+        ("containers", &|k, t| containers(k, t, facts)),
+        ("ports", &|k, t| ports(k, t, node, facts)),
+        ("users", &|k, t| users(k, t, facts)),
+        ("config-age", &|k, t| {
+            config_age(k, t, facts, now, config_warn_days)
+        }),
+        ("cert", &|k, t| cert(k, t, facts, now, cert_warn_days)),
+        ("cert-renewal", &|k, t| renewal(k, t, facts, now)),
+        ("egress-ip", &|k, t| egress(k, t, facts)),
     ];
 
-    if !facts.reachable {
-        let detail = facts.unreachable_reason.clone();
-        return suffixes
+    if let Some(reason) = &facts.unreachable_reason {
+        return checks
             .iter()
-            .map(|s| CheckResult::new(key(s), title(s), Severity::Fail, detail.clone()))
+            .map(|(suffix, _)| {
+                CheckResult::new(key(suffix), title(suffix), Severity::Fail, reason.clone())
+            })
             .collect();
     }
 
-    vec![
-        containers(&key("containers"), &title("containers"), facts),
-        ports(&key("ports"), &title("ports"), node, facts),
-        users(&key("users"), &title("users"), facts),
-        config_age(
-            &key("config-age"),
-            &title("config-age"),
-            facts,
-            now,
-            config_warn_days,
-        ),
-        cert(&key("cert"), &title("cert"), facts, now, cert_warn_days),
-        renewal(&key("cert-renewal"), &title("cert-renewal"), facts, now),
-        egress(&key("egress-ip"), &title("egress-ip"), facts),
-    ]
+    checks
+        .iter()
+        .map(|(suffix, check)| check(&key(suffix), &title(suffix)))
+        .collect()
+}
+
+/// Comma-separated list, the way every detail line in this module writes one.
+fn commas(items: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
+    let mut out = String::new();
+    for item in items {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{item}");
+    }
+    out
 }
 
 /// The node's own external address, reported as a fact in its own right. It is also the yardstick
@@ -71,33 +84,27 @@ const NODE_CONTAINER: &str = "remnanode";
 /// is no expected list: the node's own container set is the expectation, which keeps this free of
 /// configuration.
 fn containers(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
-    let broken: Vec<&str> = facts
+    // `docker ps --format '{{.Names}}\t{{.Status}}'`, split once and read three ways, instead of
+    // three passes each re-splitting the same output.
+    let rows: Vec<(&str, &str)> = facts
         .docker_ps
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter(|l| {
-            let status = l.split('\t').nth(1).unwrap_or("");
-            !status.starts_with("Up") || status.contains("unhealthy")
+        .map(|l| {
+            let (name, status) = l.split_once('\t').unwrap_or((l, ""));
+            (name.trim(), status)
         })
-        .filter_map(|l| l.split('\t').next())
         .collect();
 
-    let total = facts
-        .docker_ps
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count();
-    if total == 0 {
+    if rows.is_empty() {
         return CheckResult::new(key, title, Severity::Fail, "no containers running");
     }
     // A node whose container set looks perfectly healthy but does not include the node container
     // is not serving anything. Nothing else in this tool would notice on its own.
-    let running: Vec<&str> = facts
-        .docker_ps
-        .lines()
-        .filter_map(|l| l.split('\t').next())
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
+    let running: Vec<&str> = rows
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !name.is_empty())
         .collect();
     if !running.contains(&NODE_CONTAINER) {
         return CheckResult::new(
@@ -106,18 +113,23 @@ fn containers(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
             Severity::Fail,
             format!(
                 "the node container '{NODE_CONTAINER}' is not running (running: {})",
-                running.join(", ")
+                commas(&running)
             ),
         );
     }
+    let broken: Vec<&str> = rows
+        .iter()
+        .filter(|(_, status)| !status.starts_with("Up") || status.contains("unhealthy"))
+        .map(|(name, _)| *name)
+        .collect();
     if broken.is_empty() {
-        CheckResult::new(key, title, Severity::Ok, format!("{total} up"))
+        CheckResult::new(key, title, Severity::Ok, format!("{} up", rows.len()))
     } else {
         CheckResult::new(
             key,
             title,
             Severity::Fail,
-            format!("not healthy: {}", broken.join(", ")),
+            format!("not healthy: {}", commas(&broken)),
         )
     }
 }
@@ -173,11 +185,11 @@ fn ports(key: &str, title: &str, node: &Node, facts: &HostFacts) -> CheckResult 
         );
     }
     let public = public_listen_ports(&facts.listening);
-    let silent: Vec<String> = node
+    let silent: Vec<u16> = node
         .inbound_ports
         .iter()
+        .copied()
         .filter(|p| !public.contains(p))
-        .map(|p| p.to_string())
         .collect();
     if silent.is_empty() {
         CheckResult::new(
@@ -191,12 +203,14 @@ fn ports(key: &str, title: &str, node: &Node, facts: &HostFacts) -> CheckResult 
             key,
             title,
             Severity::Fail,
-            format!("not listening: {}", silent.join(", ")),
+            format!("not listening: {}", commas(&silent)),
         )
     }
 }
 
-fn user_counts(logs: &str) -> Vec<u64> {
+/// Smallest `has N users` count the node logged, or `None` when it logged no such line. Only the
+/// minimum is ever wanted: one inbound with no users is the failure worth reporting.
+fn min_user_count(logs: &str) -> Option<u64> {
     logs.lines()
         .filter_map(|line| {
             let rest = line.split(" has ").nth(1)?;
@@ -205,12 +219,11 @@ fn user_counts(logs: &str) -> Vec<u64> {
             }
             rest.split_whitespace().next()?.parse::<u64>().ok()
         })
-        .collect()
+        .min()
 }
 
 fn users(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
-    let counts = user_counts(&facts.node_logs);
-    match counts.iter().min() {
+    match min_user_count(&facts.node_logs) {
         None => CheckResult::new(
             key,
             title,
@@ -233,9 +246,11 @@ fn last_config_push(logs: &str) -> Option<DateTime<Utc>> {
     logs.lines()
         .filter(|l| l.contains(" has ") && l.contains("users"))
         .filter_map(|l| {
-            let stamp: String = l.chars().take(19).collect();
-            NaiveDateTime::parse_from_str(&stamp, "%Y-%m-%dT%H:%M:%S")
-                .or_else(|_| NaiveDateTime::parse_from_str(&stamp, "%Y-%m-%d %H:%M:%S"))
+            // Borrowed, not collected: the prefix is a fixed-length ASCII timestamp, and this
+            // runs for every one of up to 200 log lines.
+            let stamp = l.get(..19)?;
+            NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S"))
                 .ok()
         })
         .map(|naive| Utc.from_utc_datetime(&naive))
@@ -280,15 +295,18 @@ fn cert(
     now: DateTime<Utc>,
     warn_days: i64,
 ) -> CheckResult {
-    if facts.cert.trim().is_empty() {
+    // No TLS endpoint to ask (the node's address is a bare IP) and an endpoint that answered
+    // with nothing are different situations: the first is nothing to report, the second is a
+    // certificate this tool looked at and could not read.
+    let Some(probed) = facts.cert.as_deref() else {
         return CheckResult::new(
             key,
             title,
             Severity::Ok,
             "no TLS endpoint known for this node",
         );
-    }
-    let Some(raw) = facts.cert.split("notAfter=").nth(1) else {
+    };
+    let Some(raw) = probed.split("notAfter=").nth(1) else {
         return CheckResult::new(key, title, Severity::Warn, "certificate not parsed");
     };
     let raw = raw.lines().next().unwrap_or("").trim();
@@ -317,44 +335,68 @@ fn cert(
     )
 }
 
+/// One acme.sh certificate as its `.conf` describes it, before the renewal time is known to be
+/// readable.
 #[derive(Debug, Default, Clone)]
 struct RenewalEntry {
     webroot: Option<String>,
     due: Option<DateTime<Utc>>,
 }
 
+/// A certificate whose next renewal time did parse. Splitting these out of `RenewalEntry` is what
+/// keeps the checks below free of "this one has a due date, honest" assertions.
+#[derive(Debug, Clone)]
+struct DueCert {
+    domain: Option<String>,
+    webroot: Option<String>,
+    due: DateTime<Utc>,
+}
+
+impl DueCert {
+    /// http-01 needs port 80; with DNS-01 (`Le_Webroot='dns*'`) the port is irrelevant.
+    fn needs_port_80(&self) -> bool {
+        !self.webroot.as_deref().unwrap_or("").starts_with("dns")
+    }
+}
+
+/// How a certificate whose acme.sh path carried no domain has always been named in an alert.
+const UNKNOWN_DOMAIN: &str = "?";
+
+fn domain_label(domain: &Option<String>) -> &str {
+    domain.as_deref().unwrap_or(UNKNOWN_DOMAIN)
+}
+
+/// Value of `key='...'` on this line, if it carries one.
+fn quoted_value(line: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}='");
+    let start = line.find(&needle)? + needle.len();
+    Some(line[start..].chars().take_while(|c| *c != '\'').collect())
+}
+
 /// Lines look like `/root/.acme.sh/<domain>/<file>.conf:Le_NextRenewTimeStr='2026-09-20T10:00:00Z'`.
 /// The domain comes from the directory: a host can hold several certificates and the alert must
-/// name which one stalled.
+/// name which one stalled. A line whose path carries no domain — `grep` without `-H`, say — has
+/// no domain at all, which is `None` rather than a name that reads like one.
 ///
 /// Entries whose renewal time didn't parse are kept, with `due: None`, rather than dropped here.
 /// A domain with `Le_*` lines but no readable timestamp is a broken acme.sh config — a signal in
 /// its own right — and the caller must be able to tell that apart from no config existing at all.
-fn parse_renewal(text: &str) -> BTreeMap<String, RenewalEntry> {
-    let mut found: BTreeMap<String, RenewalEntry> = BTreeMap::new();
+fn parse_renewal(text: &str) -> BTreeMap<Option<String>, RenewalEntry> {
+    let mut found: BTreeMap<Option<String>, RenewalEntry> = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
         let domain = line
             .strip_prefix("/root/.acme.sh/")
             .and_then(|rest| rest.split('/').next())
-            .map(|d| d.trim_end_matches("_ecc").to_string())
-            .unwrap_or_else(|| "?".to_string());
+            .map(|d| d.trim_end_matches("_ecc").to_string());
 
-        for key in ["Le_Webroot", "Le_NextRenewTimeStr"] {
-            let needle = format!("{key}='");
-            if let Some(start) = line.find(&needle) {
-                let value: String = line[start + needle.len()..]
-                    .chars()
-                    .take_while(|c| *c != '\'')
-                    .collect();
-                let entry = found.entry(domain.clone()).or_default();
-                if key == "Le_Webroot" {
-                    entry.webroot = Some(value);
-                } else if let Ok(naive) =
-                    NaiveDateTime::parse_from_str(&value, "%Y-%m-%dT%H:%M:%SZ")
-                {
-                    entry.due = Some(Utc.from_utc_datetime(&naive));
-                }
+        if let Some(webroot) = quoted_value(line, "Le_Webroot") {
+            found.entry(domain.clone()).or_default().webroot = Some(webroot);
+        }
+        if let Some(due) = quoted_value(line, "Le_NextRenewTimeStr") {
+            let entry = found.entry(domain).or_default();
+            if let Ok(naive) = NaiveDateTime::parse_from_str(&due, "%Y-%m-%dT%H:%M:%SZ") {
+                entry.due = Some(Utc.from_utc_datetime(&naive));
             }
         }
     }
@@ -376,56 +418,57 @@ fn renewal(key: &str, title: &str, facts: &HostFacts, now: DateTime<Utc>) -> Che
         );
     }
 
+    // Sorted once into the two kinds there are, so nothing below has to re-derive which is which.
+    let mut certs: Vec<DueCert> = Vec::new();
+    let mut unreadable: Vec<Option<String>> = Vec::new();
+    for (domain, entry) in all {
+        match entry.due {
+            Some(due) => certs.push(DueCert {
+                domain,
+                webroot: entry.webroot,
+                due,
+            }),
+            None => unreadable.push(domain),
+        }
+    }
+
     // `Le_*` lines exist but no domain's renewal time parsed: the acme.sh config itself is
     // broken, which is a signal, not a reason to stay quiet.
-    let unreadable: Vec<&String> = all
-        .iter()
-        .filter(|(_, e)| e.due.is_none())
-        .map(|(d, _)| d)
-        .collect();
-    let certs: BTreeMap<String, RenewalEntry> = all
-        .iter()
-        .filter(|(_, e)| e.due.is_some())
-        .map(|(d, e)| (d.clone(), e.clone()))
-        .collect();
-    if certs.is_empty() {
-        let names = unreadable
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+    let Some(soonest) = certs.iter().min_by_key(|c| c.due) else {
         return CheckResult::new(
             key,
             title,
             Severity::Warn,
-            format!("acme.sh config found but its renewal time could not be read: {names}"),
+            format!(
+                "acme.sh config found but its renewal time could not be read: {}",
+                commas(unreadable.iter().map(domain_label))
+            ),
         );
-    }
+    };
 
     let port80_closed = facts.renewal.contains("PORT80=closed");
-    // http-01 needs port 80; with DNS-01 (Le_Webroot='dns*') the port is irrelevant.
-    let http01: Vec<&String> = certs
+    let http01: BTreeSet<&Option<String>> = certs
         .iter()
-        .filter(|(_, e)| !e.webroot.as_deref().unwrap_or("").starts_with("dns"))
-        .map(|(d, _)| d)
+        .filter(|c| c.needs_port_80())
+        .map(|c| &c.domain)
         .collect();
 
-    let mut overdue: Vec<(String, i64)> = certs
+    let mut overdue: Vec<(&DueCert, i64)> = certs
         .iter()
-        .filter_map(|(d, e)| {
-            let days = (now - e.due?).num_days();
-            (days > GRACE_DAYS).then_some((d.clone(), days))
+        .filter_map(|c| {
+            let days = (now - c.due).num_days();
+            (days > GRACE_DAYS).then_some((c, days))
         })
         .collect();
-    overdue.sort_by_key(|(_, days)| -days);
+    overdue.sort_by_key(|(_, days)| Reverse(*days));
 
     if !overdue.is_empty() {
-        let listed = overdue
-            .iter()
-            .map(|(d, n)| format!("{d} {n}d"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let blocked = port80_closed && overdue.iter().any(|(d, _)| http01.contains(&d));
+        let listed = commas(
+            overdue
+                .iter()
+                .map(|(c, days)| format!("{} {days}d", domain_label(&c.domain))),
+        );
+        let blocked = port80_closed && overdue.iter().any(|(c, _)| http01.contains(&c.domain));
         let reason = if blocked {
             " — port 80 is closed, http-01 cannot pass"
         } else {
@@ -439,27 +482,24 @@ fn renewal(key: &str, title: &str, facts: &HostFacts, now: DateTime<Utc>) -> Che
         );
     }
     if port80_closed && !http01.is_empty() {
-        let names = http01
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
         return CheckResult::new(
             key,
             title,
             Severity::Warn,
-            format!("port 80 is closed — http-01 renewal will fail: {names}"),
+            format!(
+                "port 80 is closed — http-01 renewal will fail: {}",
+                commas(http01.into_iter().map(domain_label))
+            ),
         );
     }
-    let soonest = certs.iter().min_by_key(|(_, e)| e.due).expect("non-empty");
     CheckResult::new(
         key,
         title,
         Severity::Ok,
         format!(
             "next {} {}",
-            soonest.0,
-            soonest.1.due.expect("filtered").date_naive()
+            domain_label(&soonest.domain),
+            soonest.due.date_naive()
         ),
     )
 }
@@ -497,12 +537,11 @@ mod tests {
 
     fn healthy_facts() -> HostFacts {
         HostFacts {
-            reachable: true,
-            unreachable_reason: String::new(),
+            unreachable_reason: None,
             docker_ps: "remnanode\tUp 5 days\ncaddy\tUp 5 days\n".into(),
             listening: "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\nLISTEN 0 4096 0.0.0.0:8443 0.0.0.0:*\n".into(),
             node_logs: "2026-08-22T09:00:00 inbound in-a has 42 users\n".into(),
-            cert: "notAfter=Nov 20 10:00:00 2026 GMT\n".into(),
+            cert: Some("notAfter=Nov 20 10:00:00 2026 GMT\n".into()),
             renewal: "/root/.acme.sh/beta.example.com/beta.example.com.conf:Le_Webroot='no'\n\
                       /root/.acme.sh/beta.example.com/beta.example.com.conf:Le_NextRenewTimeStr='2026-09-20T10:00:00Z'\n\
                       PORT80=open\n".into(),
@@ -536,8 +575,7 @@ mod tests {
     #[test]
     fn unreachable_host_fails_every_check_with_one_reason() {
         let facts = HostFacts {
-            reachable: false,
-            unreachable_reason: "ssh unreachable: Connection timed out".into(),
+            unreachable_reason: Some("ssh unreachable: Connection timed out".into()),
             ..HostFacts::default()
         };
         let r = check_host(&node(), &facts, now(), 14, 7);
@@ -649,13 +687,13 @@ mod tests {
     #[test]
     fn cert_expiry_warns_then_fails() {
         let mut facts = healthy_facts();
-        facts.cert = "notAfter=Aug 30 10:00:00 2026 GMT\n".into();
+        facts.cert = Some("notAfter=Aug 30 10:00:00 2026 GMT\n".into());
         assert_eq!(
             severity_of(&check_host(&node(), &facts, now(), 14, 7), ":cert"),
             Severity::Warn
         );
 
-        facts.cert = "notAfter=Aug 10 10:00:00 2026 GMT\n".into();
+        facts.cert = Some("notAfter=Aug 10 10:00:00 2026 GMT\n".into());
         assert_eq!(
             severity_of(&check_host(&node(), &facts, now(), 14, 7), ":cert"),
             Severity::Fail
@@ -736,11 +774,24 @@ mod tests {
     #[test]
     fn a_node_without_a_tls_endpoint_is_silent_about_its_certificate() {
         let mut facts = healthy_facts();
-        facts.cert = String::new();
+        facts.cert = None;
         let r = check_host(&node(), &facts, now(), 14, 7);
         let cert = r.iter().find(|c| c.key.ends_with(":cert")).unwrap();
         assert_eq!(cert.severity, Severity::Ok);
         assert!(cert.detail.contains("no TLS endpoint"));
+    }
+
+    #[test]
+    fn a_tls_endpoint_that_answered_with_nothing_is_not_the_same_as_having_none() {
+        // The node has a name, so its certificate was asked for and the answer was empty — the
+        // endpoint is down, or openssl said nothing. That is a certificate this tool looked at
+        // and could not read, not a node with no TLS at all.
+        let mut facts = healthy_facts();
+        facts.cert = Some(String::new());
+        let r = check_host(&node(), &facts, now(), 14, 7);
+        let cert = r.iter().find(|c| c.key.ends_with(":cert")).unwrap();
+        assert_eq!(cert.severity, Severity::Warn);
+        assert_eq!(cert.detail, "certificate not parsed");
     }
 
     #[test]

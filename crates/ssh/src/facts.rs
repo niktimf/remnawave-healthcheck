@@ -5,13 +5,16 @@ use std::time::Duration;
 /// against recorded samples without touching the network.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostFacts {
-    pub reachable: bool,
-    /// Why SSH failed; empty when the host answered.
-    pub unreachable_reason: String,
+    /// Why SSH failed, or `None` when the host answered. This is also what "reachable" means:
+    /// one field, so the reason and the verdict cannot drift apart.
+    pub unreachable_reason: Option<String>,
     pub docker_ps: String,
     pub listening: String,
     pub node_logs: String,
-    pub cert: String,
+    /// Output of the TLS probe, or `None` when this node has no name to probe (its address is a
+    /// bare IP). Empty output is a different thing — the endpoint was asked and said nothing —
+    /// and the cert check must be able to tell the two apart.
+    pub cert: Option<String>,
     pub renewal: String,
     pub egress_ip: String,
 }
@@ -42,13 +45,14 @@ enum CommandOutcome {
 
 impl CommandOutcome {
     /// The output to parse, or the reason there is none. Every check but the reachability ping
-    /// only wants this.
-    fn text(&self) -> String {
+    /// only wants this. Consuming: every caller is done with the outcome afterwards, and the
+    /// largest of these texts is a 200-line container log.
+    fn text(self) -> String {
         match self {
-            CommandOutcome::Ran { text, .. } => text.clone(),
+            CommandOutcome::Ran { text, .. } => text,
             CommandOutcome::TimedOut => "ssh timeout".to_string(),
             CommandOutcome::Failed(e) => format!("ssh error: {e}"),
-            CommandOutcome::Refused(reason) => reason.clone(),
+            CommandOutcome::Refused(reason) => reason,
         }
     }
 }
@@ -95,10 +99,9 @@ async fn run(target: &str, command: &str) -> CommandOutcome {
 /// channel red.
 pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostFacts {
     let ping = run(target, "true").await;
-    if let Some(detail) = unreachable_detail(&ping) {
+    if let Some(detail) = unreachable_detail(ping) {
         return HostFacts {
-            reachable: false,
-            unreachable_reason: format!("ssh unreachable: {detail}"),
+            unreachable_reason: Some(format!("ssh unreachable: {detail}")),
             ..HostFacts::default()
         };
     }
@@ -126,13 +129,12 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
         },
     );
     let cert = match cert_cmd {
-        Some(cmd) => run(target, &cmd).await.text(),
-        None => String::new(),
+        Some(cmd) => Some(run(target, &cmd).await.text()),
+        None => None,
     };
 
     HostFacts {
-        reachable: true,
-        unreachable_reason: String::new(),
+        unreachable_reason: None,
         docker_ps: docker_ps.text(),
         listening: listening.text(),
         node_logs: node_logs.text(),
@@ -147,12 +149,12 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
 /// This is the one place in the tool that looks at an exit status: `true` returning anything but
 /// 0 means the remote end never ran it. The detail is capped so a host that answers with a wall
 /// of text cannot push the real reason out of the alert.
-fn unreachable_detail(ping: &CommandOutcome) -> Option<String> {
+fn unreachable_detail(ping: CommandOutcome) -> Option<String> {
     match ping {
         CommandOutcome::Ran {
             status: Some(0), ..
         } => None,
-        CommandOutcome::Ran { status, text } => Some(match last_non_empty_line(text) {
+        CommandOutcome::Ran { status, text } => Some(match last_non_empty_line(&text) {
             // Nothing was said about why, so the status is all there is to report. `-1` stands
             // for "killed by a signal, no code" and is what this line has always printed.
             "" => format!("rc={}", status.unwrap_or(-1)),
@@ -187,13 +189,13 @@ mod tests {
 
     #[test]
     fn a_ping_that_returned_zero_means_the_host_is_reachable() {
-        assert_eq!(unreachable_detail(&ran(Some(0), "")), None);
-        assert_eq!(unreachable_detail(&ran(Some(0), "some banner\n")), None);
+        assert_eq!(unreachable_detail(ran(Some(0), "")), None);
+        assert_eq!(unreachable_detail(ran(Some(0), "some banner\n")), None);
     }
 
     #[test]
     fn a_failing_ping_reports_the_last_line_ssh_printed() {
-        let detail = unreachable_detail(&ran(
+        let detail = unreachable_detail(ran(
             Some(255),
             "warming up\nssh: connect to host beta.example.com port 22: Connection refused\n",
         ))
@@ -207,21 +209,21 @@ mod tests {
     #[test]
     fn a_silent_failure_falls_back_to_the_status() {
         assert_eq!(
-            unreachable_detail(&ran(Some(255), "")).as_deref(),
+            unreachable_detail(ran(Some(255), "")).as_deref(),
             Some("rc=255")
         );
         // Killed by a signal: no exit code at all.
-        assert_eq!(unreachable_detail(&ran(None, "")).as_deref(), Some("rc=-1"));
+        assert_eq!(unreachable_detail(ran(None, "")).as_deref(), Some("rc=-1"));
     }
 
     #[test]
     fn a_timeout_and_a_spawn_failure_explain_themselves() {
         assert_eq!(
-            unreachable_detail(&CommandOutcome::TimedOut).as_deref(),
+            unreachable_detail(CommandOutcome::TimedOut).as_deref(),
             Some("ssh timeout")
         );
         assert_eq!(
-            unreachable_detail(&CommandOutcome::Failed("No such file or directory".into()))
+            unreachable_detail(CommandOutcome::Failed("No such file or directory".into()))
                 .as_deref(),
             Some("ssh error: No such file or directory")
         );
@@ -229,7 +231,7 @@ mod tests {
 
     #[test]
     fn an_overlong_reason_is_capped() {
-        let detail = unreachable_detail(&ran(Some(255), &"x".repeat(500))).unwrap();
+        let detail = unreachable_detail(ran(Some(255), &"x".repeat(500))).unwrap();
         assert_eq!(detail.chars().count(), 120);
     }
 
