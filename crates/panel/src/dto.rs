@@ -1,4 +1,4 @@
-use remnawave_healthcheck_core::model::Node;
+use remnawave_healthcheck_core::model::{Node, Profile};
 use serde::Deserialize;
 
 /// Every panel response is wrapped in `{"response": ...}`.
@@ -106,22 +106,34 @@ pub fn parse_resolved(body: &str) -> anyhow::Result<Vec<ResolvedDto>> {
         .resolved_proxy_configs)
 }
 
-pub fn to_domain_node(dto: &NodeDto) -> Node {
-    let profile = dto.config_profile.as_ref();
-    Node {
-        name: dto.name.clone(),
-        address: dto.address.clone(),
-        profile_uuid: profile.and_then(|p| p.active_config_profile_uuid.clone()),
-        inbound_tags: profile
-            .map(|p| p.active_inbounds.iter().map(|i| i.tag.clone()).collect())
-            .unwrap_or_default(),
-        inbound_ports: profile
-            .map(|p| p.active_inbounds.iter().filter_map(|i| i.port).collect())
-            .unwrap_or_default(),
-        is_disabled: dto.is_disabled,
-        is_connected: dto.is_connected,
-        last_status_message: dto.last_status_message.clone(),
-        xray_version: dto.versions.as_ref().and_then(|v| v.xray.clone()),
+impl From<&NodeDto> for Node {
+    fn from(dto: &NodeDto) -> Self {
+        let profile = dto.config_profile.as_ref();
+        Node {
+            name: dto.name.clone(),
+            address: dto.address.clone(),
+            profile_uuid: profile.and_then(|p| p.active_config_profile_uuid.clone()),
+            inbound_tags: profile
+                .map(|p| p.active_inbounds.iter().map(|i| i.tag.clone()).collect())
+                .unwrap_or_default(),
+            inbound_ports: profile
+                .map(|p| p.active_inbounds.iter().filter_map(|i| i.port).collect())
+                .unwrap_or_default(),
+            is_disabled: dto.is_disabled,
+            is_connected: dto.is_connected,
+            last_status_message: dto.last_status_message.clone(),
+            xray_version: dto.versions.as_ref().and_then(|v| v.xray.clone()),
+        }
+    }
+}
+
+impl From<ProfileDto> for Profile {
+    fn from(dto: ProfileDto) -> Self {
+        Profile {
+            uuid: dto.uuid,
+            name: dto.name,
+            config: dto.config,
+        }
     }
 }
 

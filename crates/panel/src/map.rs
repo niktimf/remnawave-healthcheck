@@ -1,4 +1,4 @@
-use crate::dto::{to_domain_node, NodeDto, ProfileDto, ResolvedDto};
+use crate::dto::{NodeDto, ProfileDto, ResolvedDto};
 use remnawave_healthcheck_core::model::{Channel, Node, Profile, Snapshot};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -32,19 +32,11 @@ pub fn build_snapshot(
         .collect();
 
     Snapshot {
-        nodes: nodes.iter().map(to_domain_node).collect::<Vec<Node>>(),
+        nodes: nodes.iter().map(Node::from).collect::<Vec<Node>>(),
         profiles: profiles
             .into_iter()
-            .map(|p| {
-                (
-                    p.uuid.clone(),
-                    Profile {
-                        uuid: p.uuid,
-                        name: p.name,
-                        config: p.config,
-                    },
-                )
-            })
+            .map(Profile::from)
+            .map(|p| (p.uuid.clone(), p))
             .collect(),
         channels,
         served_remarks,
@@ -76,7 +68,7 @@ mod tests {
 
         let nodes = crate::dto::parse_nodes(&raw).unwrap();
         assert_eq!(nodes.len(), 1);
-        let n = crate::dto::to_domain_node(&nodes[0]);
+        let n = Node::from(&nodes[0]);
         assert_eq!(n.name, "alpha");
         assert_eq!(n.address, "192.0.2.10");
         assert_eq!(n.profile_uuid.as_deref(), Some("p-1"));
@@ -93,7 +85,7 @@ mod tests {
         }]})
         .to_string();
         let nodes = crate::dto::parse_nodes(&raw).unwrap();
-        let n = crate::dto::to_domain_node(&nodes[0]);
+        let n = Node::from(&nodes[0]);
         assert!(n.profile_uuid.is_none());
         assert!(n.inbound_tags.is_empty());
         assert!(n.is_disabled && !n.is_connected);
