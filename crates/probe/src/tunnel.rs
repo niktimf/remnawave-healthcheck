@@ -1,8 +1,9 @@
 use serde_json::Value;
-use std::path::Path;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Where the traffic came out, plus whatever Xray complained about if it did not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,17 +22,20 @@ pub async fn probe(
     socks_port: u16,
     timeout: Duration,
 ) -> ProbeOutcome {
-    let dir = match tempdir_in_cache() {
+    // The guard removes this directory on every exit path from here on — success, an early
+    // return, or a panic — so a stray xray config carrying the monitoring user's VLESS
+    // credentials never survives past this call.
+    let dir = match scratch_dir() {
         Ok(d) => d,
         Err(e) => {
             return ProbeOutcome {
                 exit_ip: None,
-                stderr_tail: format!("temp dir: {e}"),
+                stderr_tail: format!("scratch dir: {e}"),
             }
         }
     };
-    let cfg_path = dir.join("config.json");
-    if let Err(e) = tokio::fs::write(&cfg_path, config.to_string()).await {
+    let cfg_path = dir.path().join("config.json");
+    if let Err(e) = write_config(&cfg_path, config).await {
         return ProbeOutcome {
             exit_ip: None,
             stderr_tail: format!("writing config: {e}"),
@@ -89,7 +93,7 @@ pub async fn probe(
             stderr_tail = tail(&buf, 3, 200);
         }
     }
-    let _ = tokio::fs::remove_dir_all(&dir).await;
+    // `dir` is dropped here (and on every early return above), which removes it.
 
     ProbeOutcome {
         exit_ip,
@@ -97,11 +101,46 @@ pub async fn probe(
     }
 }
 
-fn tempdir_in_cache() -> std::io::Result<std::path::PathBuf> {
+async fn write_config(path: &Path, config: &Value) -> std::io::Result<()> {
+    // 0o600: the file holds the subscription outbound verbatim — VLESS UUID, server address,
+    // SNI, fingerprint. No point restricting the directory (see `scratch_dir`) if the file
+    // inside it stays world-readable for the moment between creation and removal.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    file.write_all(config.to_string().as_bytes()).await
+}
+
+/// A scratch directory for one probe run. Removed on `Drop`, on every exit path — success, an
+/// early return, or a panic — so a leftover xray config with live credentials never lingers in
+/// `std::env::temp_dir()`. `Drop` cannot run async code; a synchronous removal of one small
+/// directory is an acceptable price for that guarantee.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Create a fresh, `0o700` scratch directory under the OS temp dir, wrapped in a guard that
+/// removes it again once the probe is done with it.
+fn scratch_dir() -> std::io::Result<ScratchDir> {
     let base = std::env::temp_dir().join(format!("rwhc-{}", std::process::id()));
+    std::fs::create_dir_all(&base)?;
     let unique = base.join(format!("{:?}", std::time::SystemTime::now()).replace([' ', ':'], "-"));
-    std::fs::create_dir_all(&unique)?;
-    Ok(unique)
+    std::fs::DirBuilder::new().mode(0o700).create(&unique)?;
+    Ok(ScratchDir(unique))
 }
 
 /// Last non-empty lines of Xray's stderr — this is where the real reason for a dead tunnel is.
@@ -113,4 +152,48 @@ fn tail(text: &str, lines: usize, chars: usize) -> String {
         .collect();
     let start = kept.len().saturating_sub(lines);
     kept[start..].join(" / ").chars().take(chars).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The most important guarantee this module makes: a failed `spawn()` (bad binary path, no
+    /// exec permission, ENOENT — the realistic case) must not leave the scratch directory, with
+    /// its verbatim subscription outbound, behind on disk.
+    #[tokio::test]
+    async fn a_dead_spawn_leaves_no_scratch_dir_behind() {
+        let base = std::env::temp_dir().join(format!("rwhc-{}", std::process::id()));
+        let before = list_dir(&base);
+
+        let outcome = probe(
+            Path::new("/nonexistent/xray-binary-that-does-not-exist"),
+            &serde_json::json!({"outbounds": []}),
+            1,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert_eq!(outcome.exit_ip, None);
+        let after = list_dir(&base);
+        assert_eq!(
+            before, after,
+            "the scratch directory created for this run must be gone once probe() returns"
+        );
+    }
+
+    #[test]
+    fn scratch_dir_guard_removes_its_directory_on_drop() {
+        let dir = scratch_dir().expect("scratch dir creates");
+        let path = dir.path().to_path_buf();
+        assert!(path.is_dir());
+        drop(dir);
+        assert!(!path.exists(), "guard must remove the directory on drop");
+    }
+
+    fn list_dir(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
 }
