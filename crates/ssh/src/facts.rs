@@ -23,7 +23,37 @@ pub struct HostFacts {
 const RENEWAL_CMD: &str = "sudo sh -c 'grep -HE \"Le_NextRenewTimeStr|Le_Webroot\" /root/.acme.sh/*/*.conf \
 2>/dev/null || echo NO_ACME_CONF; ufw status 2>/dev/null | grep -qE \"^80/tcp\" && echo PORT80=open || echo PORT80=closed'";
 
-async fn run(target: &str, command: &str) -> (i32, String) {
+/// What became of one remote command. The text is always there — it is either the command's
+/// combined output or the reason there is none — while the exit status only exists for a command
+/// that actually ran, which is why it lives inside a single variant instead of being faked with a
+/// sentinel number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandOutcome {
+    /// The command ran on the host and returned this status and combined output. `status` is
+    /// `None` when the remote `ssh` process was killed by a signal and reported no code.
+    Ran { status: Option<i32>, text: String },
+    /// The command did not finish within the timeout.
+    TimedOut,
+    /// `ssh` itself could not be started.
+    Failed(String),
+    /// We refused to build this command line at all.
+    Refused(String),
+}
+
+impl CommandOutcome {
+    /// The output to parse, or the reason there is none. Every check but the reachability ping
+    /// only wants this.
+    fn text(&self) -> String {
+        match self {
+            CommandOutcome::Ran { text, .. } => text.clone(),
+            CommandOutcome::TimedOut => "ssh timeout".to_string(),
+            CommandOutcome::Failed(e) => format!("ssh error: {e}"),
+            CommandOutcome::Refused(reason) => reason.clone(),
+        }
+    }
+}
+
+async fn run(target: &str, command: &str) -> CommandOutcome {
     let child = tokio::process::Command::new("ssh")
         .args([
             "-o",
@@ -43,12 +73,15 @@ async fn run(target: &str, command: &str) -> (i32, String) {
         .output();
 
     match tokio::time::timeout(Duration::from_secs(30), child).await {
-        Err(_) => (124, "ssh timeout".to_string()),
-        Ok(Err(e)) => (125, format!("ssh error: {e}")),
+        Err(_) => CommandOutcome::TimedOut,
+        Ok(Err(e)) => CommandOutcome::Failed(e.to_string()),
         Ok(Ok(out)) => {
             let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
-            (out.status.code().unwrap_or(-1), text)
+            CommandOutcome::Ran {
+                status: out.status.code(),
+                text,
+            }
         }
     }
 }
@@ -61,19 +94,8 @@ async fn run(target: &str, command: &str) -> (i32, String) {
 /// different endpoints could disagree about the address of a multi-homed host and turn a healthy
 /// channel red.
 pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostFacts {
-    let (rc, ping) = run(target, "true").await;
-    if rc != 0 {
-        let reason = ping
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-            .trim();
-        let detail = if reason.is_empty() {
-            format!("rc={rc}")
-        } else {
-            reason.chars().take(120).collect()
-        };
+    let ping = run(target, "true").await;
+    if let Some(detail) = unreachable_detail(&ping) {
         return HostFacts {
             reachable: false,
             unreachable_reason: format!("ssh unreachable: {detail}"),
@@ -97,26 +119,132 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
         async {
             match &egress_cmd {
                 Some(cmd) => run(target, cmd).await,
-                None => (
-                    126,
-                    format!("refusing to run an echo URL containing a quote: {echo_url}"),
-                ),
+                None => CommandOutcome::Refused(format!(
+                    "refusing to run an echo URL containing a quote: {echo_url}"
+                )),
             }
         },
     );
     let cert = match cert_cmd {
-        Some(cmd) => run(target, &cmd).await.1,
+        Some(cmd) => run(target, &cmd).await.text(),
         None => String::new(),
     };
 
     HostFacts {
         reachable: true,
         unreachable_reason: String::new(),
-        docker_ps: docker_ps.1,
-        listening: listening.1,
-        node_logs: node_logs.1,
+        docker_ps: docker_ps.text(),
+        listening: listening.text(),
+        node_logs: node_logs.text(),
         cert,
-        renewal: renewal.1,
-        egress_ip: egress_ip.1,
+        renewal: renewal.text(),
+        egress_ip: egress_ip.text(),
+    }
+}
+
+/// Why the reachability ping says the host is not reachable, or `None` when it is.
+///
+/// This is the one place in the tool that looks at an exit status: `true` returning anything but
+/// 0 means the remote end never ran it. The detail is capped so a host that answers with a wall
+/// of text cannot push the real reason out of the alert.
+fn unreachable_detail(ping: &CommandOutcome) -> Option<String> {
+    match ping {
+        CommandOutcome::Ran {
+            status: Some(0), ..
+        } => None,
+        CommandOutcome::Ran { status, text } => Some(match last_non_empty_line(text) {
+            // Nothing was said about why, so the status is all there is to report. `-1` stands
+            // for "killed by a signal, no code" and is what this line has always printed.
+            "" => format!("rc={}", status.unwrap_or(-1)),
+            reason => reason.chars().take(120).collect(),
+        }),
+        // Nothing ran, so there is no status: the outcome's own text is the whole reason.
+        other => {
+            let text = other.text();
+            Some(last_non_empty_line(&text).chars().take(120).collect())
+        }
+    }
+}
+
+fn last_non_empty_line(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ran(status: Option<i32>, text: &str) -> CommandOutcome {
+        CommandOutcome::Ran {
+            status,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_ping_that_returned_zero_means_the_host_is_reachable() {
+        assert_eq!(unreachable_detail(&ran(Some(0), "")), None);
+        assert_eq!(unreachable_detail(&ran(Some(0), "some banner\n")), None);
+    }
+
+    #[test]
+    fn a_failing_ping_reports_the_last_line_ssh_printed() {
+        let detail = unreachable_detail(&ran(
+            Some(255),
+            "warming up\nssh: connect to host beta.example.com port 22: Connection refused\n",
+        ))
+        .expect("a non-zero ping is unreachable");
+        assert_eq!(
+            detail,
+            "ssh: connect to host beta.example.com port 22: Connection refused"
+        );
+    }
+
+    #[test]
+    fn a_silent_failure_falls_back_to_the_status() {
+        assert_eq!(
+            unreachable_detail(&ran(Some(255), "")).as_deref(),
+            Some("rc=255")
+        );
+        // Killed by a signal: no exit code at all.
+        assert_eq!(unreachable_detail(&ran(None, "")).as_deref(), Some("rc=-1"));
+    }
+
+    #[test]
+    fn a_timeout_and_a_spawn_failure_explain_themselves() {
+        assert_eq!(
+            unreachable_detail(&CommandOutcome::TimedOut).as_deref(),
+            Some("ssh timeout")
+        );
+        assert_eq!(
+            unreachable_detail(&CommandOutcome::Failed("No such file or directory".into()))
+                .as_deref(),
+            Some("ssh error: No such file or directory")
+        );
+    }
+
+    #[test]
+    fn an_overlong_reason_is_capped() {
+        let detail = unreachable_detail(&ran(Some(255), &"x".repeat(500))).unwrap();
+        assert_eq!(detail.chars().count(), 120);
+    }
+
+    #[test]
+    fn every_outcome_yields_text_for_the_parsers() {
+        assert_eq!(ran(Some(0), "listening\n").text(), "listening\n");
+        assert_eq!(CommandOutcome::TimedOut.text(), "ssh timeout");
+        assert_eq!(
+            CommandOutcome::Failed("boom".into()).text(),
+            "ssh error: boom"
+        );
+        assert_eq!(
+            CommandOutcome::Refused("refusing to run an echo URL containing a quote: x".into())
+                .text(),
+            "refusing to run an echo URL containing a quote: x"
+        );
     }
 }
