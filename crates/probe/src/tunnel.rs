@@ -1,4 +1,6 @@
+use remnawave_healthcheck_core::model::parse_ip;
 use serde_json::Value;
+use std::net::IpAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -8,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Where the traffic came out, plus whatever Xray complained about if it did not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeOutcome {
-    pub exit_ip: Option<String>,
+    pub exit_ip: Option<IpAddr>,
     pub stderr_tail: String,
 }
 
@@ -106,12 +108,9 @@ pub async fn probe(
 /// The echo endpoint answers with a bare IP address and nothing else. Anything that is not one —
 /// an HTML error page from a CDN in front of it, a captive-portal login form, a rate-limit notice
 /// — is not this channel's exit address and must never be reported as one. `ssh::egress_ip`
-/// validates the node side the same way.
-fn parse_echo_response(body: &str) -> Option<String> {
-    body.trim()
-        .parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| ip.to_string())
+/// validates the node side the same way, through the same function.
+fn parse_echo_response(body: &str) -> Option<IpAddr> {
+    parse_ip(body)
 }
 
 async fn write_config(path: &Path, config: &Value) -> std::io::Result<()> {
@@ -199,12 +198,12 @@ mod tests {
     #[test]
     fn only_a_bare_ip_address_counts_as_an_exit() {
         assert_eq!(
-            parse_echo_response(" 203.0.113.7\n").as_deref(),
-            Some("203.0.113.7")
+            parse_echo_response(" 203.0.113.7\n"),
+            Some("203.0.113.7".parse().unwrap())
         );
         assert_eq!(
-            parse_echo_response("2001:db8::1").as_deref(),
-            Some("2001:db8::1")
+            parse_echo_response("2001:db8::1"),
+            Some("2001:db8::1".parse().unwrap())
         );
         assert_eq!(parse_echo_response(""), None);
         assert_eq!(

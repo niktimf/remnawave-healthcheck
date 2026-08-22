@@ -5,6 +5,7 @@ pub mod xray;
 pub use tunnel::{probe, ProbeOutcome};
 
 use remnawave_healthcheck_core::model::{CheckResult, Severity};
+use std::net::IpAddr;
 
 /// Turn one probe into a check result.
 ///
@@ -19,10 +20,10 @@ pub fn classify(
     key: &str,
     remark: &str,
     expect_node: &str,
-    expect_ip: Option<&str>,
+    expect_ip: Option<IpAddr>,
     outcome: &ProbeOutcome,
 ) -> CheckResult {
-    match (&outcome.exit_ip, expect_ip) {
+    match (outcome.exit_ip, expect_ip) {
         (None, _) => {
             let mut detail = "no exit (tunnel dead)".to_string();
             if !outcome.stderr_tail.is_empty() {
@@ -60,9 +61,13 @@ mod tests {
 
     fn outcome(ip: Option<&str>, tail: &str) -> ProbeOutcome {
         ProbeOutcome {
-            exit_ip: ip.map(str::to_string),
+            exit_ip: ip.map(|ip| ip.parse().expect("test address is an IP")),
             stderr_tail: tail.to_string(),
         }
+    }
+
+    fn ip(text: &str) -> Option<std::net::IpAddr> {
+        Some(text.parse().expect("test address is an IP"))
     }
 
     #[test]
@@ -71,7 +76,7 @@ mod tests {
             "channel:alpha@alpha.example.com:443",
             "alpha",
             "beta",
-            Some("192.0.2.20"),
+            ip("192.0.2.20"),
             &outcome(Some("192.0.2.20"), ""),
         );
         assert_eq!(r.severity, Severity::Ok);
@@ -85,7 +90,7 @@ mod tests {
             "channel:alpha@alpha.example.com:443",
             "alpha",
             "beta",
-            Some("192.0.2.20"),
+            ip("192.0.2.20"),
             &outcome(Some("203.0.113.7"), ""),
         );
         assert_eq!(r.severity, Severity::Fail);
@@ -102,7 +107,7 @@ mod tests {
             "channel:alpha@alpha.example.com:443",
             "alpha",
             "beta",
-            Some("192.0.2.20"),
+            ip("192.0.2.20"),
             &outcome(None, "failed to dial"),
         );
         assert_eq!(r.severity, Severity::Fail);

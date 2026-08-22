@@ -8,6 +8,7 @@ use remnawave_healthcheck_panel::{short_uuid_from_url, PanelClient};
 use remnawave_healthcheck_probe as probe;
 use remnawave_healthcheck_ssh as node_ssh;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -35,7 +36,7 @@ pub async fn run(args: Args) -> Result<i32> {
     results.extend(checks::monitoring_coverage(&snapshot));
     results.push(checks::xray_version_drift(&snapshot.nodes));
 
-    let mut egress: HashMap<String, String> = HashMap::new();
+    let mut egress: HashMap<String, IpAddr> = HashMap::new();
     if !args.no_ssh {
         let (node_results, addresses) = node_checks(&args, &snapshot).await;
         results.extend(node_results);
@@ -180,7 +181,7 @@ fn classify_state_read(result: std::io::Result<String>, path: &Path) -> StateFil
 async fn node_checks(
     args: &Args,
     snapshot: &Snapshot,
-) -> (Vec<CheckResult>, HashMap<String, String>) {
+) -> (Vec<CheckResult>, HashMap<String, IpAddr>) {
     let now = chrono::Utc::now();
     let mut pending = FuturesUnordered::new();
     for node in snapshot.nodes.iter().filter(|n| !n.is_disabled) {
@@ -188,9 +189,9 @@ async fn node_checks(
             // An address that is not an IP is also the TLS endpoint worth inspecting.
             let domain = node
                 .address
-                .parse::<std::net::IpAddr>()
-                .err()
-                .map(|_| node.address.as_str());
+                .parse::<IpAddr>()
+                .is_err()
+                .then_some(node.address.as_str());
             let facts = node_ssh::gather(&node.address, domain, &args.echo_url).await;
             (node, facts)
         });
@@ -225,7 +226,7 @@ async fn node_checks(
 async fn channel_checks(
     args: &Args,
     snapshot: &Snapshot,
-    egress: &HashMap<String, String>,
+    egress: &HashMap<String, IpAddr>,
 ) -> Vec<CheckResult> {
     let setup_fail = |detail: String| {
         vec![CheckResult::new(
@@ -282,7 +283,7 @@ async fn channel_checks(
                     &channel.check_key(),
                     &channel.remark,
                     &expect,
-                    egress.get(&expect).map(String::as_str),
+                    egress.get(&expect).copied(),
                     &outcome,
                 )
             });

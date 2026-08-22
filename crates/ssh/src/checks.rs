@@ -1,7 +1,8 @@
 use crate::facts::HostFacts;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use remnawave_healthcheck_core::model::{CheckResult, Node, Severity};
+use remnawave_healthcheck_core::model::{parse_ip, CheckResult, Node, Severity};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 pub fn check_host(
     node: &Node,
@@ -463,13 +464,11 @@ fn renewal(key: &str, title: &str, facts: &HostFacts, now: DateTime<Utc>) -> Che
     )
 }
 
-/// Node's own view of its egress address, used as the expectation for channel exits.
-pub fn egress_ip(facts: &HostFacts) -> Option<String> {
-    let candidate = facts.egress_ip.trim();
-    candidate
-        .parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| ip.to_string())
+/// Node's own view of its egress address, used as the expectation for channel exits. Shares
+/// `core::model::parse_ip` with the probe side so both ends of the comparison agree on what an
+/// address is.
+pub fn egress_ip(facts: &HostFacts) -> Option<IpAddr> {
+    parse_ip(&facts.egress_ip)
 }
 
 #[cfg(test)]
@@ -746,7 +745,10 @@ mod tests {
 
     #[test]
     fn egress_ip_is_trimmed_and_validated() {
-        assert_eq!(egress_ip(&healthy_facts()).as_deref(), Some("192.0.2.20"));
+        assert_eq!(
+            egress_ip(&healthy_facts()),
+            Some("192.0.2.20".parse::<IpAddr>().unwrap())
+        );
         let mut facts = healthy_facts();
         facts.egress_ip = "curl: (7) Failed to connect\n".into();
         assert_eq!(egress_ip(&facts), None);
