@@ -1,3 +1,4 @@
 target/
 .xray-cache/
 *.state.json
+.superpowers/
