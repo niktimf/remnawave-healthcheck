@@ -1,7 +1,7 @@
 use crate::facts::HostFacts;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use remnawave_healthcheck_core::model::{CheckResult, Node, Severity};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn check_host(
     node: &Node,
@@ -19,6 +19,7 @@ pub fn check_host(
         "config-age",
         "cert",
         "cert-renewal",
+        "egress-ip",
     ];
 
     if !facts.reachable {
@@ -42,11 +43,32 @@ pub fn check_host(
         ),
         cert(&key("cert"), &title("cert"), facts, now, cert_warn_days),
         renewal(&key("cert-renewal"), &title("cert-renewal"), facts, now),
+        egress(&key("egress-ip"), &title("egress-ip"), facts),
     ]
 }
 
-/// Any container that is not up — or is up but unhealthy — is a failure. There is no expected
-/// list: the node's own container set is the expectation, which keeps this free of configuration.
+/// The node's own external address, reported as a fact in its own right. It is also the yardstick
+/// every channel expected to exit here is measured against, so when it is unknown the report says
+/// so out loud: those channel verdicts are then unverified rather than merely uninteresting.
+fn egress(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
+    match egress_ip(facts) {
+        Some(ip) => CheckResult::new(key, title, Severity::Ok, format!("egress {ip}")),
+        None => CheckResult::new(
+            key,
+            title,
+            Severity::Warn,
+            "the node could not report its external address, so exits of channels expected to \
+             leave through it cannot be verified",
+        ),
+    }
+}
+
+/// The one container this tool does expect by name: without it the node runs no Xray at all.
+const NODE_CONTAINER: &str = "remnanode";
+
+/// Any container that is not up — or is up but unhealthy — is a failure. Beyond `remnanode` there
+/// is no expected list: the node's own container set is the expectation, which keeps this free of
+/// configuration.
 fn containers(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
     let broken: Vec<&str> = facts
         .docker_ps
@@ -67,6 +89,26 @@ fn containers(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
     if total == 0 {
         return CheckResult::new(key, title, Severity::Fail, "no containers running");
     }
+    // A node whose container set looks perfectly healthy but does not include the node container
+    // is not serving anything. Nothing else in this tool would notice on its own.
+    let running: Vec<&str> = facts
+        .docker_ps
+        .lines()
+        .filter_map(|l| l.split('\t').next())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    if !running.contains(&NODE_CONTAINER) {
+        return CheckResult::new(
+            key,
+            title,
+            Severity::Fail,
+            format!(
+                "the node container '{NODE_CONTAINER}' is not running (running: {})",
+                running.join(", ")
+            ),
+        );
+    }
     if broken.is_empty() {
         CheckResult::new(key, title, Severity::Ok, format!("{total} up"))
     } else {
@@ -76,6 +118,46 @@ fn containers(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
             Severity::Fail,
             format!("not healthy: {}", broken.join(", ")),
         )
+    }
+}
+
+/// Ports of the `ss -ltn` listeners that something outside the node can actually reach.
+///
+/// A listener bound to a loopback address answers only from the node itself — the local fallback
+/// web server of a Vision inbound is exactly that — so counting it would report a client-facing
+/// inbound port as healthy while nothing outside can connect to it. Matching the port number
+/// anywhere in the output did precisely that.
+fn public_listen_ports(ss_output: &str) -> BTreeSet<u16> {
+    let mut ports = BTreeSet::new();
+    for line in ss_output.lines() {
+        // ss -ltn: State Recv-Q Send-Q Local-Address:Port Peer-Address:Port
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 || !fields[0].eq_ignore_ascii_case("LISTEN") {
+            continue;
+        }
+        let Some((address, port)) = fields[3].rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        if is_loopback(address) {
+            continue;
+        }
+        ports.insert(port);
+    }
+    ports
+}
+
+/// `127.0.0.1`, `[::1]`, and anything else that only the node can reach. A wildcard (`*`,
+/// `0.0.0.0`, `[::]`) or a concrete external address is not loopback and counts as public.
+fn is_loopback(address: &str) -> bool {
+    let address = address.trim_matches(|c| c == '[' || c == ']');
+    // ss can append a scope, e.g. `fe80::1%eth0`.
+    let address = address.split('%').next().unwrap_or(address);
+    match address.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => address == "localhost",
     }
 }
 
@@ -89,10 +171,11 @@ fn ports(key: &str, title: &str, node: &Node, facts: &HostFacts) -> CheckResult 
             "no inbound ports declared by the panel",
         );
     }
+    let public = public_listen_ports(&facts.listening);
     let silent: Vec<String> = node
         .inbound_ports
         .iter()
-        .filter(|p| !facts.listening.contains(&format!(":{p} ")))
+        .filter(|p| !public.contains(p))
         .map(|p| p.to_string())
         .collect();
     if silent.is_empty() {
@@ -459,7 +542,7 @@ mod tests {
             ..HostFacts::default()
         };
         let r = check_host(&node(), &facts, now(), 14, 7);
-        assert_eq!(r.len(), 6, "one result per check, no more, no fewer");
+        assert_eq!(r.len(), 7, "one result per check, no more, no fewer");
         assert!(r.iter().all(|c| c.severity == Severity::Fail));
         assert!(r.iter().all(|c| c.detail.contains("unreachable")));
     }
@@ -475,6 +558,67 @@ mod tests {
         facts.docker_ps = "remnanode\tUp 5 days (unhealthy)\n".into();
         let r = check_host(&node(), &facts, now(), 14, 7);
         assert_eq!(severity_of(&r, ":containers"), Severity::Fail);
+    }
+
+    #[test]
+    fn a_missing_node_container_fails_even_when_everything_else_is_up() {
+        let mut facts = healthy_facts();
+        facts.docker_ps = "caddy\tUp 5 days\nwatchtower\tUp 5 days\n".into();
+        let r = check_host(&node(), &facts, now(), 14, 7);
+        let containers = r.iter().find(|c| c.key.ends_with(":containers")).unwrap();
+        assert_eq!(containers.severity, Severity::Fail);
+        assert!(
+            containers.detail.contains("remnanode"),
+            "the reason must name the container: {}",
+            containers.detail
+        );
+    }
+
+    #[test]
+    fn a_port_listening_only_on_loopback_is_not_a_public_inbound() {
+        let mut facts = healthy_facts();
+        facts.listening = "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n\
+                           LISTEN 0 4096 127.0.0.1:8443 0.0.0.0:*\n"
+            .into();
+        let r = check_host(&node(), &facts, now(), 14, 7);
+        let ports = r.iter().find(|c| c.key.ends_with(":ports")).unwrap();
+        assert_eq!(ports.severity, Severity::Fail);
+        assert!(ports.detail.contains("8443"), "{}", ports.detail);
+    }
+
+    #[test]
+    fn wildcard_and_ipv6_listeners_count_as_public() {
+        let mut facts = healthy_facts();
+        facts.listening = "State Recv-Q Send-Q Local-Address:Port Peer-Address:Port\n\
+                           LISTEN 0 4096 *:443 *:*\n\
+                           LISTEN 0 4096 [::]:8443 [::]:*\n\
+                           LISTEN 0 4096 [::1]:9000 [::]:*\n"
+            .into();
+        assert_eq!(
+            severity_of(&check_host(&node(), &facts, now(), 14, 7), ":ports"),
+            Severity::Ok
+        );
+        let public = public_listen_ports(&facts.listening);
+        assert!(!public.contains(&9000), "[::1] is loopback");
+    }
+
+    #[test]
+    fn an_unknown_egress_address_warns_instead_of_passing_quietly() {
+        let mut facts = healthy_facts();
+        facts.egress_ip = "curl: (28) Operation timed out\n".into();
+        let r = check_host(&node(), &facts, now(), 14, 7);
+        let egress = r.iter().find(|c| c.key.ends_with(":egress-ip")).unwrap();
+        assert_eq!(egress.severity, Severity::Warn);
+        assert!(
+            egress.detail.contains("cannot be verified"),
+            "{}",
+            egress.detail
+        );
+
+        let ok = check_host(&node(), &healthy_facts(), now(), 14, 7);
+        let egress = ok.iter().find(|c| c.key.ends_with(":egress-ip")).unwrap();
+        assert_eq!(egress.severity, Severity::Ok);
+        assert!(egress.detail.contains("192.0.2.20"));
     }
 
     #[test]

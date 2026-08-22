@@ -1,5 +1,7 @@
 target/
 .xray-cache/
 *.state.json
+# Default --state-file name; it holds node names, channel details and panel error texts.
+.healthcheck-state.json
 .superpowers/
 .idea/

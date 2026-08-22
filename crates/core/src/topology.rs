@@ -328,7 +328,7 @@ mod tests {
                 .map(|p| (p.uuid.clone(), p))
                 .collect::<HashMap<_, _>>(),
             channels: vec![],
-            served_channel_count: 0,
+            served_remarks: Vec::new(),
         }
     }
 

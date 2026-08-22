@@ -18,6 +18,9 @@ impl Diff {
     }
 }
 
+/// Non-OK results of one run, keyed by check key. Keys must be unique by construction — two
+/// results sharing one key collapse into a single entry here, and the loser disappears from the
+/// alert without a trace (see `Channel::check_key`).
 pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
     results
         .iter()
@@ -75,12 +78,13 @@ fn icon(value: &str) -> &'static str {
     }
 }
 
-/// Escape the characters Telegram's HTML parse mode treats specially. A check's own key or detail
-/// text (xray stderr, a panel status message) is not under our control and can contain a stray
-/// `<` or bare `&`; unescaped, that either mangles the message's markup or makes Telegram reject
+/// Escape the characters Telegram's HTML parse mode treats specially. Public because every path
+/// that puts text into an alert needs it, the out-of-band panel-failure alert included. A check's
+/// own key or detail text (xray stderr, a panel status message) is not under our control and can
+/// contain a stray `<` or bare `&`; unescaped, that either mangles the message's markup or makes Telegram reject
 /// the whole alert with "can't parse entities" — losing the alert entirely, which is exactly the
 /// failure this tool exists to prevent.
-fn escape_html(s: &str) -> String {
+pub fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

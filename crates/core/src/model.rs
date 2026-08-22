@@ -78,7 +78,22 @@ pub struct Channel {
     pub address: String,
     pub port: u16,
     /// Ready-made Xray outbound taken from the subscription. Never assembled by us.
+    /// `Value::Null` means the subscription served no config for this channel.
     pub outbound: serde_json::Value,
+}
+
+impl Channel {
+    /// Stable key of this channel's check, unique by construction.
+    ///
+    /// The remark alone is not: it is rendered from a template configured in the panel and
+    /// nothing there enforces uniqueness. Two channels sharing a remark would share a key, and
+    /// since the problem set is a map, one of them would silently vanish from the alert while the
+    /// report on stdout still showed both. The client-facing endpoint is what tells two hosts of
+    /// the same inbound apart, so it goes into the key; the human-facing title stays the plain
+    /// remark.
+    pub fn check_key(&self) -> String {
+        format!("channel:{}@{}:{}", self.remark, self.address, self.port)
+    }
 }
 
 /// An Xray config profile: the full JSON, as stored in the panel.
@@ -95,8 +110,10 @@ pub struct Snapshot {
     pub nodes: Vec<Node>,
     pub profiles: HashMap<String, Profile>,
     pub channels: Vec<Channel>,
-    /// How many channels the rendered subscription actually served.
-    pub served_channel_count: usize,
+    /// Remarks the rendered subscription actually served, duplicates included. Kept as a list
+    /// rather than a count so `subscription:coverage` can compare sets and name what is missing:
+    /// one channel dropped and another one duplicated leaves the counts equal.
+    pub served_remarks: Vec<String>,
 }
 
 #[cfg(test)]
@@ -107,6 +124,26 @@ mod tests {
     fn severity_orders_ok_below_warn_below_fail() {
         assert!(Severity::Ok < Severity::Warn);
         assert!(Severity::Warn < Severity::Fail);
+    }
+
+    #[test]
+    fn channels_sharing_a_remark_still_get_different_keys() {
+        let channel = |address: &str, port: u16| Channel {
+            remark: "the same remark".into(),
+            inbound_tag: "in-a".into(),
+            profile_uuid: Some("p".into()),
+            address: address.into(),
+            port,
+            outbound: serde_json::Value::Null,
+        };
+        let a = channel("alpha.example.com", 443);
+        let b = channel("beta.example.com", 443);
+        let c = channel("alpha.example.com", 8443);
+        assert_ne!(a.check_key(), b.check_key());
+        assert_ne!(a.check_key(), c.check_key());
+        assert!(a.check_key().starts_with("channel:"));
+        // Stable across calls: the diff between two runs depends on it.
+        assert_eq!(a.check_key(), channel("alpha.example.com", 443).check_key());
     }
 
     #[test]

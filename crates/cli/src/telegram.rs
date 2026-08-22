@@ -24,14 +24,19 @@ pub async fn send(token: &str, chat_id: &str, text: &str, thread_id: Option<&str
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[alert] http client: {e}");
+            // `without_url` here too: a builder error carries no URL today, but nothing about
+            // this call site guarantees that, and the URL of this client would hold the token.
+            eprintln!("[alert] http client: {}", e.without_url());
             return false;
         }
     };
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     match client.post(&url).json(&payload).send().await {
         Err(e) => {
-            eprintln!("[alert] telegram unreachable: {e}");
+            // `without_url`: a reqwest error's Display appends " for url (...)", and that URL
+            // carries the bot token. Any network hiccup would otherwise print the live token to
+            // stderr — into whatever collects this tool's logs.
+            eprintln!("[alert] telegram unreachable: {}", e.without_url());
             false
         }
         Ok(resp) if !resp.status().is_success() => {

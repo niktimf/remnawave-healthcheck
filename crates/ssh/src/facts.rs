@@ -55,7 +55,12 @@ async fn run(target: &str, command: &str) -> (i32, String) {
 
 /// Collect everything the node-side checks need, in one pass.
 /// An unreachable host short-circuits: no point issuing five more commands that will all fail.
-pub async fn gather(target: &str, domain: Option<&str>) -> HostFacts {
+///
+/// `echo_url` is the same endpoint the channel probes use (`--echo-url`), passed in rather than
+/// fixed here so that both sides of the exit comparison always ask the same service: two
+/// different endpoints could disagree about the address of a multi-homed host and turn a healthy
+/// channel red.
+pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostFacts {
     let (rc, ping) = run(target, "true").await;
     if rc != 0 {
         let reason = ping
@@ -76,6 +81,10 @@ pub async fn gather(target: &str, domain: Option<&str>) -> HostFacts {
         };
     }
 
+    // Single-quoted for the remote shell; a URL carrying a quote of its own is refused rather
+    // than pasted into a command line.
+    let egress_cmd =
+        (!echo_url.contains('\'')).then(|| format!("curl -fsS --max-time 8 '{echo_url}'"));
     let cert_cmd = domain.map(|d| {
         format!("echo | openssl s_client -connect {d}:443 -servername {d} 2>/dev/null | openssl x509 -noout -enddate")
     });
@@ -85,7 +94,15 @@ pub async fn gather(target: &str, domain: Option<&str>) -> HostFacts {
         run(target, "sudo ss -ltn 2>/dev/null || ss -ltn"),
         run(target, "sudo docker logs --tail 200 remnanode 2>&1 || docker logs --tail 200 remnanode"),
         run(target, RENEWAL_CMD),
-        run(target, "curl -fsS --max-time 8 https://api.ipify.org"),
+        async {
+            match &egress_cmd {
+                Some(cmd) => run(target, cmd).await,
+                None => (
+                    126,
+                    format!("refusing to run an echo URL containing a quote: {echo_url}"),
+                ),
+            }
+        },
     );
     let cert = match cert_cmd {
         Some(cmd) => run(target, &cmd).await.1,

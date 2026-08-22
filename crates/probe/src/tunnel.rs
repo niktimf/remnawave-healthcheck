@@ -12,15 +12,18 @@ pub struct ProbeOutcome {
     pub stderr_tail: String,
 }
 
-const ECHO_URL: &str = "https://api.ipify.org";
-
-/// Run Xray with `config`, ask an echo service for our address through the local SOCKS port,
+/// Run Xray with `config`, ask the echo endpoint for our address through the local SOCKS port,
 /// then kill Xray. Nothing is left running when this returns.
+///
+/// `echo_url` comes from the caller (`--echo-url`) rather than being fixed here: one hard-coded
+/// endpoint going down would paint every channel red at once, which is the false alarm this tool
+/// exists to avoid.
 pub async fn probe(
     xray_bin: &Path,
     config: &Value,
     socks_port: u16,
     timeout: Duration,
+    echo_url: &str,
 ) -> ProbeOutcome {
     // The guard removes this directory on every exit path from here on — success, an early
     // return, or a panic — so a stray xray config carrying the monitoring user's VLESS
@@ -70,12 +73,11 @@ pub async fn probe(
     let deadline = Instant::now() + timeout;
     let mut exit_ip = None;
     while Instant::now() < deadline {
-        if let Ok(resp) = client.get(ECHO_URL).send().await {
+        if let Ok(resp) = client.get(echo_url).send().await {
             if resp.status().is_success() {
                 if let Ok(text) = resp.text().await {
-                    let trimmed = text.trim().to_string();
-                    if !trimmed.is_empty() {
-                        exit_ip = Some(trimmed);
+                    if let Some(ip) = parse_echo_response(&text) {
+                        exit_ip = Some(ip);
                         break;
                     }
                 }
@@ -99,6 +101,17 @@ pub async fn probe(
         exit_ip,
         stderr_tail,
     }
+}
+
+/// The echo endpoint answers with a bare IP address and nothing else. Anything that is not one —
+/// an HTML error page from a CDN in front of it, a captive-portal login form, a rate-limit notice
+/// — is not this channel's exit address and must never be reported as one. `ssh::egress_ip`
+/// validates the node side the same way.
+fn parse_echo_response(body: &str) -> Option<String> {
+    body.trim()
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 async fn write_config(path: &Path, config: &Value) -> std::io::Result<()> {
@@ -171,6 +184,7 @@ mod tests {
             &serde_json::json!({"outbounds": []}),
             1,
             Duration::from_millis(50),
+            "https://echo.example.com",
         )
         .await;
 
@@ -180,6 +194,25 @@ mod tests {
             before, after,
             "the scratch directory created for this run must be gone once probe() returns"
         );
+    }
+
+    #[test]
+    fn only_a_bare_ip_address_counts_as_an_exit() {
+        assert_eq!(
+            parse_echo_response(" 203.0.113.7\n").as_deref(),
+            Some("203.0.113.7")
+        );
+        assert_eq!(
+            parse_echo_response("2001:db8::1").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(parse_echo_response(""), None);
+        assert_eq!(
+            parse_echo_response("<html><title>502 Bad Gateway</title></html>"),
+            None,
+            "an error page must not become an exit address"
+        );
+        assert_eq!(parse_echo_response("203.0.113.7 (cached)"), None);
     }
 
     #[test]

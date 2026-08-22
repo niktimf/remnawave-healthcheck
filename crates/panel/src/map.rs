@@ -6,16 +6,18 @@ use std::collections::HashMap;
 /// Joins the three panel views into one snapshot.
 ///
 /// Channels keep every config the panel resolved, even when the rendered subscription did not
-/// serve it — `served_channel_count` carries the difference so `subscription:coverage` can report
-/// it instead of the gap disappearing.
+/// serve it — `served_remarks` carries what the subscription did serve, duplicates included, so
+/// `subscription:coverage` can compare the two sets instead of the gap disappearing.
 pub fn build_snapshot(
     nodes: Vec<NodeDto>,
     profiles: Vec<ProfileDto>,
     resolved: Vec<ResolvedDto>,
     outbounds: Vec<(String, Value)>,
 ) -> Snapshot {
+    // Recorded before the map collapses duplicates: a remark served twice is exactly what the
+    // coverage check needs to see, and the map would hide it.
+    let served_remarks: Vec<String> = outbounds.iter().map(|(remark, _)| remark.clone()).collect();
     let served: HashMap<String, Value> = outbounds.into_iter().collect();
-    let served_channel_count = served.len();
 
     let channels: Vec<Channel> = resolved
         .into_iter()
@@ -45,7 +47,7 @@ pub fn build_snapshot(
             })
             .collect(),
         channels,
-        served_channel_count,
+        served_remarks,
     }
 }
 
@@ -121,7 +123,7 @@ mod tests {
         assert_eq!(snap.channels[0].inbound_tag, "in-a");
         assert_eq!(snap.channels[0].profile_uuid.as_deref(), Some("p-1"));
         assert_eq!(snap.channels[0].outbound["protocol"], "vless");
-        assert_eq!(snap.served_channel_count, 1);
+        assert_eq!(snap.served_remarks, vec!["alpha direct".to_string()]);
         assert!(snap.profiles.contains_key("p-1"));
     }
 
@@ -144,6 +146,6 @@ mod tests {
             1,
             "resolved channels are kept for the coverage check"
         );
-        assert_eq!(snap.served_channel_count, 0);
+        assert!(snap.served_remarks.is_empty());
     }
 }

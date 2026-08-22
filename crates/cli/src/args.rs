@@ -56,4 +56,8 @@ pub struct Args {
     /// First local SOCKS port; each channel gets the next one
     #[arg(long, default_value_t = 10800)]
     pub socks_base_port: u16,
+    /// Endpoint that echoes back the caller's IP address; used both through each channel's tunnel
+    /// and on the node itself, so that both sides of an exit comparison ask the same service
+    #[arg(long, default_value = "https://api.ipify.org")]
+    pub echo_url: String,
 }

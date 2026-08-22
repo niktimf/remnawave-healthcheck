@@ -28,22 +28,69 @@ pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
         .collect()
 }
 
-/// The panel resolved N channels for the monitoring user; the rendered subscription served M.
-/// A gap means templates or response rules are eating channels while the panel looks healthy.
+/// The panel resolved a set of channels for the monitoring user; the rendered subscription served
+/// a set of remarks. The two must be the same set — that join by remark is what gives every
+/// channel its outbound, so a mismatch means channels are being probed with the wrong config or
+/// not at all, while the panel still looks healthy.
+///
+/// Sets, not counts: one channel dropped and another one duplicated leaves the counts equal and
+/// would have made a broken join look green.
 pub fn subscription_coverage(snapshot: &Snapshot) -> CheckResult {
-    let resolved = snapshot.channels.len();
-    let served = snapshot.served_channel_count;
-    let severity = if resolved == served {
-        Severity::Ok
-    } else {
-        Severity::Fail
-    };
-    CheckResult::new(
-        "subscription:coverage",
-        "subscription coverage",
-        severity,
-        format!("subscription served {served} of {resolved} resolved channels"),
-    )
+    let resolved: BTreeSet<&str> = snapshot
+        .channels
+        .iter()
+        .map(|c| c.remark.as_str())
+        .collect();
+    let served: BTreeSet<&str> = snapshot.served_remarks.iter().map(String::as_str).collect();
+
+    let missing: Vec<&str> = resolved.difference(&served).copied().collect();
+    let unexpected: Vec<&str> = served.difference(&resolved).copied().collect();
+    // A remark served twice makes the join ambiguous: both channels would be probed with whichever
+    // outbound happened to win, so one of them would be reported on evidence that is not its own.
+    let duplicated: Vec<&str> = served
+        .iter()
+        .copied()
+        .filter(|r| {
+            snapshot
+                .served_remarks
+                .iter()
+                .filter(|served| served.as_str() == *r)
+                .count()
+                > 1
+        })
+        .collect();
+
+    let key = "subscription:coverage";
+    let title = "subscription coverage";
+    if missing.is_empty() && unexpected.is_empty() && duplicated.is_empty() {
+        return CheckResult::new(
+            key,
+            title,
+            Severity::Ok,
+            format!(
+                "subscription served all {} resolved channels",
+                resolved.len()
+            ),
+        );
+    }
+
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("not served: {}", missing.join(", ")));
+    }
+    if !unexpected.is_empty() {
+        parts.push(format!(
+            "served but not resolved by the panel: {}",
+            unexpected.join(", ")
+        ));
+    }
+    if !duplicated.is_empty() {
+        parts.push(format!(
+            "served more than once, so their configs cannot be told apart: {}",
+            duplicated.join(", ")
+        ));
+    }
+    CheckResult::new(key, title, Severity::Fail, parts.join("; "))
 }
 
 /// Inbounds that are live on a node but never reach the monitoring user — typically the user was
@@ -129,7 +176,7 @@ mod tests {
         }
     }
 
-    fn snap(nodes: Vec<Node>, channel_tags: &[&str], served: usize) -> Snapshot {
+    fn snap(nodes: Vec<Node>, channel_tags: &[&str], served: &[&str]) -> Snapshot {
         Snapshot {
             nodes,
             profiles: HashMap::new(),
@@ -144,7 +191,7 @@ mod tests {
                     outbound: json!({}),
                 })
                 .collect(),
-            served_channel_count: served,
+            served_remarks: served.iter().map(|r| r.to_string()).collect(),
         }
     }
 
@@ -167,12 +214,37 @@ mod tests {
     }
 
     #[test]
-    fn subscription_coverage_fails_when_served_count_differs() {
-        let ok = subscription_coverage(&snap(vec![], &["in-a", "in-b"], 2));
+    fn subscription_coverage_is_ok_only_when_the_two_sets_match() {
+        let ok = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &["ch-in-a", "ch-in-b"]));
         assert_eq!(ok.severity, Severity::Ok);
-        let bad = subscription_coverage(&snap(vec![], &["in-a", "in-b"], 0));
+        let bad = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &[]));
         assert_eq!(bad.severity, Severity::Fail);
-        assert!(bad.detail.contains('0') && bad.detail.contains('2'));
+        assert!(bad.detail.contains("ch-in-a") && bad.detail.contains("ch-in-b"));
+    }
+
+    #[test]
+    fn subscription_coverage_names_the_channel_the_subscription_dropped() {
+        let r = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &["ch-in-a"]));
+        assert_eq!(r.severity, Severity::Fail);
+        assert!(r.detail.contains("ch-in-b"), "{}", r.detail);
+        assert!(!r.detail.contains("ch-in-a"), "{}", r.detail);
+    }
+
+    #[test]
+    fn one_channel_dropped_and_another_duplicated_no_longer_cancels_out() {
+        // The counts match (two resolved, two served) but the join is broken: the old count-based
+        // check reported this as green.
+        let r = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &["ch-in-a", "ch-in-a"]));
+        assert_eq!(r.severity, Severity::Fail);
+        assert!(r.detail.contains("ch-in-b"), "{}", r.detail);
+        assert!(r.detail.contains("more than once"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_remark_served_but_never_resolved_also_fails() {
+        let r = subscription_coverage(&snap(vec![], &["in-a"], &["ch-in-a", "ch-ghost"]));
+        assert_eq!(r.severity, Severity::Fail);
+        assert!(r.detail.contains("ch-ghost"), "{}", r.detail);
     }
 
     #[test]
@@ -186,7 +258,7 @@ mod tests {
                 &["in-a", "in-lonely"],
             )],
             &["in-a"],
-            1,
+            &["ch-in-a"],
         );
         let results = monitoring_coverage(&s);
         assert_eq!(results.len(), 1);
@@ -200,7 +272,7 @@ mod tests {
         let s = snap(
             vec![node("alpha", true, true, "26.6.27", &["in-lonely"])],
             &[],
-            0,
+            &[],
         );
         assert!(monitoring_coverage(&s).is_empty());
     }

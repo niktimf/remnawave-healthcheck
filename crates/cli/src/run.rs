@@ -2,7 +2,7 @@ use crate::args::Args;
 use crate::telegram;
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use remnawave_healthcheck_core::model::{CheckResult, Severity, Snapshot};
+use remnawave_healthcheck_core::model::{Channel, CheckResult, Severity, Snapshot};
 use remnawave_healthcheck_core::{checks, report, state, topology};
 use remnawave_healthcheck_panel::{short_uuid_from_url, PanelClient};
 use remnawave_healthcheck_probe as probe;
@@ -20,10 +20,14 @@ pub async fn run(args: Args) -> Result<i32> {
     let short_uuid = short_uuid_from_url(&args.subscription_url)
         .context("subscription URL has no shortUuid in its last path segment")?;
     let client = PanelClient::new(&args.panel_url, &args.api_token)?;
-    let snapshot = client
+    let snapshot = match client
         .snapshot(&short_uuid)
         .await
-        .context("reading the panel")?;
+        .context("reading the panel")
+    {
+        Ok(snapshot) => snapshot,
+        Err(e) => return panel_unreadable(&args, e).await,
+    };
 
     let mut results = Vec::new();
     results.extend(checks::node_status(&snapshot.nodes));
@@ -44,17 +48,14 @@ pub async fn run(args: Args) -> Result<i32> {
 
     print!("{}", report::render(&results));
 
-    // A partial run (some check family skipped) must not touch history: `results` here is not
-    // "everything is fine", it is "everything we looked at is fine". Writing it as the new state
-    // would erase the skipped family's problems from the problem set, and the diff would report
-    // them as recovered even though nothing about them actually changed — and the following full
-    // run would then report them as new all over again. Diagnostic runs (`--no-ssh`,
-    // `--no-channels`) still print the report and carry the right exit code; they just leave
-    // state and Telegram alone.
-    if args.no_ssh || args.no_channels {
-        eprintln!(
-            "[state] partial run (--no-ssh or --no-channels given): state file and Telegram notification skipped"
-        );
+    // A partial run (some check family was not evaluated) must not touch history: `results` here
+    // is not "everything is fine", it is "everything we looked at is fine". Writing it as the new
+    // state would erase the unevaluated family's problems from the problem set, and the diff would
+    // report them as recovered even though nothing about them actually changed — and the following
+    // full run would then report them as new all over again. Such runs still print the report and
+    // carry the right exit code; they just leave state and Telegram alone.
+    if let Some(reason) = partial_run_reason(&args, &results) {
+        eprintln!("[state] {reason}: state file and Telegram notification skipped");
         return Ok(report::exit_code(&results));
     }
 
@@ -70,13 +71,70 @@ pub async fn run(args: Args) -> Result<i32> {
         };
     let previous = state::from_json(&previous_raw);
     let diff = state::diff(&current, &previous);
-    if !diff.is_empty() {
-        notify(&args, &diff).await;
+    if !diff.is_empty() && notify(&args, &diff).await == Delivery::Failed {
+        // The change was detected but nobody was told. Writing it into the state file now would
+        // mark it "already known" and it would never appear in a diff again — one network blip
+        // would swallow the alert for good. Leaving the file alone costs a repeated alert next
+        // run, which is the harmless direction of the trade.
+        eprintln!(
+            "[state] the alert could not be delivered: state file left untouched so the change is reported again next run"
+        );
+        return Ok(report::exit_code(&results));
     }
     std::fs::write(&args.state_file, state::to_json(&current))
         .with_context(|| format!("writing {}", args.state_file.display()))?;
 
     Ok(report::exit_code(&results))
+}
+
+/// Why this run must not be treated as a full picture of the installation, if it must not.
+///
+/// Skipping a family by flag is one way; the other is `channel_checks` failing before it could
+/// probe anything, which leaves a single `channels:setup` failure in place of every `channel:*`
+/// result. Both look identical to the state file — a pile of keys that simply are not there — and
+/// both would otherwise be written as the new truth, turning every previously failing channel into
+/// a RECOVERED notification about a channel nobody looked at.
+fn partial_run_reason(args: &Args, results: &[CheckResult]) -> Option<String> {
+    if args.no_ssh || args.no_channels {
+        return Some("partial run (--no-ssh or --no-channels given)".to_string());
+    }
+    let setup_failed = results
+        .iter()
+        .any(|r| r.key == SETUP_KEY && r.severity == Severity::Fail);
+    setup_failed.then(|| {
+        "partial run (channel probing could not start, so no channel was checked)".to_string()
+    })
+}
+
+/// The panel is the only source of truth this tool has, so a failure to read it means nothing at
+/// all was checked — and it is the loudest failure there is: panel down, token revoked, DNS gone.
+/// Letting it end the process on stderr alone would silence the alerting channel at exactly the
+/// moment it matters, so the reason goes to Telegram directly, bypassing the diff. State is left
+/// untouched: overwriting it here would make the next successful run announce every still-broken
+/// check as RECOVERED.
+async fn panel_unreadable(args: &Args, err: anyhow::Error) -> Result<i32> {
+    let (Some(token), Some(chat)) = (&args.telegram_bot_token, &args.telegram_chat_id) else {
+        // No notifier configured — behave exactly as before and let `main` report on stderr.
+        return Err(err);
+    };
+    let mut text = format!(
+        "\u{1F534} <b>Healthcheck</b>\nthe panel could not be read, so nothing was checked\n{}",
+        state::escape_html(&format!("{err:#}"))
+    );
+    if let Some(url) = args.run_url.as_deref() {
+        text.push_str(&format!("\n\n{url}"));
+    }
+    let sent = telegram::send(token, chat, &text, args.telegram_thread_id.as_deref()).await;
+    eprintln!("healthcheck failed: {err:#}");
+    eprintln!(
+        "[alert] panel unreadable → telegram {}",
+        if sent {
+            "sent"
+        } else {
+            "FAILED (see the line above)"
+        }
+    );
+    Ok(2)
 }
 
 /// `socks_base_port + concurrency` must fit under the last TCP port, or two channels probed in
@@ -133,7 +191,7 @@ async fn node_checks(
                 .parse::<std::net::IpAddr>()
                 .err()
                 .map(|_| node.address.as_str());
-            let facts = node_ssh::gather(&node.address, domain).await;
+            let facts = node_ssh::gather(&node.address, domain, &args.echo_url).await;
             (node, facts)
         });
     }
@@ -171,7 +229,7 @@ async fn channel_checks(
 ) -> Vec<CheckResult> {
     let setup_fail = |detail: String| {
         vec![CheckResult::new(
-            "channels:setup",
+            SETUP_KEY,
             "channel probing setup",
             Severity::Fail,
             detail,
@@ -204,37 +262,24 @@ async fn channel_checks(
         for (i, channel) in chunk.iter().enumerate() {
             let binary = binary.clone();
             let port = args.socks_base_port.saturating_add(i as u16);
+            let echo_url = args.echo_url.as_str();
             pending.push(async move {
-                let expect = match topology::resolve_exit(channel, snapshot) {
-                    Ok(node) => node,
-                    Err(e) => {
-                        return CheckResult::new(
-                            format!("channel:{}", channel.remark),
-                            channel.remark.clone(),
-                            Severity::Fail,
-                            format!("cannot tell where this channel should exit: {e}"),
-                        )
-                    }
+                let expect = match channel_precheck(channel, snapshot, disabled) {
+                    Ok(expect) => expect,
+                    Err(decided) => return decided,
                 };
-                if disabled.contains(&expect.as_str()) {
-                    return CheckResult::new(
-                        format!("channel:{}", channel.remark),
-                        channel.remark.clone(),
-                        Severity::Warn,
-                        format!("expected exit '{expect}' is disabled in the panel"),
-                    );
-                }
 
                 let config = probe::config::build(&channel.outbound, port);
-                let mut outcome = probe::probe(&binary, &config, port, timeout).await;
+                let mut outcome = probe::probe(&binary, &config, port, timeout, echo_url).await;
                 // Retry only a dead tunnel: no exit at all is the common single blip. A wrong
                 // exit is deterministic — the outbound config does not change between the two
                 // calls — so retrying it would only double the timeout on infra that is
                 // genuinely broken, without ever changing the answer.
                 if outcome.exit_ip.is_none() {
-                    outcome = probe::probe(&binary, &config, port, timeout).await;
+                    outcome = probe::probe(&binary, &config, port, timeout, echo_url).await;
                 }
                 probe::classify(
+                    &channel.check_key(),
                     &channel.remark,
                     &expect,
                     egress.get(&expect).map(String::as_str),
@@ -247,6 +292,50 @@ async fn channel_checks(
         }
     }
     results
+}
+
+/// Key of the single result that stands in for the whole channel family when probing could not
+/// be set up at all.
+const SETUP_KEY: &str = "channels:setup";
+
+/// Everything about a channel that can be settled before xray is started: the name of the node it
+/// is supposed to exit through, or the finished check result explaining why it cannot be probed.
+///
+/// The last of those reasons is a channel the panel resolved but the subscription never served.
+/// Its outbound is `Value::Null`, and handing that to the config builder produces a config xray
+/// refuses to start — the channel would then be reported as "no exit (tunnel dead)", after two
+/// full probe timeouts, pointing the reader at the tunnel instead of at the subscription.
+fn channel_precheck(
+    channel: &Channel,
+    snapshot: &Snapshot,
+    disabled: &[&str],
+) -> Result<String, CheckResult> {
+    let key = channel.check_key();
+    let expect = topology::resolve_exit(channel, snapshot).map_err(|e| {
+        CheckResult::new(
+            key.clone(),
+            channel.remark.clone(),
+            Severity::Fail,
+            format!("cannot tell where this channel should exit: {e}"),
+        )
+    })?;
+    if disabled.contains(&expect.as_str()) {
+        return Err(CheckResult::new(
+            key,
+            channel.remark.clone(),
+            Severity::Warn,
+            format!("expected exit '{expect}' is disabled in the panel"),
+        ));
+    }
+    if channel.outbound.is_null() {
+        return Err(CheckResult::new(
+            key,
+            channel.remark.clone(),
+            Severity::Fail,
+            "the panel resolved this channel but the subscription served no config for it, so there is nothing to probe",
+        ));
+    }
+    Ok(expect)
 }
 
 /// The version the nodes are actually running. When they disagree, `xray:version-drift` has
@@ -267,7 +356,16 @@ fn required_xray_version(snapshot: &Snapshot) -> Option<String> {
         .map(|(v, _)| v.to_string())
 }
 
-async fn notify(args: &Args, diff: &state::Diff) {
+/// What became of an alert. `NotConfigured` is not a failure: running without Telegram
+/// credentials is a deliberate configuration, and it must not hold the state file hostage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Sent,
+    Failed,
+    NotConfigured,
+}
+
+async fn notify(args: &Args, diff: &state::Diff) -> Delivery {
     let message = state::format_message(diff, args.run_url.as_deref());
     match (&args.telegram_bot_token, &args.telegram_chat_id) {
         (Some(token), Some(chat)) => {
@@ -284,13 +382,21 @@ async fn notify(args: &Args, diff: &state::Diff) {
                     "FAILED (see the line above)"
                 }
             );
+            if sent {
+                Delivery::Sent
+            } else {
+                Delivery::Failed
+            }
         }
-        _ => eprintln!(
-            "[alert] {} new / {} worse / {} recovered, but no Telegram credentials were given",
-            diff.new.len(),
-            diff.escalated.len(),
-            diff.recovered.len()
-        ),
+        _ => {
+            eprintln!(
+                "[alert] {} new / {} worse / {} recovered, but no Telegram credentials were given",
+                diff.new.len(),
+                diff.escalated.len(),
+                diff.recovered.len()
+            );
+            Delivery::NotConfigured
+        }
     }
 }
 
@@ -316,7 +422,8 @@ async fn test_alert(args: &Args) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remnawave_healthcheck_core::model::Node;
+    use remnawave_healthcheck_core::model::{Node, Profile};
+    use serde_json::json;
     use std::io::{Error, ErrorKind};
 
     fn node(name: &str, disabled: bool, version: Option<&str>) -> Node {
@@ -338,7 +445,7 @@ mod tests {
             nodes,
             profiles: HashMap::new(),
             channels: vec![],
-            served_channel_count: 0,
+            served_remarks: Vec::new(),
         }
     }
 
@@ -361,7 +468,99 @@ mod tests {
             concurrency: 8,
             probe_timeout_secs: 22,
             socks_base_port: 10800,
+            echo_url: "https://echo.example.com".into(),
         }
+    }
+
+    /// One exit node with a plain freedom profile, plus one channel pointing at it.
+    fn resolvable_snapshot(outbound: serde_json::Value) -> Snapshot {
+        let mut node = node("beta", false, Some("26.6.27"));
+        node.address = "beta.example.com".into();
+        node.inbound_tags = vec!["in-exit".into()];
+        node.profile_uuid = Some("p-exit".into());
+        let profile = Profile {
+            uuid: "p-exit".into(),
+            name: "exit".into(),
+            config: json!({
+                "inbounds": [{"tag": "in-exit", "port": 443}],
+                "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            }),
+        };
+        Snapshot {
+            nodes: vec![node],
+            profiles: HashMap::from([("p-exit".to_string(), profile)]),
+            channels: vec![Channel {
+                remark: "beta direct".into(),
+                inbound_tag: "in-exit".into(),
+                profile_uuid: Some("p-exit".into()),
+                address: "beta.example.com".into(),
+                port: 443,
+                outbound,
+            }],
+            served_remarks: vec!["beta direct".to_string()],
+        }
+    }
+
+    #[test]
+    fn a_probeable_channel_precheck_yields_its_expected_exit() {
+        let snap = resolvable_snapshot(json!({"protocol": "vless"}));
+        assert_eq!(
+            channel_precheck(&snap.channels[0], &snap, &[]).unwrap(),
+            "beta"
+        );
+    }
+
+    #[test]
+    fn a_channel_the_subscription_never_served_fails_without_being_probed() {
+        // outbound == null: building a config out of it would make xray refuse to start and the
+        // channel would be blamed for a dead tunnel after two full timeouts.
+        let snap = resolvable_snapshot(serde_json::Value::Null);
+        let decided = channel_precheck(&snap.channels[0], &snap, &[])
+            .expect_err("a channel with no config must not reach the probe");
+        assert_eq!(decided.severity, Severity::Fail);
+        assert!(
+            decided.detail.contains("subscription"),
+            "the reason must point at the subscription, not at the tunnel: {}",
+            decided.detail
+        );
+        assert!(!decided.detail.contains("tunnel"), "{}", decided.detail);
+    }
+
+    #[test]
+    fn a_channel_whose_exit_is_disabled_only_warns() {
+        let snap = resolvable_snapshot(json!({"protocol": "vless"}));
+        let decided = channel_precheck(&snap.channels[0], &snap, &["beta"]).unwrap_err();
+        assert_eq!(decided.severity, Severity::Warn);
+    }
+
+    #[test]
+    fn precheck_results_carry_the_channels_unique_key_and_plain_title() {
+        let snap = resolvable_snapshot(serde_json::Value::Null);
+        let decided = channel_precheck(&snap.channels[0], &snap, &[]).unwrap_err();
+        assert_eq!(decided.key, snap.channels[0].check_key());
+        assert_eq!(decided.title, "beta direct");
+
+        // Two channels sharing a remark must not share a key, or one of them would silently
+        // disappear from the problem set and therefore from the alert.
+        let mut other = snap.channels[0].clone();
+        other.address = "gamma.example.com".into();
+        assert_ne!(decided.key, other.check_key());
+    }
+
+    #[test]
+    fn a_failed_probe_setup_makes_the_run_partial() {
+        let args = test_args();
+        assert!(partial_run_reason(&args, &[]).is_none());
+
+        let setup_failed = vec![CheckResult::new(
+            SETUP_KEY,
+            "channel probing setup",
+            Severity::Fail,
+            "obtaining xray 26.6.27: connection refused",
+        )];
+        let reason = partial_run_reason(&args, &setup_failed)
+            .expect("a run that probed no channel is not a full picture");
+        assert!(reason.contains("no channel was checked"), "{reason}");
     }
 
     #[test]

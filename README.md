@@ -19,7 +19,7 @@ The same three values can be given as environment variables instead of flags —
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` (optionally `TELEGRAM_THREAD_ID` for a supergroup topic) to
 get alerted when something changes. Run `remnawave-healthcheck --help` for the full flag list, including
 `--no-ssh`, `--no-channels`, `--test-alert`, and the tuning knobs (`--concurrency`, `--probe-timeout-secs`,
-`--cert-warn-days`, `--config-warn-days`).
+`--cert-warn-days`, `--config-warn-days`, `--echo-url`).
 
 ## What it checks
 
@@ -33,9 +33,10 @@ get alerted when something changes. Run `remnawave-healthcheck --help` for the f
   monitoring user's subscription, typically because the user was never added to that squad.
 - **Xray version drift** across nodes — client and node must agree on protocol features to talk to each
   other at all.
-- **Node-side facts over SSH** — containers up and healthy, expected ports listening, provisioned users
-  present in the logs, config-push freshness, TLS certificate expiry, and the acme.sh renewal mechanism
-  itself (not just the certificate's remaining days).
+- **Node-side facts over SSH** — the node container running, containers up and healthy, expected ports
+  listening publicly, provisioned users present in the logs, config-push freshness, the node's own
+  external address, TLS certificate expiry, and the acme.sh renewal mechanism itself (not just the
+  certificate's remaining days).
 
 ## What it needs
 
