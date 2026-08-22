@@ -13,14 +13,16 @@ fn release_url(version: &str) -> String {
 /// hitting its time limit is the realistic case — would otherwise leave a truncated file that the
 /// next run accepts on sight, and every channel would then fail against a binary that cannot run.
 pub async fn ensure(version: &str, cache_dir: &Path) -> Result<PathBuf> {
-    let binary = cache_dir.join(version).join("xray");
+    // The directory first, the binary from it: asking a path built here for its parent could only
+    // be answered with an `expect` for a case that cannot happen.
+    let dir = cache_dir.join(version);
+    let binary = dir.join("xray");
     if binary.exists() {
         return Ok(binary);
     }
-    let dir = binary.parent().expect("binary path always has a parent");
-    tokio::fs::create_dir_all(dir).await?;
+    tokio::fs::create_dir_all(&dir).await?;
 
-    download_into(version, dir).await?;
+    download_into(version, &dir).await?;
     Ok(binary)
 }
 
@@ -42,11 +44,11 @@ async fn download_into(version: &str, dir: &Path) -> Result<()> {
         // Same directory, so the rename below stays within one filesystem and is atomic. The pid
         // keeps two runs of the tool from unpacking over each other's partial file.
         let partial = dir.join(format!("xray.{}.partial", std::process::id()));
-        let unpacked = unpack_into(bytes, &partial);
-        if unpacked.is_err() {
+        // A half-written file is worse than none: the next run would rename it into place and
+        // every channel would fail against a binary that cannot run.
+        unpack_into(bytes, &partial).inspect_err(|_| {
             let _ = std::fs::remove_file(&partial);
-        }
-        unpacked?;
+        })?;
         std::fs::rename(&partial, &target)
             .with_context(|| format!("moving the unpacked binary into {}", target.display()))?;
         Ok(())
