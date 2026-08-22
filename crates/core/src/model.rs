@@ -2,11 +2,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Severity of a single check. Ordering matters: the run's overall severity is the maximum.
+///
+/// One textual encoding, and only one: the state file goes through `Display`/`FromStr` too, so
+/// what is written there is the same `OK`/`WARN`/`FAIL` the report and the alerts show. A derived
+/// encoding would give the same value a second spelling that nothing else in the tool understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub enum Severity {
     Ok,
     Warn,
     Fail,
+}
+
+impl From<Severity> for String {
+    fn from(severity: Severity) -> Self {
+        severity.to_string()
+    }
+}
+
+impl TryFrom<String> for Severity {
+    type Error = ParseSeverityError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
 }
 
 impl Severity {

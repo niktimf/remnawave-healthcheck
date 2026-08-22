@@ -1,5 +1,5 @@
 use crate::model::{CheckResult, Node, Severity, Snapshot};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What the panel itself thinks of each node. Costs no SSH and no tunnels.
 pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
@@ -41,23 +41,22 @@ pub fn subscription_coverage(snapshot: &Snapshot) -> CheckResult {
         .iter()
         .map(|c| c.remark.as_str())
         .collect();
-    let served: BTreeSet<&str> = snapshot.served_remarks.iter().map(String::as_str).collect();
+    // Counted in one pass: both the set of served remarks and the ones served more than once come
+    // out of the same tally.
+    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+    for remark in &snapshot.served_remarks {
+        *tally.entry(remark.as_str()).or_default() += 1;
+    }
+    let served: BTreeSet<&str> = tally.keys().copied().collect();
 
     let missing: Vec<&str> = resolved.difference(&served).copied().collect();
     let unexpected: Vec<&str> = served.difference(&resolved).copied().collect();
     // A remark served twice makes the join ambiguous: both channels would be probed with whichever
     // outbound happened to win, so one of them would be reported on evidence that is not its own.
-    let duplicated: Vec<&str> = served
+    let duplicated: Vec<&str> = tally
         .iter()
-        .copied()
-        .filter(|r| {
-            snapshot
-                .served_remarks
-                .iter()
-                .filter(|served| served.as_str() == *r)
-                .count()
-                > 1
-        })
+        .filter(|(_, count)| **count > 1)
+        .map(|(remark, _)| *remark)
         .collect();
 
     let key = "subscription:coverage";
@@ -127,30 +126,24 @@ pub fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
 /// agree on features such as sessionIDTable). There is no configured expectation — the drift itself
 /// is the signal.
 pub fn xray_version_drift(nodes: &[Node]) -> CheckResult {
-    let versions: BTreeSet<&str> = nodes
+    let versions: Vec<&str> = nodes
         .iter()
         .filter(|n| !n.is_disabled)
         .filter_map(|n| n.xray_version.as_deref())
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
         .collect();
 
     let key = "xray:version-drift";
     let title = "xray version drift";
-    match versions.len() {
-        0 => CheckResult::new(key, title, Severity::Ok, "no versions reported"),
-        1 => CheckResult::new(
-            key,
-            title,
-            Severity::Ok,
-            format!("all nodes on {}", versions.iter().next().unwrap()),
-        ),
-        _ => CheckResult::new(
+    match versions.as_slice() {
+        [] => CheckResult::new(key, title, Severity::Ok, "no versions reported"),
+        [only] => CheckResult::new(key, title, Severity::Ok, format!("all nodes on {only}")),
+        several => CheckResult::new(
             key,
             title,
             Severity::Warn,
-            format!(
-                "nodes disagree: {}",
-                versions.into_iter().collect::<Vec<_>>().join(", ")
-            ),
+            format!("nodes disagree: {}", several.join(", ")),
         ),
     }
 }

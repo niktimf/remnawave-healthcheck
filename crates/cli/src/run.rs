@@ -3,6 +3,7 @@ use crate::telegram;
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use remnawave_healthcheck_core::model::{Channel, CheckResult, Severity, Snapshot};
+use remnawave_healthcheck_core::report::Outcome;
 use remnawave_healthcheck_core::{checks, report, state, topology};
 use remnawave_healthcheck_panel::{short_uuid_from_url, PanelClient};
 use remnawave_healthcheck_probe as probe;
@@ -12,7 +13,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
-pub async fn run(args: Args) -> Result<i32> {
+pub async fn run(args: Args) -> Result<Outcome> {
     if args.test_alert {
         return test_alert(&args).await;
     }
@@ -57,7 +58,7 @@ pub async fn run(args: Args) -> Result<i32> {
     // carry the right exit code; they just leave state and Telegram alone.
     if let Some(reason) = partial_run_reason(&args, &results) {
         eprintln!("[state] {reason}: state file and Telegram notification skipped");
-        return Ok(report::exit_code(&results));
+        return Ok(report::outcome(&results));
     }
 
     let current = state::problem_set(&results);
@@ -80,12 +81,12 @@ pub async fn run(args: Args) -> Result<i32> {
         eprintln!(
             "[state] the alert could not be delivered: state file left untouched so the change is reported again next run"
         );
-        return Ok(report::exit_code(&results));
+        return Ok(report::outcome(&results));
     }
     std::fs::write(&args.state_file, state::to_json(&current))
         .with_context(|| format!("writing {}", args.state_file.display()))?;
 
-    Ok(report::exit_code(&results))
+    Ok(report::outcome(&results))
 }
 
 /// Why this run must not be treated as a full picture of the installation, if it must not.
@@ -113,7 +114,7 @@ fn partial_run_reason(args: &Args, results: &[CheckResult]) -> Option<String> {
 /// moment it matters, so the reason goes to Telegram directly, bypassing the diff. State is left
 /// untouched: overwriting it here would make the next successful run announce every still-broken
 /// check as RECOVERED.
-async fn panel_unreadable(args: &Args, err: anyhow::Error) -> Result<i32> {
+async fn panel_unreadable(args: &Args, err: anyhow::Error) -> Result<Outcome> {
     let (Some(token), Some(chat)) = (&args.telegram_bot_token, &args.telegram_chat_id) else {
         // No notifier configured — behave exactly as before and let `main` report on stderr.
         return Err(err);
@@ -135,7 +136,7 @@ async fn panel_unreadable(args: &Args, err: anyhow::Error) -> Result<i32> {
             "FAILED (see the line above)"
         }
     );
-    Ok(2)
+    Ok(Outcome::Aborted)
 }
 
 /// `socks_base_port + concurrency` must fit under the last TCP port, or two channels probed in
@@ -401,10 +402,10 @@ async fn notify(args: &Args, diff: &state::Diff) -> Delivery {
     }
 }
 
-async fn test_alert(args: &Args) -> Result<i32> {
+async fn test_alert(args: &Args) -> Result<Outcome> {
     let (Some(token), Some(chat)) = (&args.telegram_bot_token, &args.telegram_chat_id) else {
         eprintln!("[alert] TEST: no Telegram bot token or chat id given");
-        return Ok(2);
+        return Ok(Outcome::Aborted);
     };
     let sent = telegram::send(
         token,
@@ -417,7 +418,7 @@ async fn test_alert(args: &Args) -> Result<i32> {
         "[alert] TEST: delivery {}",
         if sent { "OK" } else { "FAILED" }
     );
-    Ok(if sent { 0 } else { 1 })
+    Ok(if sent { Outcome::Ok } else { Outcome::Failed })
 }
 
 #[cfg(test)]

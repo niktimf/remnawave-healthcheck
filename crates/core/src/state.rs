@@ -51,32 +51,30 @@ pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
 /// was already a problem. Softening (FAIL -> WARN) is deliberately silent: the problem is still
 /// there and re-alerting on it is noise.
 pub fn diff(current: &ProblemSet, previous: &ProblemSet) -> Diff {
-    let new = current
-        .iter()
-        .filter(|(k, _)| !previous.contains_key(*k))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let recovered = previous
-        .iter()
-        .filter(|(k, _)| !current.contains_key(*k))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    let escalated = current
-        .iter()
-        .filter(|(k, v)| previous.get(*k).is_some_and(|p| v.severity > p.severity))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
     Diff {
-        new,
-        recovered,
-        escalated,
+        new: select(current, |k, _| !previous.contains_key(k)),
+        recovered: select(previous, |k, _| !current.contains_key(k)),
+        escalated: select(current, |k, v| {
+            previous.get(k).is_some_and(|p| v.severity > p.severity)
+        }),
     }
 }
 
+/// The entries of `from` the predicate keeps. Owned, because a diff outlives the two sets it was
+/// computed from.
+fn select(from: &ProblemSet, keep: impl Fn(&str, &Problem) -> bool) -> ProblemSet {
+    from.iter()
+        .filter(|(k, v)| keep(k, v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Every variant is spelled out: a wildcard here would give a future severity a red circle
+/// silently instead of failing to compile.
 fn icon(severity: Severity) -> &'static str {
     match severity {
         Severity::Warn => "\u{1F7E1}",
-        _ => "\u{1F534}",
+        Severity::Ok | Severity::Fail => "\u{1F534}",
     }
 }
 
@@ -87,9 +85,16 @@ fn icon(severity: Severity) -> &'static str {
 /// the whole alert with "can't parse entities" — losing the alert entirely, which is exactly the
 /// failure this tool exists to prevent.
 pub fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// One problem as it appears in an alert line. The severity label is ours and needs no escaping;
@@ -120,8 +125,11 @@ pub fn format_message(d: &Diff, run_url: Option<&str>) -> String {
     lines.join("\n")
 }
 
+/// A problem set is a map of strings to two owned fields, so serialising it cannot fail for any
+/// reason short of a bug in this crate. Swallowing an error here would write `{}` — an empty
+/// problem set — and the next run would report every still-broken check as recovered.
 pub fn to_json(state: &ProblemSet) -> String {
-    serde_json::to_string_pretty(state).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(state).expect("a problem set always serialises")
 }
 
 /// Anything unreadable is treated as "no previous run" — a corrupt state file must not break
@@ -214,7 +222,7 @@ mod tests {
         let s = ps(&[("channel:a", Severity::Warn, "slow")]);
         let raw = to_json(&s);
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("state file is JSON");
-        assert_eq!(parsed["channel:a"]["severity"], "Warn");
+        assert_eq!(parsed["channel:a"]["severity"], "WARN");
         assert_eq!(parsed["channel:a"]["detail"], "slow");
     }
 

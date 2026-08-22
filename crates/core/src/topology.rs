@@ -12,11 +12,13 @@ pub enum ResolveError {
         inbound_tag: String,
         profile_uuid: String,
     },
-    #[error("inbound '{inbound_tag}' runs on several nodes ({candidates}) and none has address {address}")]
+    // The candidates stay a list: joining them into a string at construction time would leave a
+    // caller wanting to name them no way to get them back out.
+    #[error("inbound '{inbound_tag}' runs on several nodes ({}) and none has address {address}", candidates.join(", "))]
     AmbiguousEntryNode {
         inbound_tag: String,
         address: String,
-        candidates: String,
+        candidates: Vec<String>,
     },
     #[error("node '{node}' has no active config profile")]
     NodeWithoutProfile { node: String },
@@ -35,7 +37,10 @@ pub enum ResolveError {
     #[error(
         "the rule for inbound '{inbound_tag}' selects its outbound in a way this tool cannot follow ({how})"
     )]
-    UnsupportedRule { inbound_tag: String, how: String },
+    UnsupportedRule {
+        inbound_tag: String,
+        how: UnsupportedSelector,
+    },
     #[error(
         "outbound '{tag}' ({protocol}) ends the chain outside the node's own egress, so the expected exit address cannot be derived from the topology"
     )]
@@ -52,6 +57,61 @@ pub enum ResolveError {
     TooDeep { max: usize },
 }
 
+/// The ways a matched routing rule can pick an outbound that this tool cannot follow. Both
+/// spellings are part of `UnsupportedRule`'s message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedSelector {
+    /// The rule routes through a balancer, so the outbound depends on runtime state.
+    BalancerTag,
+    /// The rule names no outbound at all.
+    NoOutboundTag,
+}
+
+impl std::fmt::Display for UnsupportedSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UnsupportedSelector::BalancerTag => "balancerTag",
+            UnsupportedSelector::NoOutboundTag => "no outboundTag",
+        })
+    }
+}
+
+/// What an outbound does with the traffic that reaches it. The JSON keeps its protocol strings;
+/// this is the one place that turns them into a decision, so a new protocol is classified once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundKind {
+    /// Leaves through the node's own address: the chain ends at this node.
+    NodeEgress,
+    /// Traffic is dropped.
+    Blackhole,
+    /// Ends the chain without going out through the node's own address (wireguard such as WARP,
+    /// dns, loopback) — the expected exit IP is not derivable from the topology.
+    OpaqueTerminal,
+    /// Forwards to another hop, whose address the outbound carries.
+    Proxy,
+}
+
+impl OutboundKind {
+    fn from_protocol(protocol: &str) -> Self {
+        match protocol {
+            "freedom" => OutboundKind::NodeEgress,
+            "blackhole" => OutboundKind::Blackhole,
+            "wireguard" | "dns" | "loopback" => OutboundKind::OpaqueTerminal,
+            _ => OutboundKind::Proxy,
+        }
+    }
+}
+
+/// Where a proxying outbound sends the traffic on to.
+struct Destination {
+    address: String,
+    port: u16,
+}
+
+/// How an outbound with no `tag` appears in an error message. Only ever used for reading: the
+/// resolver itself keeps the absence as an `Option`.
+const UNTAGGED: &str = "<untagged>";
+
 /// Name of the node this channel is declared to exit through.
 pub fn resolve_exit(channel: &Channel, snapshot: &Snapshot) -> Result<String, ResolveError> {
     let mut node = entry_node(channel, &snapshot.nodes)?;
@@ -67,35 +127,42 @@ pub fn resolve_exit(channel: &Channel, snapshot: &Snapshot) -> Result<String, Re
         }
         let config = profile_config(node, snapshot)?;
         let outbound = outbound_for(config, &inbound_tag, node)?;
-        let tag = outbound
-            .get("tag")
-            .and_then(Value::as_str)
-            .unwrap_or("<untagged>")
-            .to_string();
+        // Borrowed, and only spelled out in the error branches below: the happy path never needs
+        // a tag, and an outbound without one is an absence, not the literal "<untagged>".
+        let tag = outbound.get("tag").and_then(Value::as_str);
+        let named = || tag.unwrap_or(UNTAGGED).to_string();
         let protocol = outbound
             .get("protocol")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
 
-        match protocol.as_str() {
-            "freedom" => return Ok(node.name.clone()),
-            "blackhole" => return Err(ResolveError::Blackhole { inbound_tag, tag }),
-            // wireguard (e.g. WARP), dns and loopback terminate the chain without going out
-            // through the node's own address — the expected exit IP is not derivable here.
-            "wireguard" | "dns" | "loopback" => {
-                return Err(ResolveError::OpaqueTerminal { tag, protocol })
+        match OutboundKind::from_protocol(protocol) {
+            OutboundKind::NodeEgress => return Ok(node.name.clone()),
+            OutboundKind::Blackhole => {
+                return Err(ResolveError::Blackhole {
+                    inbound_tag,
+                    tag: named(),
+                })
             }
-            _ => {}
+            OutboundKind::OpaqueTerminal => {
+                return Err(ResolveError::OpaqueTerminal {
+                    tag: named(),
+                    protocol: protocol.to_string(),
+                })
+            }
+            OutboundKind::Proxy => {}
         }
 
-        let (address, port) =
-            destination(outbound).ok_or(ResolveError::NoDestination { tag: tag.clone() })?;
+        let Destination { address, port } =
+            destination(outbound).ok_or_else(|| ResolveError::NoDestination { tag: named() })?;
         let next = snapshot
             .nodes
             .iter()
             .find(|n| n.address == address)
-            .ok_or(ResolveError::UnknownNextHop { tag, address })?;
+            .ok_or_else(|| ResolveError::UnknownNextHop {
+                tag: named(),
+                address,
+            })?;
         let next_config = profile_config(next, snapshot)?;
         inbound_tag = inbound_tag_on_port(next_config, port).ok_or_else(|| {
             ResolveError::NoInboundOnPort {
@@ -125,25 +192,21 @@ fn entry_node<'a>(channel: &Channel, nodes: &'a [Node]) -> Result<&'a Node, Reso
         })
         .collect();
 
-    match candidates.len() {
-        0 => Err(ResolveError::NoEntryNode {
+    match candidates.as_slice() {
+        [] => Err(ResolveError::NoEntryNode {
             inbound_tag: channel.inbound_tag.clone(),
             profile_uuid: profile_uuid.to_string(),
         }),
-        1 => Ok(candidates[0]),
+        [only] => Ok(only),
         // Several nodes share the profile and the inbound; the channel address decides.
-        _ => candidates
+        several => several
             .iter()
             .copied()
             .find(|n| n.address == channel.address)
             .ok_or_else(|| ResolveError::AmbiguousEntryNode {
                 inbound_tag: channel.inbound_tag.clone(),
                 address: channel.address.clone(),
-                candidates: candidates
-                    .iter()
-                    .map(|n| n.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                candidates: several.iter().map(|n| n.name.clone()).collect(),
             }),
     }
 }
@@ -201,13 +264,13 @@ fn outbound_for<'a>(
             Some(tag) => Some(tag),
             None => {
                 let how = if rule.get("balancerTag").is_some() {
-                    "balancerTag"
+                    UnsupportedSelector::BalancerTag
                 } else {
-                    "no outboundTag"
+                    UnsupportedSelector::NoOutboundTag
                 };
                 return Err(ResolveError::UnsupportedRule {
                     inbound_tag: inbound_tag.to_string(),
-                    how: how.to_string(),
+                    how,
                 });
             }
         },
@@ -233,7 +296,7 @@ fn rule_matches(rule: &Value, inbound_tag: &str) -> bool {
 }
 
 /// Destination of a proxying outbound: vless uses `vnext`, trojan and shadowsocks use `servers`.
-fn destination(outbound: &Value) -> Option<(String, u16)> {
+fn destination(outbound: &Value) -> Option<Destination> {
     let settings = outbound.get("settings")?;
     let first = settings
         .get("vnext")
@@ -247,7 +310,7 @@ fn destination(outbound: &Value) -> Option<(String, u16)> {
         })?;
     let address = first.get("address")?.as_str()?.to_string();
     let port = u16::try_from(first.get("port")?.as_u64()?).ok()?;
-    Some((address, port))
+    Some(Destination { address, port })
 }
 
 fn inbound_tag_on_port(config: &Value, port: u16) -> Option<String> {
@@ -503,10 +566,12 @@ mod tests {
             vec![profile],
         );
         let ch = channel("balancer", "in", "p", "beta.example.com");
-        assert!(matches!(
-            resolve_exit(&ch, &snap),
-            Err(ResolveError::UnsupportedRule { .. })
-        ));
+        let err = resolve_exit(&ch, &snap).unwrap_err();
+        assert!(matches!(err, ResolveError::UnsupportedRule { .. }));
+        assert_eq!(
+            err.to_string(),
+            "the rule for inbound 'in' selects its outbound in a way this tool cannot follow (balancerTag)"
+        );
     }
 
     #[test]
@@ -563,10 +628,17 @@ mod tests {
             vec![exit_profile("p-exit", "in-exit", 443)],
         );
         let ch = channel("neither", "in-exit", "p-exit", "gamma.example.com");
+        let err = resolve_exit(&ch, &snap).unwrap_err();
+        // The candidates are kept as a list and named in the message, in order.
         assert!(matches!(
-            resolve_exit(&ch, &snap),
-            Err(ResolveError::AmbiguousEntryNode { .. })
+            &err,
+            ResolveError::AmbiguousEntryNode { candidates, .. }
+                if candidates == &["alpha".to_string(), "beta".to_string()]
         ));
+        assert_eq!(
+            err.to_string(),
+            "inbound 'in-exit' runs on several nodes (alpha, beta) and none has address gamma.example.com"
+        );
     }
 
     #[test]

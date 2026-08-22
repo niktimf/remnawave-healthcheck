@@ -3,15 +3,17 @@ mod run;
 mod telegram;
 
 use clap::Parser;
+use remnawave_healthcheck_core::report::Outcome;
+use std::process::ExitCode;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let args = args::Args::parse();
     match run::run(args).await {
-        Ok(code) => std::process::exit(code),
+        Ok(outcome) => outcome.into(),
         Err(err) => {
             eprintln!("healthcheck failed: {err:#}");
-            std::process::exit(2);
+            Outcome::Aborted.into()
         }
     }
 }
