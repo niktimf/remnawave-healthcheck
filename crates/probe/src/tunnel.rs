@@ -39,7 +39,30 @@ pub async fn probe(
     timeout: Duration,
     echo_url: &str,
 ) -> ProbeOutcome {
-    match attempt(xray_bin, config, socks_port, timeout, echo_url).await {
+    probe_under(
+        &scratch_base(),
+        xray_bin,
+        config,
+        socks_port,
+        timeout,
+        echo_url,
+    )
+    .await
+}
+
+/// `probe`, with the directory its scratch directory is created under spelled out. Private: the
+/// tool always uses `scratch_base()`. A test points it at a directory of its own, and can then
+/// assert that nothing whatsoever survived the call — an assertion that would otherwise have to
+/// tolerate whatever other probes of the same process are doing in the shared base.
+async fn probe_under(
+    base: &Path,
+    xray_bin: &Path,
+    config: &Value,
+    socks_port: u16,
+    timeout: Duration,
+    echo_url: &str,
+) -> ProbeOutcome {
+    match attempt(base, xray_bin, config, socks_port, timeout, echo_url).await {
         Ok(outcome) => outcome,
         // Nothing was probed, so there is no exit address; the reason takes the place xray's
         // stderr would have had, which is where the reader already looks for it.
@@ -51,6 +74,7 @@ pub async fn probe(
 /// leaves through `Err`, and `probe` turns that into the outcome the caller expects — so no path
 /// here has to assemble a failed outcome by hand, and none of them may panic.
 async fn attempt(
+    base: &Path,
     xray_bin: &Path,
     config: &Value,
     socks_port: u16,
@@ -60,7 +84,7 @@ async fn attempt(
     // The guard removes this directory on every exit path from here on — success, an early
     // return, or a panic — so a stray xray config carrying the monitoring user's VLESS
     // credentials never survives past this call.
-    let dir = scratch_dir().map_err(|e| format!("scratch dir: {e}"))?;
+    let dir = scratch_dir_in(base).map_err(|e| format!("scratch dir: {e}"))?;
     let cfg_path = dir.as_ref().join("config.json");
     write_config(&cfg_path, config)
         .await
@@ -168,14 +192,19 @@ impl Drop for ScratchDir {
     }
 }
 
-/// Create a fresh, `0o700` scratch directory under the OS temp dir, wrapped in a guard that
-/// removes it again once the probe is done with it.
-fn scratch_dir() -> std::io::Result<ScratchDir> {
+/// Where this process keeps its scratch directories: one directory per run of the tool, so a
+/// process killed outright leaves its leftovers in a single, obvious place.
+fn scratch_base() -> PathBuf {
+    std::env::temp_dir().join(format!("rwhc-{}", std::process::id()))
+}
+
+/// Create a fresh, `0o700` scratch directory under `base`, wrapped in a guard that removes it
+/// again once the probe is done with it.
+fn scratch_dir_in(base: &Path) -> std::io::Result<ScratchDir> {
     // Two probes of one run can start within the same nanosecond, and a clock can step
     // backwards; the counter is what actually guarantees the name is unused.
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir().join(format!("rwhc-{}", std::process::id()));
-    std::fs::create_dir_all(&base)?;
+    std::fs::create_dir_all(base)?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
@@ -208,15 +237,17 @@ mod tests {
     /// exec permission, ENOENT — the realistic case) must not leave the scratch directory, with
     /// its verbatim subscription outbound, behind on disk.
     ///
-    /// Asserted as "no config file survives anywhere under the base", not as "the listing is
-    /// unchanged": the base directory is shared by every probe of this process, so a listing
-    /// taken before and after would also see scratch directories of tests running in parallel
-    /// and fail for reasons that have nothing to do with this one.
+    /// The probe runs under a base directory belonging to this test alone, so the assertion can
+    /// be the widest one there is — nothing at all survived — without depending on what any
+    /// other test is doing in the base the tool itself uses.
     #[tokio::test]
     async fn a_dead_spawn_leaves_no_scratch_dir_behind() {
-        let base = std::env::temp_dir().join(format!("rwhc-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("rwhc-test-dead-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
 
-        let outcome = probe(
+        let outcome = probe_under(
+            &base,
             Path::new("/nonexistent/xray-binary-that-does-not-exist"),
             &serde_json::json!({"outbounds": []}),
             1,
@@ -226,38 +257,29 @@ mod tests {
         .await;
 
         assert_eq!(outcome.exit_ip, None);
-        let leftovers: Vec<PathBuf> = list_dir(&base)
-            .into_iter()
-            .filter(|d| d.join("config.json").exists())
-            .collect();
+        let leftovers = list_dir(&base);
         assert!(
             leftovers.is_empty(),
-            "a config with live credentials survived probe(): {leftovers:?}"
+            "the scratch directory created for this run must be gone once probe() returns: {leftovers:?}"
         );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// What this endpoint can answer with, as opposed to what an address looks like: the full
-    /// matrix of "is this an address" lives with `core::model::parse_ip`, which both sides of the
-    /// exit comparison share. Here the subject is the echo endpoint itself — anything a CDN or a
-    /// captive portal puts in front of it answers 200 with a body that is not this channel's exit.
+    /// What the wrapper is for: the body of an echo answer is this channel's exit address only
+    /// when it is nothing but an address. A CDN or captive portal in front of the endpoint
+    /// answers 200 with a page, and that page must never be reported as an exit. Which bodies
+    /// count as an address is `core::model::parse_ip`'s decision and is tested there in full.
     #[test]
-    fn an_error_page_from_the_echo_endpoint_is_not_an_exit_address() {
+    fn an_echo_answer_that_is_not_an_address_is_not_an_exit() {
         assert_eq!(
             parse_echo_response("<html><title>502 Bad Gateway</title></html>"),
             None
-        );
-        assert_eq!(parse_echo_response("203.0.113.7 (cached)"), None);
-        assert_eq!(parse_echo_response(""), None);
-        assert_eq!(
-            parse_echo_response(" 203.0.113.7\n"),
-            Some("203.0.113.7".parse().unwrap()),
-            "a bare address, whitespace and all, is the one thing that does count"
         );
     }
 
     #[test]
     fn scratch_dir_guard_removes_its_directory_on_drop() {
-        let dir = scratch_dir().expect("scratch dir creates");
+        let dir = scratch_dir_in(&scratch_base()).expect("scratch dir creates");
         let path = dir.as_ref().to_path_buf();
         assert!(path.is_dir());
         drop(dir);

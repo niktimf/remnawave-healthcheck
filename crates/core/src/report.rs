@@ -76,7 +76,8 @@ pub fn render(results: &[CheckResult]) -> String {
             tw = title_w
         );
     }
-    let _ = write!(out, "\nOVERALL: {}\n", overall(results));
+    out.push('\n');
+    let _ = writeln!(out, "OVERALL: {}", overall(results));
     out
 }
 
