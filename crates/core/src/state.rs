@@ -1,8 +1,18 @@
-use crate::model::CheckResult;
+use crate::model::{CheckResult, Severity};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// One non-OK check as the problem set remembers it. Severity stays a `Severity` rather than
+/// being glued into the detail text: the diff compares severities, and re-parsing them out of a
+/// rendered string is how a typo turns into a missed escalation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Problem {
+    pub severity: Severity,
+    pub detail: String,
+}
+
 /// Non-OK checks of one run, keyed by the stable check key. BTreeMap keeps output deterministic.
-pub type ProblemSet = BTreeMap<String, String>;
+pub type ProblemSet = BTreeMap<String, Problem>;
 
 /// What changed between two runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,20 +38,13 @@ pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
         .map(|r| {
             (
                 r.key.clone(),
-                format!("{}: {}", r.severity.label(), r.detail),
+                Problem {
+                    severity: r.severity,
+                    detail: r.detail.clone(),
+                },
             )
         })
         .collect()
-}
-
-/// Severity encoded in a problem-set value ("FAIL: ..." -> 2). Unknown prefixes rank lowest.
-fn rank(value: &str) -> i32 {
-    match value.split(':').next().unwrap_or("").trim() {
-        "OK" => 0,
-        "WARN" => 1,
-        "FAIL" => 2,
-        _ => -1,
-    }
 }
 
 /// Appearing and disappearing keys always count. So does a severity escalation on a key that
@@ -60,7 +63,7 @@ pub fn diff(current: &ProblemSet, previous: &ProblemSet) -> Diff {
         .collect();
     let escalated = current
         .iter()
-        .filter(|(k, v)| previous.get(*k).is_some_and(|p| rank(v) > rank(p)))
+        .filter(|(k, v)| previous.get(*k).is_some_and(|p| v.severity > p.severity))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     Diff {
@@ -70,11 +73,10 @@ pub fn diff(current: &ProblemSet, previous: &ProblemSet) -> Diff {
     }
 }
 
-fn icon(value: &str) -> &'static str {
-    if rank(value) == 1 {
-        "\u{1F7E1}"
-    } else {
-        "\u{1F534}"
+fn icon(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Warn => "\u{1F7E1}",
+        _ => "\u{1F534}",
     }
 }
 
@@ -90,20 +92,26 @@ pub fn escape_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// One problem as it appears in an alert line. The severity label is ours and needs no escaping;
+/// the detail is not (xray stderr, a panel status message) and does.
+fn render_problem(p: &Problem) -> String {
+    format!("{}: {}", p.severity, escape_html(&p.detail))
+}
+
 /// Telegram message body, HTML parse mode.
 pub fn format_message(d: &Diff, run_url: Option<&str>) -> String {
     let mut lines = vec!["<b>Healthcheck</b>".to_string()];
-    for (k, v) in &d.new {
-        let mark = icon(v);
-        let (k, v) = (escape_html(k), escape_html(v));
+    for (k, p) in &d.new {
+        let mark = icon(p.severity);
+        let (k, v) = (escape_html(k), render_problem(p));
         lines.push(format!("{mark} NEW  {k} — {v}"));
     }
-    for (k, v) in &d.escalated {
-        let (k, v) = (escape_html(k), escape_html(v));
+    for (k, p) in &d.escalated {
+        let (k, v) = (escape_html(k), render_problem(p));
         lines.push(format!("\u{1F53A} WORSE  {k} — {v}"));
     }
-    for (k, v) in &d.recovered {
-        let (k, v) = (escape_html(k), escape_html(v));
+    for (k, p) in &d.recovered {
+        let (k, v) = (escape_html(k), render_problem(p));
         lines.push(format!("\u{1F7E2} RECOVERED  {k} — {v}"));
     }
     if let Some(url) = run_url {
@@ -127,10 +135,18 @@ mod tests {
     use super::*;
     use crate::model::{CheckResult, Severity};
 
-    fn ps(pairs: &[(&str, &str)]) -> ProblemSet {
-        pairs
+    fn ps(entries: &[(&str, Severity, &str)]) -> ProblemSet {
+        entries
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, severity, detail)| {
+                (
+                    k.to_string(),
+                    Problem {
+                        severity: *severity,
+                        detail: detail.to_string(),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -143,14 +159,19 @@ mod tests {
         ];
         let got = problem_set(&results);
         assert_eq!(got.len(), 2);
-        assert_eq!(got["b"], "WARN: meh");
-        assert_eq!(got["c"], "FAIL: bad");
+        assert_eq!(got["b"].severity, Severity::Warn);
+        assert_eq!(got["b"].detail, "meh");
+        assert_eq!(got["c"].severity, Severity::Fail);
+        assert_eq!(got["c"].detail, "bad");
+        // Rendered into an alert, a problem still reads exactly as it always did.
+        assert_eq!(render_problem(&got["b"]), "WARN: meh");
+        assert_eq!(render_problem(&got["c"]), "FAIL: bad");
     }
 
     #[test]
     fn diff_reports_new_recovered_and_escalated() {
-        let previous = ps(&[("a", "WARN: x"), ("b", "FAIL: y")]);
-        let current = ps(&[("a", "FAIL: x"), ("c", "FAIL: z")]);
+        let previous = ps(&[("a", Severity::Warn, "x"), ("b", Severity::Fail, "y")]);
+        let current = ps(&[("a", Severity::Fail, "x"), ("c", Severity::Fail, "z")]);
         let d = diff(&current, &previous);
         assert_eq!(d.new.keys().collect::<Vec<_>>(), vec!["c"]);
         assert_eq!(d.recovered.keys().collect::<Vec<_>>(), vec!["b"]);
@@ -160,30 +181,59 @@ mod tests {
 
     #[test]
     fn softening_from_fail_to_warn_is_silent() {
-        let previous = ps(&[("a", "FAIL: x")]);
-        let current = ps(&[("a", "WARN: x")]);
+        let previous = ps(&[("a", Severity::Fail, "x")]);
+        let current = ps(&[("a", Severity::Warn, "x")]);
         let d = diff(&current, &previous);
         assert!(d.is_empty(), "FAIL->WARN must not alert");
     }
 
     #[test]
+    fn a_changed_detail_at_the_same_severity_is_silent() {
+        // Only the severity decides an escalation; a reworded detail is not news.
+        let previous = ps(&[("a", Severity::Fail, "no exit (tunnel dead)")]);
+        let current = ps(&[("a", Severity::Fail, "no exit (tunnel dead) | xray: boom")]);
+        assert!(diff(&current, &previous).is_empty());
+    }
+
+    #[test]
     fn unchanged_state_is_silent() {
-        let s = ps(&[("a", "FAIL: x")]);
+        let s = ps(&[("a", Severity::Fail, "x")]);
         assert!(diff(&s, &s).is_empty());
     }
 
     #[test]
     fn json_roundtrip_and_tolerance_to_garbage() {
-        let s = ps(&[("a", "FAIL: x")]);
+        let s = ps(&[("a", Severity::Fail, "x")]);
         assert_eq!(from_json(&to_json(&s)), s);
         assert!(from_json("not json at all").is_empty());
         assert!(from_json("[1,2,3]").is_empty());
     }
 
     #[test]
+    fn the_state_file_is_a_map_of_key_to_severity_and_detail() {
+        let s = ps(&[("channel:a", Severity::Warn, "slow")]);
+        let raw = to_json(&s);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("state file is JSON");
+        assert_eq!(parsed["channel:a"]["severity"], "Warn");
+        assert_eq!(parsed["channel:a"]["detail"], "slow");
+    }
+
+    #[test]
+    fn a_state_file_with_an_unreadable_entry_is_treated_as_no_previous_run() {
+        // Half a problem set is not a problem set: silently keeping the readable half would make
+        // the missing keys look recovered.
+        assert!(from_json(r#"{"channel:a": {"severity": "Nope", "detail": "x"}}"#).is_empty());
+        assert!(from_json(r#"{"channel:a": "FAIL: x"}"#).is_empty());
+    }
+
+    #[test]
     fn html_special_characters_in_keys_and_values_are_escaped() {
         let d = Diff {
-            new: ps(&[("channel:<script>", "FAIL: xray said <boom> & died")]),
+            new: ps(&[(
+                "channel:<script>",
+                Severity::Fail,
+                "xray said <boom> & died",
+            )]),
             recovered: ps(&[]),
             escalated: ps(&[]),
         };
@@ -206,14 +256,28 @@ mod tests {
     #[test]
     fn message_lists_every_section_and_run_url() {
         let d = Diff {
-            new: ps(&[("channel:a", "FAIL: no exit")]),
-            recovered: ps(&[("channel:b", "FAIL: no exit")]),
-            escalated: ps(&[("node:beta:cert", "FAIL: expired")]),
+            new: ps(&[("channel:a", Severity::Fail, "no exit")]),
+            recovered: ps(&[("channel:b", Severity::Fail, "no exit")]),
+            escalated: ps(&[("node:beta:cert", Severity::Fail, "expired")]),
         };
         let msg = format_message(&d, Some("https://example.com/run/1"));
         assert!(msg.contains("NEW"));
         assert!(msg.contains("WORSE"));
         assert!(msg.contains("RECOVERED"));
         assert!(msg.contains("https://example.com/run/1"));
+    }
+
+    #[test]
+    fn alert_lines_keep_their_exact_wording() {
+        // These lines are the tool's user-facing output; the refactor must not reflow them.
+        let d = Diff {
+            new: ps(&[("channel:a", Severity::Warn, "slow")]),
+            recovered: ps(&[("channel:c", Severity::Fail, "no exit")]),
+            escalated: ps(&[("channel:b", Severity::Fail, "no exit")]),
+        };
+        assert_eq!(
+            format_message(&d, None),
+            "<b>Healthcheck</b>\n\u{1F7E1} NEW  channel:a \u{2014} WARN: slow\n\u{1F53A} WORSE  channel:b \u{2014} FAIL: no exit\n\u{1F7E2} RECOVERED  channel:c \u{2014} FAIL: no exit"
+        );
     }
 }

@@ -30,7 +30,7 @@ pub fn render(results: &[CheckResult]) -> String {
     for r in &rows {
         out.push_str(&format!(
             "{:<6} {:<kw$}  {:<tw$}  {}\n",
-            r.severity.label(),
+            r.severity,
             r.key,
             r.title,
             r.detail,
@@ -38,7 +38,7 @@ pub fn render(results: &[CheckResult]) -> String {
             tw = title_w
         ));
     }
-    out.push_str(&format!("\nOVERALL: {}\n", overall(results).label()));
+    out.push_str(&format!("\nOVERALL: {}\n", overall(results)));
     out
 }
 

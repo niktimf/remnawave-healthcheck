@@ -10,17 +10,51 @@ pub enum Severity {
 }
 
 impl Severity {
-    pub fn label(self) -> &'static str {
-        match self {
-            Severity::Ok => "OK",
-            Severity::Warn => "WARN",
-            Severity::Fail => "FAIL",
-        }
-    }
-
     pub fn is_ok(self) -> bool {
         self == Severity::Ok
     }
+}
+
+/// How a severity appears in the report and in every alert. These three strings are part of the
+/// tool's output contract, not a debug rendering.
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `pad`, not `write_str`: the report table formats severities with a width (`{:<6}`),
+        // and only `pad` honours it.
+        f.pad(match self {
+            Severity::Ok => "OK",
+            Severity::Warn => "WARN",
+            Severity::Fail => "FAIL",
+        })
+    }
+}
+
+/// Anything that is not one of the three labels.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown severity: {0}")]
+pub struct ParseSeverityError(pub String);
+
+impl std::str::FromStr for Severity {
+    type Err = ParseSeverityError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "OK" => Ok(Severity::Ok),
+            "WARN" => Ok(Severity::Warn),
+            "FAIL" => Ok(Severity::Fail),
+            other => Err(ParseSeverityError(other.to_string())),
+        }
+    }
+}
+
+/// The one place that decides what counts as an address.
+///
+/// Both sides of the exit comparison — what the channel's tunnel came out as, and what the node
+/// says its own egress is — go through here, so neither can drift into a different notion of
+/// "same address". Anything that is not a bare IP (an HTML error page from a CDN, a curl error
+/// line, a captive-portal form) is not an address and must never be reported as one.
+pub fn parse_ip(text: &str) -> Option<std::net::IpAddr> {
+    text.trim().parse().ok()
 }
 
 /// One check outcome. `key` is stable across runs and is what the diff compares.
@@ -124,6 +158,58 @@ mod tests {
     fn severity_orders_ok_below_warn_below_fail() {
         assert!(Severity::Ok < Severity::Warn);
         assert!(Severity::Warn < Severity::Fail);
+    }
+
+    #[test]
+    fn only_a_bare_address_parses_as_an_ip() {
+        assert_eq!(
+            parse_ip(" 203.0.113.7\n"),
+            Some("203.0.113.7".parse().unwrap())
+        );
+        assert_eq!(
+            parse_ip("2001:db8::1"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(parse_ip(""), None);
+        assert_eq!(
+            parse_ip("<html><title>502 Bad Gateway</title></html>"),
+            None
+        );
+        assert_eq!(parse_ip("203.0.113.7 (cached)"), None);
+        assert_eq!(parse_ip("curl: (28) Operation timed out"), None);
+    }
+
+    #[test]
+    fn severity_renders_the_three_report_labels() {
+        assert_eq!(Severity::Ok.to_string(), "OK");
+        assert_eq!(Severity::Warn.to_string(), "WARN");
+        assert_eq!(Severity::Fail.to_string(), "FAIL");
+    }
+
+    #[test]
+    fn severity_honours_a_format_width() {
+        // The report table lays severities out in a fixed column; losing the padding would
+        // silently reflow every row of the report.
+        assert_eq!(format!("{:<6}|", Severity::Ok), "OK    |");
+        assert_eq!(format!("{:<6}|", Severity::Fail), "FAIL  |");
+    }
+
+    #[test]
+    fn severity_parses_back_from_its_own_label() {
+        for s in [Severity::Ok, Severity::Warn, Severity::Fail] {
+            assert_eq!(s.to_string().parse::<Severity>(), Ok(s));
+        }
+    }
+
+    #[test]
+    fn an_unknown_severity_label_is_an_error_naming_the_input() {
+        let err = "SOMETHING".parse::<Severity>().unwrap_err();
+        assert_eq!(err, ParseSeverityError("SOMETHING".to_string()));
+        assert!(err.to_string().contains("SOMETHING"));
+        // Case and stray whitespace are not silently accepted: the labels are exact.
+        assert!("fail".parse::<Severity>().is_err());
+        assert!(" FAIL".parse::<Severity>().is_err());
+        assert!("".parse::<Severity>().is_err());
     }
 
     #[test]
