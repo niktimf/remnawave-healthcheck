@@ -2,3 +2,4 @@ target/
 .xray-cache/
 *.state.json
 .superpowers/
+.idea/
