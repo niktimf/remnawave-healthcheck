@@ -96,16 +96,15 @@ pub async fn run(args: Args) -> Result<Outcome> {
 /// result. Both look identical to the state file — a pile of keys that simply are not there — and
 /// both would otherwise be written as the new truth, turning every previously failing channel into
 /// a RECOVERED notification about a channel nobody looked at.
-fn partial_run_reason(args: &Args, results: &[CheckResult]) -> Option<String> {
+fn partial_run_reason(args: &Args, results: &[CheckResult]) -> Option<&'static str> {
     if args.no_ssh || args.no_channels {
-        return Some("partial run (--no-ssh or --no-channels given)".to_string());
+        return Some("partial run (--no-ssh or --no-channels given)");
     }
     let setup_failed = results
         .iter()
         .any(|r| r.key == SETUP_KEY && r.severity == Severity::Fail);
-    setup_failed.then(|| {
-        "partial run (channel probing could not start, so no channel was checked)".to_string()
-    })
+    setup_failed
+        .then_some("partial run (channel probing could not start, so no channel was checked)")
 }
 
 /// The panel is the only source of truth this tool has, so a failure to read it means nothing at
@@ -130,11 +129,7 @@ async fn panel_unreadable(args: &Args, err: anyhow::Error) -> Result<Outcome> {
     eprintln!("healthcheck failed: {err:#}");
     eprintln!(
         "[alert] panel unreadable → telegram {}",
-        if sent {
-            "sent"
-        } else {
-            "FAILED (see the line above)"
-        }
+        delivery_label(sent)
     );
     Ok(Outcome::Aborted)
 }
@@ -229,23 +224,12 @@ async fn channel_checks(
     snapshot: &Snapshot,
     egress: &HashMap<String, IpAddr>,
 ) -> Vec<CheckResult> {
-    let setup_fail = |detail: String| {
-        vec![CheckResult::new(
-            SETUP_KEY,
-            "channel probing setup",
-            Severity::Fail,
-            detail,
-        )]
-    };
-
     let Some(version) = required_xray_version(snapshot) else {
-        return setup_fail(
-            "no node reported an Xray version, so no binary can be chosen".to_string(),
-        );
+        return setup_failed("no node reported an Xray version, so no binary can be chosen");
     };
     let binary = match probe::xray::ensure(&version, &args.xray_cache).await {
         Ok(b) => b,
-        Err(e) => return setup_fail(format!("obtaining xray {version}: {e:#}")),
+        Err(e) => return setup_failed(format!("obtaining xray {version}: {e:#}")),
     };
     let disabled: Vec<&str> = snapshot
         .nodes
@@ -263,12 +247,19 @@ async fn channel_checks(
         let disabled = &disabled;
         for (i, channel) in chunk.iter().enumerate() {
             let binary = binary.clone();
-            let port = args.socks_base_port.saturating_add(i as u16);
+            // The index is bounded by `--concurrency`, which `validate_socks_port_range` already
+            // held to a value the port arithmetic can take; `as` would have hidden that instead
+            // of relying on it.
+            let offset = u16::try_from(i).expect("a chunk is at most --concurrency channels long");
+            let port = args.socks_base_port.saturating_add(offset);
             let echo_url = args.echo_url.as_str();
             pending.push(async move {
-                let expect = match channel_precheck(channel, snapshot, disabled) {
-                    Ok(expect) => expect,
-                    Err(decided) => return decided,
+                // Once per channel: the key identifies this check in the state file, and having
+                // two places build it is how the two spellings drift apart.
+                let key = channel.check_key();
+                let expect = match channel_precheck(&key, channel, snapshot, disabled) {
+                    Precheck::Probe(expect) => expect,
+                    Precheck::Decided(decided) => return decided,
                 };
 
                 let config = probe::config::build(&channel.outbound, port);
@@ -281,7 +272,7 @@ async fn channel_checks(
                     outcome = probe::probe(&binary, &config, port, timeout, echo_url).await;
                 }
                 probe::classify(
-                    &channel.check_key(),
+                    &key,
                     &channel.remark,
                     &expect,
                     egress.get(&expect).copied(),
@@ -300,6 +291,16 @@ async fn channel_checks(
 /// be set up at all.
 const SETUP_KEY: &str = "channels:setup";
 
+/// The one result that stands in for every channel when probing could not be set up.
+fn setup_failed(detail: impl Into<String>) -> Vec<CheckResult> {
+    vec![CheckResult::new(
+        SETUP_KEY,
+        "channel probing setup",
+        Severity::Fail,
+        detail,
+    )]
+}
+
 /// Everything about a channel that can be settled before xray is started: the name of the node it
 /// is supposed to exit through, or the finished check result explaining why it cannot be probed.
 ///
@@ -308,36 +309,52 @@ const SETUP_KEY: &str = "channels:setup";
 /// refuses to start — the channel would then be reported as "no exit (tunnel dead)", after two
 /// full probe timeouts, pointing the reader at the tunnel instead of at the subscription.
 fn channel_precheck(
+    key: &str,
     channel: &Channel,
     snapshot: &Snapshot,
     disabled: &[&str],
-) -> Result<String, CheckResult> {
-    let key = channel.check_key();
-    let expect = topology::resolve_exit(channel, snapshot).map_err(|e| {
-        CheckResult::new(
-            key.clone(),
-            channel.remark.clone(),
-            Severity::Fail,
-            format!("cannot tell where this channel should exit: {e}"),
-        )
-    })?;
-    if disabled.contains(&expect.as_str()) {
-        return Err(CheckResult::new(
+) -> Precheck {
+    let decided = |severity, detail: String| {
+        Precheck::Decided(CheckResult::new(
             key,
             channel.remark.clone(),
+            severity,
+            detail,
+        ))
+    };
+
+    let expect = match topology::resolve_exit(channel, snapshot) {
+        Ok(expect) => expect,
+        Err(e) => {
+            return decided(
+                Severity::Fail,
+                format!("cannot tell where this channel should exit: {e}"),
+            )
+        }
+    };
+    if disabled.contains(&expect.as_str()) {
+        return decided(
             Severity::Warn,
             format!("expected exit '{expect}' is disabled in the panel"),
-        ));
+        );
     }
     if channel.outbound.is_null() {
-        return Err(CheckResult::new(
-            key,
-            channel.remark.clone(),
+        return decided(
             Severity::Fail,
-            "the panel resolved this channel but the subscription served no config for it, so there is nothing to probe",
-        ));
+            "the panel resolved this channel but the subscription served no config for it, so there is nothing to probe".to_string(),
+        );
     }
-    Ok(expect)
+    Precheck::Probe(expect)
+}
+
+/// The two ways a channel's pre-probe examination can end. Not a `Result`: neither outcome is an
+/// error, and a reader who sees `Err` here would look for one.
+#[derive(Debug)]
+enum Precheck {
+    /// Nothing stands in the way. Carries the name of the node the channel must exit through.
+    Probe(String),
+    /// The channel is not to be probed, and this is the finished result saying why.
+    Decided(CheckResult),
 }
 
 /// The version the nodes are actually running. When they disagree, `xray:version-drift` has
@@ -354,8 +371,18 @@ fn required_xray_version(snapshot: &Snapshot) -> Option<String> {
     }
     tally
         .into_iter()
-        .max_by_key(|(v, count)| (*count, v.to_string()))
-        .map(|(v, _)| v.to_string())
+        .max_by_key(|&(version, count)| (count, version))
+        .map(|(version, _)| version.to_string())
+}
+
+/// How a delivery attempt reads on stderr. The parenthetical points at the line `telegram::send`
+/// printed just above, which carries the API's own reason for the refusal.
+fn delivery_label(sent: bool) -> &'static str {
+    if sent {
+        "sent"
+    } else {
+        "FAILED (see the line above)"
+    }
 }
 
 /// What became of an alert. `NotConfigured` is not a failure: running without Telegram
@@ -378,11 +405,7 @@ async fn notify(args: &Args, diff: &state::Diff) -> Delivery {
                 diff.new.len(),
                 diff.escalated.len(),
                 diff.recovered.len(),
-                if sent {
-                    "sent"
-                } else {
-                    "FAILED (see the line above)"
-                }
+                delivery_label(sent)
             );
             if sent {
                 Delivery::Sent
@@ -503,13 +526,33 @@ mod tests {
         }
     }
 
+    /// The expected exit node of a channel that is to be probed.
+    fn expected_exit(precheck: Precheck) -> String {
+        match precheck {
+            Precheck::Probe(expect) => expect,
+            Precheck::Decided(decided) => {
+                panic!("expected a probeable channel, got {decided:?}")
+            }
+        }
+    }
+
+    /// The finished result of a channel that is not to be probed.
+    fn decided(precheck: Precheck) -> CheckResult {
+        match precheck {
+            Precheck::Decided(result) => result,
+            Precheck::Probe(expect) => panic!("expected a decided channel, got exit {expect:?}"),
+        }
+    }
+
+    fn precheck_of(snap: &Snapshot, disabled: &[&str]) -> Precheck {
+        let channel = &snap.channels[0];
+        channel_precheck(&channel.check_key(), channel, snap, disabled)
+    }
+
     #[test]
     fn a_probeable_channel_precheck_yields_its_expected_exit() {
         let snap = resolvable_snapshot(json!({"protocol": "vless"}));
-        assert_eq!(
-            channel_precheck(&snap.channels[0], &snap, &[]).unwrap(),
-            "beta"
-        );
+        assert_eq!(expected_exit(precheck_of(&snap, &[])), "beta");
     }
 
     #[test]
@@ -517,8 +560,8 @@ mod tests {
         // outbound == null: building a config out of it would make xray refuse to start and the
         // channel would be blamed for a dead tunnel after two full timeouts.
         let snap = resolvable_snapshot(serde_json::Value::Null);
-        let decided = channel_precheck(&snap.channels[0], &snap, &[])
-            .expect_err("a channel with no config must not reach the probe");
+        // A channel with no config must not reach the probe.
+        let decided = decided(precheck_of(&snap, &[]));
         assert_eq!(decided.severity, Severity::Fail);
         assert!(
             decided.detail.contains("subscription"),
@@ -531,14 +574,14 @@ mod tests {
     #[test]
     fn a_channel_whose_exit_is_disabled_only_warns() {
         let snap = resolvable_snapshot(json!({"protocol": "vless"}));
-        let decided = channel_precheck(&snap.channels[0], &snap, &["beta"]).unwrap_err();
+        let decided = decided(precheck_of(&snap, &["beta"]));
         assert_eq!(decided.severity, Severity::Warn);
     }
 
     #[test]
     fn precheck_results_carry_the_channels_unique_key_and_plain_title() {
         let snap = resolvable_snapshot(serde_json::Value::Null);
-        let decided = channel_precheck(&snap.channels[0], &snap, &[]).unwrap_err();
+        let decided = decided(precheck_of(&snap, &[]));
         assert_eq!(decided.key, snap.channels[0].check_key());
         assert_eq!(decided.title, "beta direct");
 
