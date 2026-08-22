@@ -28,6 +28,14 @@ pub enum ResolveError {
     UnknownOutbound { profile: String, tag: String },
     #[error("inbound '{inbound_tag}' is routed into blackhole outbound '{tag}'")]
     Blackhole { inbound_tag: String, tag: String },
+    #[error(
+        "the rule for inbound '{inbound_tag}' selects its outbound in a way this tool cannot follow ({how})"
+    )]
+    UnsupportedRule { inbound_tag: String, how: String },
+    #[error(
+        "outbound '{tag}' ({protocol}) ends the chain outside the node's own egress, so the expected exit address cannot be derived from the topology"
+    )]
+    OpaqueTerminal { tag: String, protocol: String },
     #[error("outbound '{tag}' carries no destination address")]
     NoDestination { tag: String },
     #[error("outbound '{tag}' points at {address}, which is not a known node")]
@@ -60,14 +68,20 @@ pub fn resolve_exit(channel: &Channel, snapshot: &Snapshot) -> Result<String, Re
             .and_then(Value::as_str)
             .unwrap_or("<untagged>")
             .to_string();
-
-        match outbound
+        let protocol = outbound
             .get("protocol")
             .and_then(Value::as_str)
             .unwrap_or_default()
-        {
+            .to_string();
+
+        match protocol.as_str() {
             "freedom" => return Ok(node.name.clone()),
             "blackhole" => return Err(ResolveError::Blackhole { inbound_tag, tag }),
+            // wireguard (e.g. WARP), dns and loopback terminate the chain without going out
+            // through the node's own address — the expected exit IP is not derivable here.
+            "wireguard" | "dns" | "loopback" => {
+                return Err(ResolveError::OpaqueTerminal { tag, protocol })
+            }
             _ => {}
         }
 
@@ -145,10 +159,13 @@ fn outbound_for<'a>(
     inbound_tag: &str,
     node: &Node,
 ) -> Result<&'a Value, ResolveError> {
+    // profile_uuid is expected to be Some here (profile_config already required it to resolve
+    // this config), but the fallback keeps the label legible instead of panicking, and spells
+    // out what it actually contains so an incident read never mistakes a node name for a UUID.
     let profile_label = node
         .profile_uuid
         .clone()
-        .unwrap_or_else(|| node.name.clone());
+        .unwrap_or_else(|| format!("<node '{}' has no profile uuid>", node.name));
     let outbounds = config
         .get("outbounds")
         .and_then(Value::as_array)
@@ -157,13 +174,33 @@ fn outbound_for<'a>(
             profile: profile_label.clone(),
         })?;
 
-    let routed_tag = config
+    let matched_rule = config
         .get("routing")
         .and_then(|r| r.get("rules"))
         .and_then(Value::as_array)
-        .and_then(|rules| rules.iter().find(|rule| rule_matches(rule, inbound_tag)))
-        .and_then(|rule| rule.get("outboundTag"))
-        .and_then(Value::as_str);
+        .and_then(|rules| rules.iter().find(|rule| rule_matches(rule, inbound_tag)));
+
+    // A rule matching is the "found a rule" case; a rule with no outboundTag (e.g. it
+    // routes via balancerTag instead) is a distinct case from "no rule matched at all" —
+    // conflating them would silently fall back to the first outbound and could report a
+    // wrong exit instead of failing loudly.
+    let routed_tag = match matched_rule {
+        Some(rule) => match rule.get("outboundTag").and_then(Value::as_str) {
+            Some(tag) => Some(tag),
+            None => {
+                let how = if rule.get("balancerTag").is_some() {
+                    "balancerTag"
+                } else {
+                    "no outboundTag"
+                };
+                return Err(ResolveError::UnsupportedRule {
+                    inbound_tag: inbound_tag.to_string(),
+                    how: how.to_string(),
+                });
+            }
+        },
+        None => None,
+    };
 
     match routed_tag {
         Some(tag) => outbounds
@@ -413,6 +450,88 @@ mod tests {
         assert!(matches!(
             resolve_exit(&ch, &snap),
             Err(ResolveError::NoInboundOnPort { .. })
+        ));
+    }
+
+    #[test]
+    fn rule_selecting_via_balancer_tag_is_unsupported() {
+        let profile = Profile {
+            uuid: "p".into(),
+            name: "p".into(),
+            config: json!({
+                "inbounds": [{ "tag": "in", "port": 443 }],
+                "outbounds": [{ "tag": "direct", "protocol": "freedom" }],
+                "routing": { "rules": [{ "inboundTag": ["in"], "balancerTag": "lb" }] }
+            }),
+        };
+        let snap = snapshot(
+            vec![node("beta", "192.0.2.20", "p", &["in"])],
+            vec![profile],
+        );
+        let ch = channel("balancer", "in", "p", "beta.example.com");
+        assert!(matches!(
+            resolve_exit(&ch, &snap),
+            Err(ResolveError::UnsupportedRule { .. })
+        ));
+    }
+
+    #[test]
+    fn wireguard_outbound_is_an_opaque_terminal() {
+        let profile = Profile {
+            uuid: "p".into(),
+            name: "p".into(),
+            config: json!({
+                "inbounds": [{ "tag": "in", "port": 443 }],
+                "outbounds": [{ "tag": "warp", "protocol": "wireguard" }],
+                "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "warp" }] }
+            }),
+        };
+        let snap = snapshot(
+            vec![node("beta", "192.0.2.20", "p", &["in"])],
+            vec![profile],
+        );
+        let ch = channel("warp", "in", "p", "beta.example.com");
+        assert!(matches!(
+            resolve_exit(&ch, &snap),
+            Err(ResolveError::OpaqueTerminal { .. })
+        ));
+    }
+
+    #[test]
+    fn vless_outbound_without_settings_has_no_destination() {
+        let profile = Profile {
+            uuid: "p".into(),
+            name: "p".into(),
+            config: json!({
+                "inbounds": [{ "tag": "in", "port": 443 }],
+                "outbounds": [{ "tag": "broken", "protocol": "vless" }],
+                "routing": { "rules": [{ "inboundTag": ["in"], "outboundTag": "broken" }] }
+            }),
+        };
+        let snap = snapshot(
+            vec![node("beta", "192.0.2.20", "p", &["in"])],
+            vec![profile],
+        );
+        let ch = channel("broken", "in", "p", "beta.example.com");
+        assert!(matches!(
+            resolve_exit(&ch, &snap),
+            Err(ResolveError::NoDestination { .. })
+        ));
+    }
+
+    #[test]
+    fn two_candidate_nodes_neither_matching_channel_address_is_ambiguous() {
+        let snap = snapshot(
+            vec![
+                node("alpha", "192.0.2.10", "p-exit", &["in-exit"]),
+                node("beta", "192.0.2.20", "p-exit", &["in-exit"]),
+            ],
+            vec![exit_profile("p-exit", "in-exit", 443)],
+        );
+        let ch = channel("neither", "in-exit", "p-exit", "gamma.example.com");
+        assert!(matches!(
+            resolve_exit(&ch, &snap),
+            Err(ResolveError::AmbiguousEntryNode { .. })
         ));
     }
 
