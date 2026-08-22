@@ -77,7 +77,10 @@ pub struct ResolvedDto {
 #[serde(rename_all = "camelCase")]
 pub struct MetadataDto {
     pub inbound_tag: String,
-    pub config_profile_uuid: String,
+    /// `null` when the host has no config profile attached (legacy host, or a profile that was
+    /// since deleted) — a real panel state per `resolved-proxy-config.schema.ts`, not drift.
+    #[serde(default)]
+    pub config_profile_uuid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,5 +122,32 @@ pub fn to_domain_node(dto: &NodeDto) -> Node {
         is_connected: dto.is_connected,
         last_status_message: dto.last_status_message.clone(),
         xray_version: dto.versions.as_ref().and_then(|v| v.xray.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn resolved_config_with_a_null_profile_uuid_still_parses() {
+        // hosts.schema.ts and resolved-proxy-config.schema.ts both declare configProfileUuid
+        // nullable: a host can be unattached to any config profile (legacy host, or one whose
+        // profile was deleted). This must not fail parsing the whole response over one such host.
+        let raw = json!({"response": {"resolvedProxyConfigs": [{
+            "finalRemark": "orphaned host",
+            "address": "orphan.example.com",
+            "port": 443,
+            "metadata": {
+                "inboundTag": "in-a",
+                "configProfileUuid": null
+            }
+        }]}})
+        .to_string();
+
+        let resolved = parse_resolved(&raw).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].metadata.config_profile_uuid, None);
     }
 }

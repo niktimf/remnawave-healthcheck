@@ -20,6 +20,10 @@ pub enum ResolveError {
     },
     #[error("node '{node}' has no active config profile")]
     NodeWithoutProfile { node: String },
+    #[error(
+        "channel '{remark}' is not attached to any config profile, so its route cannot be resolved"
+    )]
+    ChannelWithoutProfile { remark: String },
     #[error("profile {uuid} is not known to the panel")]
     ProfileMissing { uuid: String },
     #[error("profile {profile} declares no outbounds")]
@@ -105,10 +109,18 @@ pub fn resolve_exit(channel: &Channel, snapshot: &Snapshot) -> Result<String, Re
 }
 
 fn entry_node<'a>(channel: &Channel, nodes: &'a [Node]) -> Result<&'a Node, ResolveError> {
+    let profile_uuid =
+        channel
+            .profile_uuid
+            .as_deref()
+            .ok_or_else(|| ResolveError::ChannelWithoutProfile {
+                remark: channel.remark.clone(),
+            })?;
+
     let candidates: Vec<&Node> = nodes
         .iter()
         .filter(|n| {
-            n.profile_uuid.as_deref() == Some(channel.profile_uuid.as_str())
+            n.profile_uuid.as_deref() == Some(profile_uuid)
                 && n.inbound_tags.iter().any(|t| t == &channel.inbound_tag)
         })
         .collect();
@@ -116,7 +128,7 @@ fn entry_node<'a>(channel: &Channel, nodes: &'a [Node]) -> Result<&'a Node, Reso
     match candidates.len() {
         0 => Err(ResolveError::NoEntryNode {
             inbound_tag: channel.inbound_tag.clone(),
-            profile_uuid: channel.profile_uuid.clone(),
+            profile_uuid: profile_uuid.to_string(),
         }),
         1 => Ok(candidates[0]),
         // Several nodes share the profile and the inbound; the channel address decides.
@@ -324,7 +336,7 @@ mod tests {
         Channel {
             remark: remark.into(),
             inbound_tag: inbound_tag.into(),
-            profile_uuid: profile.into(),
+            profile_uuid: Some(profile.into()),
             address: address.into(),
             port: 443,
             outbound: json!({}),
@@ -339,6 +351,28 @@ mod tests {
         );
         let ch = channel("beta direct", "in-exit", "p-exit", "beta.example.com");
         assert_eq!(resolve_exit(&ch, &snap).unwrap(), "beta");
+    }
+
+    #[test]
+    fn channel_without_a_profile_fails_loudly_instead_of_resolving() {
+        // A host can be unattached to any config profile (legacy host, deleted profile) — this
+        // is a legitimate panel state, and such a channel cannot be resolved, not silently OK'd.
+        let snap = snapshot(
+            vec![node("beta", "192.0.2.20", "p-exit", &["in-exit"])],
+            vec![exit_profile("p-exit", "in-exit", 443)],
+        );
+        let ch = Channel {
+            remark: "orphaned host".into(),
+            inbound_tag: "in-exit".into(),
+            profile_uuid: None,
+            address: "beta.example.com".into(),
+            port: 443,
+            outbound: json!({}),
+        };
+        assert!(matches!(
+            resolve_exit(&ch, &snap),
+            Err(ResolveError::ChannelWithoutProfile { remark }) if remark == "orphaned host"
+        ));
     }
 
     #[test]

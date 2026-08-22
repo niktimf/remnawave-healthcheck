@@ -111,7 +111,7 @@ mod tests {
             port: 443,
             metadata: crate::dto::MetadataDto {
                 inbound_tag: "in-a".into(),
-                config_profile_uuid: "p-1".into(),
+                config_profile_uuid: Some("p-1".into()),
             },
         }];
         let outbounds = vec![("alpha direct".to_string(), json!({"protocol": "vless"}))];
@@ -119,14 +119,14 @@ mod tests {
         let snap = build_snapshot(nodes, profiles, resolved, outbounds);
         assert_eq!(snap.channels.len(), 1);
         assert_eq!(snap.channels[0].inbound_tag, "in-a");
-        assert_eq!(snap.channels[0].profile_uuid, "p-1");
+        assert_eq!(snap.channels[0].profile_uuid.as_deref(), Some("p-1"));
         assert_eq!(snap.channels[0].outbound["protocol"], "vless");
         assert_eq!(snap.served_channel_count, 1);
         assert!(snap.profiles.contains_key("p-1"));
     }
 
     #[test]
-    fn resolved_config_without_a_matching_outbound_is_dropped_from_channels() {
+    fn unmatched_resolved_config_keeps_the_channel_but_drops_its_outbound() {
         // The subscription served fewer channels than the panel resolved — subscription:coverage
         // is what reports this, so the counts must stay honest here.
         let resolved = vec![crate::dto::ResolvedDto {
@@ -135,7 +135,7 @@ mod tests {
             port: 443,
             metadata: crate::dto::MetadataDto {
                 inbound_tag: "in-a".into(),
-                config_profile_uuid: "p-1".into(),
+                config_profile_uuid: Some("p-1".into()),
             },
         }];
         let snap = build_snapshot(vec![], vec![], resolved, vec![]);

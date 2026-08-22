@@ -138,7 +138,7 @@ mod tests {
                 .map(|t| Channel {
                     remark: format!("ch-{t}"),
                     inbound_tag: t.to_string(),
-                    profile_uuid: "p".into(),
+                    profile_uuid: Some("p".into()),
                     address: "edge.example.com".into(),
                     port: 443,
                     outbound: json!({}),

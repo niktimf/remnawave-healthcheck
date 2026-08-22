@@ -71,7 +71,10 @@ pub struct Channel {
     /// Host remark; used as the human-facing channel name and as part of the check key.
     pub remark: String,
     pub inbound_tag: String,
-    pub profile_uuid: String,
+    /// Config profile the panel attached this host to. `None` is a legitimate panel state — a
+    /// legacy host, or one whose config profile was deleted — not corrupted data; such a channel
+    /// has no entry node to resolve and must fail loudly rather than being treated as healthy.
+    pub profile_uuid: Option<String>,
     pub address: String,
     pub port: u16,
     /// Ready-made Xray outbound taken from the subscription. Never assembled by us.
