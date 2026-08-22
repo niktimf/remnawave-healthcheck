@@ -1,4 +1,4 @@
-use crate::model::{CheckResult, Severity};
+use crate::model::CheckResult;
 use std::collections::BTreeMap;
 
 /// Non-OK checks of one run, keyed by the stable check key. BTreeMap keeps output deterministic.
@@ -21,7 +21,7 @@ impl Diff {
 pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
     results
         .iter()
-        .filter(|r| r.severity != Severity::Ok)
+        .filter(|r| !r.severity.is_ok())
         .map(|r| {
             (
                 r.key.clone(),

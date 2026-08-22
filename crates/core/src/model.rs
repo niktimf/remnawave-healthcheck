@@ -17,6 +17,10 @@ impl Severity {
             Severity::Fail => "FAIL",
         }
     }
+
+    pub fn is_ok(self) -> bool {
+        self == Severity::Ok
+    }
 }
 
 /// One check outcome. `key` is stable across runs and is what the diff compares.
