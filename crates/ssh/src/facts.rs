@@ -18,7 +18,9 @@ pub struct HostFacts {
 
 /// Renewal state of acme.sh plus whether port 80 is open for http-01.
 /// The glob is expanded inside `sudo sh -c`; a non-root shell cannot look into /root.
-const RENEWAL_CMD: &str = "sudo sh -c 'grep -E \"Le_NextRenewTimeStr|Le_Webroot\" /root/.acme.sh/*/*.conf \
+/// `-H` forces the `filename:` prefix even when the glob expands to exactly one file (the common
+/// case for a single acme.sh `--ecc` cert) — without it `parse_renewal` can't recover the domain.
+const RENEWAL_CMD: &str = "sudo sh -c 'grep -HE \"Le_NextRenewTimeStr|Le_Webroot\" /root/.acme.sh/*/*.conf \
 2>/dev/null || echo NO_ACME_CONF; ufw status 2>/dev/null | grep -qE \"^80/tcp\" && echo PORT80=open || echo PORT80=closed'";
 
 async fn run(target: &str, command: &str) -> (i32, String) {
@@ -34,6 +36,10 @@ async fn run(target: &str, command: &str) -> (i32, String) {
             command,
         ])
         .stdin(Stdio::null())
+        // If the timeout below fires, the future carrying this child is dropped; without
+        // kill_on_drop the `ssh` process would be orphaned instead of reaped, and on a run
+        // scheduled every few hours against a hung node those orphans accumulate.
+        .kill_on_drop(true)
         .output();
 
     match tokio::time::timeout(Duration::from_secs(30), child).await {

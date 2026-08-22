@@ -234,6 +234,10 @@ struct RenewalEntry {
 /// Lines look like `/root/.acme.sh/<domain>/<file>.conf:Le_NextRenewTimeStr='2026-09-20T10:00:00Z'`.
 /// The domain comes from the directory: a host can hold several certificates and the alert must
 /// name which one stalled.
+///
+/// Entries whose renewal time didn't parse are kept, with `due: None`, rather than dropped here.
+/// A domain with `Le_*` lines but no readable timestamp is a broken acme.sh config — a signal in
+/// its own right — and the caller must be able to tell that apart from no config existing at all.
 fn parse_renewal(text: &str) -> BTreeMap<String, RenewalEntry> {
     let mut found: BTreeMap<String, RenewalEntry> = BTreeMap::new();
     for line in text.lines() {
@@ -262,7 +266,6 @@ fn parse_renewal(text: &str) -> BTreeMap<String, RenewalEntry> {
             }
         }
     }
-    found.retain(|_, e| e.due.is_some());
     found
 }
 
@@ -271,8 +274,8 @@ fn parse_renewal(text: &str) -> BTreeMap<String, RenewalEntry> {
 /// the expiry check would notice.
 fn renewal(key: &str, title: &str, facts: &HostFacts, now: DateTime<Utc>) -> CheckResult {
     const GRACE_DAYS: i64 = 1;
-    let certs = parse_renewal(&facts.renewal);
-    if certs.is_empty() {
+    let all = parse_renewal(&facts.renewal);
+    if all.is_empty() {
         return CheckResult::new(
             key,
             title,
@@ -280,6 +283,33 @@ fn renewal(key: &str, title: &str, facts: &HostFacts, now: DateTime<Utc>) -> Che
             "no acme.sh config (managed elsewhere)",
         );
     }
+
+    // `Le_*` lines exist but no domain's renewal time parsed: the acme.sh config itself is
+    // broken, which is a signal, not a reason to stay quiet.
+    let unreadable: Vec<&String> = all
+        .iter()
+        .filter(|(_, e)| e.due.is_none())
+        .map(|(d, _)| d)
+        .collect();
+    let certs: BTreeMap<String, RenewalEntry> = all
+        .iter()
+        .filter(|(_, e)| e.due.is_some())
+        .map(|(d, e)| (d.clone(), e.clone()))
+        .collect();
+    if certs.is_empty() {
+        let names = unreadable
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return CheckResult::new(
+            key,
+            title,
+            Severity::Warn,
+            format!("acme.sh config found but its renewal time could not be read: {names}"),
+        );
+    }
+
     let port80_closed = facts.renewal.contains("PORT80=closed");
     // http-01 needs port 80; with DNS-01 (Le_Webroot='dns*') the port is irrelevant.
     let http01: Vec<&String> = certs
@@ -421,7 +451,7 @@ mod tests {
             ..HostFacts::default()
         };
         let r = check_host(&node(), &facts, now(), 14, 7);
-        assert!(r.len() >= 5);
+        assert_eq!(r.len(), 6, "one result per check, no more, no fewer");
         assert!(r.iter().all(|c| c.severity == Severity::Fail));
         assert!(r.iter().all(|c| c.detail.contains("unreachable")));
     }
@@ -522,6 +552,28 @@ mod tests {
 
     #[test]
     fn a_host_without_acme_is_silent_about_renewal() {
+        let mut facts = healthy_facts();
+        facts.renewal = "NO_ACME_CONF\nPORT80=closed\n".into();
+        let r = check_host(&node(), &facts, now(), 14, 7);
+        let renewal = r.iter().find(|c| c.key.ends_with(":cert-renewal")).unwrap();
+        assert_eq!(renewal.severity, Severity::Ok);
+        assert!(renewal.detail.contains("managed elsewhere"));
+    }
+
+    #[test]
+    fn unreadable_renewal_time_warns_and_names_the_domain() {
+        let mut facts = healthy_facts();
+        facts.renewal = "/root/.acme.sh/beta.example.com/beta.example.com.conf:Le_Webroot='no'\n\
+                         /root/.acme.sh/beta.example.com/beta.example.com.conf:Le_NextRenewTimeStr='not-a-timestamp'\n\
+                         PORT80=open\n".into();
+        let r = check_host(&node(), &facts, now(), 14, 7);
+        let renewal = r.iter().find(|c| c.key.ends_with(":cert-renewal")).unwrap();
+        assert_eq!(renewal.severity, Severity::Warn);
+        assert!(renewal.detail.contains("beta.example.com"));
+    }
+
+    #[test]
+    fn no_acme_conf_output_still_reads_ok_after_the_unreadable_time_fix() {
         let mut facts = healthy_facts();
         facts.renewal = "NO_ACME_CONF\nPORT80=closed\n".into();
         let r = check_host(&node(), &facts, now(), 14, 7);
