@@ -1,4 +1,4 @@
-use crate::model::{CheckResult, Node, Severity, Snapshot};
+use crate::model::{CheckResult, Node, PanelState, Severity, Snapshot};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the panel itself thinks of each node. Costs no SSH and no tunnels.
@@ -6,24 +6,27 @@ pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
     nodes
         .iter()
         .map(|n| {
-            let key = format!("node:{}:panel", n.name);
-            let title = format!("{} panel status", n.name);
-            if n.is_disabled {
-                CheckResult::new(key, title, Severity::Warn, "disabled by an administrator")
-            } else if !n.is_connected {
-                let reason = n
-                    .last_status_message
-                    .as_deref()
-                    .unwrap_or("no reason given");
-                CheckResult::new(
-                    key,
-                    title,
+            // Which state a node is in is the node's own question; what that state is worth in a
+            // report is this module's. A reconnecting node is a warning rather than a failure
+            // because the panel retries on its own, and it carries no reason: the message the
+            // panel left behind is about the attempt before this one.
+            let (severity, detail) = match n.panel_state() {
+                PanelState::Disabled => {
+                    (Severity::Warn, "disabled by an administrator".to_string())
+                }
+                PanelState::Connecting => (Severity::Warn, "connecting".to_string()),
+                PanelState::Disconnected { reason } => (
                     Severity::Fail,
-                    format!("not connected: {reason}"),
-                )
-            } else {
-                CheckResult::new(key, title, Severity::Ok, "connected")
-            }
+                    format!("not connected: {}", reason.unwrap_or("no reason given")),
+                ),
+                PanelState::Connected => (Severity::Ok, "connected".to_string()),
+            };
+            CheckResult::new(
+                format!("node:{}:panel", n.name),
+                format!("{} panel status", n.name),
+                severity,
+                detail,
+            )
         })
         .collect()
 }
@@ -103,7 +106,7 @@ pub fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<&str> = BTreeSet::new();
 
-    for node in snapshot.nodes.iter().filter(|n| !n.is_disabled) {
+    for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
         for tag in &node.inbound_tags {
             if covered.contains(tag.as_str()) || !seen.insert(tag.as_str()) {
                 continue;
@@ -128,7 +131,7 @@ pub fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
 pub fn xray_version_drift(nodes: &[Node]) -> CheckResult {
     let versions: Vec<&str> = nodes
         .iter()
-        .filter(|n| !n.is_disabled)
+        .filter(|n| n.is_enabled())
         .filter_map(|n| n.xray_version.as_deref())
         .collect::<BTreeSet<&str>>()
         .into_iter()
@@ -164,6 +167,7 @@ mod tests {
             inbound_ports: vec![443],
             is_disabled: disabled,
             is_connected: connected,
+            is_connecting: false,
             last_status_message: Some("boom".into()),
             xray_version: Some(version.into()),
         }
@@ -204,6 +208,18 @@ mod tests {
             beta.detail.contains("boom"),
             "panel's own message must reach the report"
         );
+    }
+
+    #[test]
+    fn a_reconnecting_node_warns_without_repeating_a_stale_reason() {
+        // `node` leaves a "boom" in `last_status_message`, which is what the panel does too: it
+        // sets `isConnecting` without clearing the reason of the attempt before.
+        let mut reconnecting = node("alpha", false, false, "26.6.27", &["in-a"]);
+        reconnecting.is_connecting = true;
+        let results = node_status(&[reconnecting]);
+        assert_eq!(results[0].severity, Severity::Warn);
+        assert_eq!(results[0].detail, "connecting");
+        assert_eq!(results[0].key, "node:alpha:panel");
     }
 
     #[test]

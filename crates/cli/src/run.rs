@@ -180,7 +180,7 @@ async fn node_checks(
 ) -> (Vec<CheckResult>, HashMap<String, IpAddr>) {
     let now = chrono::Utc::now();
     let mut pending = FuturesUnordered::new();
-    for node in snapshot.nodes.iter().filter(|n| !n.is_disabled) {
+    for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
         pending.push(async move {
             // An address that is not an IP is also the TLS endpoint worth inspecting.
             let domain = node
@@ -234,7 +234,7 @@ async fn channel_checks(
     let disabled: Vec<&str> = snapshot
         .nodes
         .iter()
-        .filter(|n| n.is_disabled)
+        .filter(|n| !n.is_enabled())
         .map(|n| n.name.as_str())
         .collect();
 
@@ -364,7 +364,7 @@ fn required_xray_version(snapshot: &Snapshot) -> Option<String> {
     for version in snapshot
         .nodes
         .iter()
-        .filter(|n| !n.is_disabled)
+        .filter(|n| n.is_enabled())
         .filter_map(|n| n.xray_version.as_deref())
     {
         *tally.entry(version).or_default() += 1;
@@ -460,6 +460,7 @@ mod tests {
             inbound_ports: vec![],
             is_disabled: disabled,
             is_connected: true,
+            is_connecting: false,
             last_status_message: None,
             xray_version: version.map(String::from),
         }

@@ -114,8 +114,65 @@ pub struct Node {
     pub inbound_ports: Vec<u16>,
     pub is_disabled: bool,
     pub is_connected: bool,
+    /// The panel is mid-(re)connect. Kept apart from `is_connected`, which is false for the whole
+    /// of that window: without this bit a node that is merely reconnecting is indistinguishable
+    /// from one that is down.
+    pub is_connecting: bool,
     pub last_status_message: Option<String>,
     pub xray_version: Option<String>,
+}
+
+/// What the panel says about a node, as one value.
+///
+/// The three flags are mirrored from the panel exactly as they arrived, because the panel's own
+/// writes are not transactional with its start job: it finishes that job by storing whether the
+/// node started without re-reading whether the node has since been disabled. Any combination of
+/// bits is therefore observable, and collapsing them at the boundary would be guessing. The
+/// collapse happens here instead, once, with a fixed precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelState<'a> {
+    /// Switched off by an administrator.
+    Disabled,
+    /// Connecting, or reconnecting after a drop.
+    Connecting,
+    /// Down, with whatever reason the panel recorded for the last attempt.
+    Disconnected {
+        reason: Option<&'a str>,
+    },
+    Connected,
+}
+
+impl Node {
+    /// The panel's verdict on this node, decided in one place.
+    ///
+    /// The order of the arms is the whole content of this function. `Disabled` wins over
+    /// everything: an administrator switching a node off is the explanation for whatever else the
+    /// node reports, and the panel stops the node's xray on that path anyway. `Connecting` wins
+    /// over `Disconnected` because the panel sets it *without* clearing `last_status_message` —
+    /// the reason sitting there belongs to an earlier attempt, so reporting a reconnecting node as
+    /// down would name a cause that is no longer current.
+    pub fn panel_state(&self) -> PanelState<'_> {
+        if self.is_disabled {
+            PanelState::Disabled
+        } else if self.is_connecting {
+            PanelState::Connecting
+        } else if !self.is_connected {
+            PanelState::Disconnected {
+                reason: self.last_status_message.as_deref(),
+            }
+        } else {
+            PanelState::Connected
+        }
+    }
+
+    /// Not switched off by an administrator.
+    ///
+    /// Deliberately narrower than the panel's own notion of a usable node, which also requires the
+    /// node to be connected and not connecting: a node that dropped its connection is exactly the
+    /// one whose host this tool still wants to look at over SSH.
+    pub fn is_enabled(&self) -> bool {
+        !self.is_disabled
+    }
 }
 
 /// A client-facing channel, exactly as the monitoring user receives it.
@@ -258,5 +315,74 @@ mod tests {
         assert_eq!(r.title, "alpha");
         assert_eq!(r.severity, Severity::Fail);
         assert_eq!(r.detail, "no exit");
+    }
+
+    fn node(disabled: bool, connecting: bool, connected: bool, message: Option<&str>) -> Node {
+        Node {
+            name: "alpha".into(),
+            address: "192.0.2.1".into(),
+            profile_uuid: None,
+            inbound_tags: vec![],
+            inbound_ports: vec![],
+            is_disabled: disabled,
+            is_connected: connected,
+            is_connecting: connecting,
+            last_status_message: message.map(String::from),
+            xray_version: None,
+        }
+    }
+
+    #[test]
+    fn a_disabled_node_stays_disabled_whatever_the_other_bits_say() {
+        // The panel's writes are not transactional with its own start job: a node disabled while
+        // that job was in flight comes back disabled with `isConnected` still set. The bits are
+        // mirrored as they arrived, so the precedence here is what settles such a node.
+        assert_eq!(
+            node(true, false, true, None).panel_state(),
+            PanelState::Disabled
+        );
+        assert_eq!(
+            node(true, true, false, None).panel_state(),
+            PanelState::Disabled
+        );
+    }
+
+    #[test]
+    fn a_reconnecting_node_is_neither_connected_nor_a_failure() {
+        // The panel sets `isConnecting` without clearing `lastStatusMessage`, so the reason left
+        // there belongs to an earlier attempt and this state carries none.
+        assert_eq!(
+            node(false, true, false, Some("boom")).panel_state(),
+            PanelState::Connecting
+        );
+    }
+
+    #[test]
+    fn a_disconnected_node_carries_the_panels_own_reason_only_when_there_is_one() {
+        assert_eq!(
+            node(false, false, false, Some("boom")).panel_state(),
+            PanelState::Disconnected {
+                reason: Some("boom")
+            }
+        );
+        assert_eq!(
+            node(false, false, false, None).panel_state(),
+            PanelState::Disconnected { reason: None }
+        );
+        // A connected node keeps whatever message the last failure left behind; it is not current.
+        assert_eq!(
+            node(false, false, true, Some("boom")).panel_state(),
+            PanelState::Connected
+        );
+    }
+
+    #[test]
+    fn only_an_administrator_switching_a_node_off_makes_it_not_enabled() {
+        // Narrower than the panel's own notion of a usable node on purpose: a node that dropped
+        // its connection is exactly the one whose host is still worth looking at over SSH.
+        assert!(node(false, false, true, None).is_enabled());
+        assert!(node(false, false, false, None).is_enabled());
+        assert!(node(false, true, false, None).is_enabled());
+        assert!(!node(true, false, false, None).is_enabled());
     }
 }

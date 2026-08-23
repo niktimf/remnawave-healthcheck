@@ -19,6 +19,8 @@ pub struct NodeDto {
     #[serde(default)]
     pub is_connected: bool,
     #[serde(default)]
+    pub is_connecting: bool,
+    #[serde(default)]
     pub last_status_message: Option<String>,
     #[serde(default)]
     pub versions: Option<VersionsDto>,
@@ -122,6 +124,7 @@ impl From<&NodeDto> for Node {
             inbound_ports: inbounds.iter().filter_map(|i| i.port).collect(),
             is_disabled: dto.is_disabled,
             is_connected: dto.is_connected,
+            is_connecting: dto.is_connecting,
             last_status_message: dto.last_status_message.clone(),
             xray_version: dto.versions.as_ref().and_then(|v| v.xray.clone()),
         }

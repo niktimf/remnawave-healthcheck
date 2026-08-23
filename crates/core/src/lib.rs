@@ -4,4 +4,4 @@ pub mod report;
 pub mod state;
 pub mod topology;
 
-pub use model::{Channel, CheckResult, Node, Profile, Severity, Snapshot};
+pub use model::{Channel, CheckResult, Node, PanelState, Profile, Severity, Snapshot};

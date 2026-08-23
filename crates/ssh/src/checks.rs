@@ -530,6 +530,7 @@ mod tests {
             inbound_ports: vec![443, 8443],
             is_disabled: false,
             is_connected: true,
+            is_connecting: false,
             last_status_message: None,
             xray_version: Some("26.6.27".into()),
         }

@@ -92,7 +92,7 @@ mod tests {
         let n = Node::from(&nodes[0]);
         assert!(n.profile_uuid.is_none());
         assert!(n.inbound_tags.is_empty());
-        assert!(n.is_disabled && !n.is_connected);
+        assert!(n.is_disabled && !n.is_connected && !n.is_connecting);
     }
 
     #[test]
