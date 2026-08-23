@@ -1,4 +1,5 @@
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
+use remnawave_healthcheck_core::model::EchoUrl;
 use std::time::Duration;
 
 /// How long the initial connection to a host may take (`ssh -o ConnectTimeout`).
@@ -59,8 +60,6 @@ enum CommandOutcome {
     TimedOut,
     /// The command never ran: the session could not carry it.
     Failed(String),
-    /// We refused to build this command line at all.
-    Refused(String),
 }
 
 impl CommandOutcome {
@@ -72,7 +71,6 @@ impl CommandOutcome {
             CommandOutcome::Ran { text, .. } => text,
             CommandOutcome::TimedOut => "ssh timeout".to_string(),
             CommandOutcome::Failed(e) => format!("ssh error: {e}"),
-            CommandOutcome::Refused(reason) => reason,
         }
     }
 }
@@ -143,8 +141,9 @@ async fn run(session: &Session, command: &str) -> CommandOutcome {
 /// `echo_url` is the same endpoint the channel probes use (`--echo-url`), passed in rather than
 /// fixed here so that both sides of the exit comparison always ask the same service: two
 /// different endpoints could disagree about the address of a multi-homed host and turn a healthy
-/// channel red.
-pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostFacts {
+/// channel red. It arrives as an `EchoUrl`, which is to say it has already been established that
+/// quoting it into a command line is safe.
+pub async fn gather(target: &str, domain: Option<&str>, echo_url: &EchoUrl) -> HostFacts {
     // Opening the session is the reachability check: there is nothing to ask a host that could
     // not be reached, and why it could not be reached is the reason to report.
     let session = match connect(target).await {
@@ -157,10 +156,8 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
         }
     };
 
-    // Single-quoted for the remote shell; a URL carrying a quote of its own is refused rather
-    // than pasted into a command line.
-    let egress_cmd =
-        (!echo_url.contains('\'')).then(|| format!("curl -fsS --max-time 8 '{echo_url}'"));
+    // Single-quoted for the remote shell, which `EchoUrl` is what makes safe.
+    let egress_cmd = format!("curl -fsS --max-time 8 '{echo_url}'");
     let cert_cmd = domain.map(|d| {
         format!("echo | openssl s_client -connect {d}:443 -servername {d} 2>/dev/null | openssl x509 -noout -enddate")
     });
@@ -171,14 +168,7 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
         run(&session, "sudo ss -ltn 2>/dev/null || ss -ltn"),
         run(&session, "sudo docker logs --tail 200 remnanode 2>&1 || docker logs --tail 200 remnanode"),
         run(&session, RENEWAL_CMD),
-        async {
-            match &egress_cmd {
-                Some(cmd) => run(&session, cmd).await,
-                None => CommandOutcome::Refused(format!(
-                    "refusing to run an echo URL containing a quote: {echo_url}"
-                )),
-            }
-        },
+        run(&session, &egress_cmd),
     );
     let cert = match cert_cmd {
         Some(cmd) => Some(run(&session, &cmd).await.text()),
@@ -283,7 +273,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn an_unreachable_host_yields_a_reason_from_the_real_transport() {
-        let facts = gather("127.0.0.1", None, "https://example.invalid").await;
+        let echo_url: EchoUrl = "https://example.invalid".parse().unwrap();
+        let facts = gather("127.0.0.1", None, &echo_url).await;
         let reason = facts
             .unreachable_reason
             .expect("a host with no sshd is unreachable");
@@ -300,11 +291,6 @@ mod tests {
         assert_eq!(
             CommandOutcome::Failed("boom".into()).text(),
             "ssh error: boom"
-        );
-        assert_eq!(
-            CommandOutcome::Refused("refusing to run an echo URL containing a quote: x".into())
-                .text(),
-            "refusing to run an echo URL containing a quote: x"
         );
     }
 }

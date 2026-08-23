@@ -112,180 +112,126 @@ struct Destination {
 /// resolver itself keeps the absence as an `Option`.
 const UNTAGGED: &str = "<untagged>";
 
-/// Name of the node this channel is declared to exit through.
-pub fn resolve_exit(channel: &Channel, snapshot: &Snapshot) -> Result<String, ResolveError> {
-    let mut node = entry_node(channel, &snapshot.nodes)?;
-    let mut inbound_tag = channel.inbound_tag.clone();
-    let mut visited: HashSet<(String, String)> = HashSet::new();
+/// One config profile's Xray configuration, as the resolver reads it.
+///
+/// A newtype over the raw JSON rather than a deserialised struct: a profile is an arbitrary Xray
+/// configuration, only four paths of it are ever read here, and a schema would break on
+/// everything else it legitimately contains. What the newtype buys is that a profile config, an
+/// outbound and a routing rule stop being the same type — handing one to something that meant
+/// another no longer compiles — and that every `get("...")` lives here rather than in the middle
+/// of the resolution logic.
+#[derive(Clone, Copy)]
+struct Config<'a>(&'a Value);
 
-    for _ in 0..MAX_HOPS {
-        if !visited.insert((node.name.clone(), inbound_tag.clone())) {
-            return Err(ResolveError::Cycle {
-                node: node.name.clone(),
-                inbound_tag,
-            });
+impl<'a> Config<'a> {
+    /// Outbounds in declaration order, or `None` when the profile declares none at all.
+    fn outbounds(&self) -> Option<&'a [Value]> {
+        self.0
+            .get("outbounds")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .filter(|outbounds| !outbounds.is_empty())
+    }
+
+    /// Where this config sends the traffic of one inbound.
+    fn route_for(&self, inbound_tag: &str) -> Routed<'a> {
+        let matched = self
+            .0
+            .get("routing")
+            .and_then(|routing| routing.get("rules"))
+            .and_then(Value::as_array)
+            .and_then(|rules| rules.iter().find(|rule| rule_matches(rule, inbound_tag)));
+
+        let Some(rule) = matched else {
+            return Routed::FirstOutbound;
+        };
+        match rule.get("outboundTag").and_then(Value::as_str) {
+            Some(tag) => Routed::Tag(tag),
+            None if rule.get("balancerTag").is_some() => {
+                Routed::Unsupported(UnsupportedSelector::BalancerTag)
+            }
+            None => Routed::Unsupported(UnsupportedSelector::NoOutboundTag),
         }
-        let config = profile_config(node, snapshot)?;
-        let outbound = outbound_for(config, &inbound_tag, node)?;
-        // Borrowed, and only spelled out in the error branches below: the happy path never needs
-        // a tag, and an outbound without one is an absence, not the literal "<untagged>".
-        let tag = outbound.get("tag").and_then(Value::as_str);
-        let named = || tag.unwrap_or(UNTAGGED).to_string();
-        let protocol = outbound
+    }
+
+    fn outbound_tagged(&self, tag: &str) -> Option<Outbound<'a>> {
+        self.outbounds()?
+            .iter()
+            .find(|outbound| outbound.get("tag").and_then(Value::as_str) == Some(tag))
+            .map(Outbound)
+    }
+
+    fn inbound_tag_on_port(&self, port: u16) -> Option<String> {
+        self.0
+            .get("inbounds")?
+            .as_array()?
+            .iter()
+            .find(|inbound| inbound.get("port").and_then(Value::as_u64) == Some(u64::from(port)))
+            .and_then(|inbound| inbound.get("tag"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+}
+
+/// Where a config routes an inbound's traffic — the three cases that must not be conflated.
+///
+/// A rule that matched but names no outbound (it selects by `balancerTag`, say) is a different
+/// thing from no rule matching at all. Reading both as "no tag" would silently fall back to the
+/// first outbound and report a wrong exit instead of failing loudly, which is why the difference
+/// is a variant here rather than a `None` two call sites away.
+enum Routed<'a> {
+    /// A rule matched and named this outbound.
+    Tag(&'a str),
+    /// No rule matched. Xray sends such traffic into the first outbound of the list, and
+    /// mirroring that is what keeps rule-less exit profiles working.
+    FirstOutbound,
+    /// A rule matched but picks its outbound in a way this tool cannot follow.
+    Unsupported(UnsupportedSelector),
+}
+
+/// One outbound of a config.
+#[derive(Clone, Copy)]
+struct Outbound<'a>(&'a Value);
+
+impl<'a> Outbound<'a> {
+    /// How this outbound appears in an error message, and only there: the happy path never needs
+    /// a tag, and an outbound without one is an absence rather than the literal "<untagged>".
+    fn name(&self) -> String {
+        self.0
+            .get("tag")
+            .and_then(Value::as_str)
+            .unwrap_or(UNTAGGED)
+            .to_string()
+    }
+
+    fn protocol(&self) -> &'a str {
+        self.0
             .get("protocol")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        match OutboundKind::from_protocol(protocol) {
-            OutboundKind::NodeEgress => return Ok(node.name.clone()),
-            OutboundKind::Blackhole => {
-                return Err(ResolveError::Blackhole {
-                    inbound_tag,
-                    tag: named(),
-                })
-            }
-            OutboundKind::OpaqueTerminal => {
-                return Err(ResolveError::OpaqueTerminal {
-                    tag: named(),
-                    protocol: protocol.to_string(),
-                })
-            }
-            OutboundKind::Proxy => {}
-        }
-
-        let Destination { address, port } =
-            destination(outbound).ok_or_else(|| ResolveError::NoDestination { tag: named() })?;
-        let next = snapshot
-            .nodes
-            .iter()
-            .find(|n| n.address == address)
-            .ok_or_else(|| ResolveError::UnknownNextHop {
-                tag: named(),
-                address,
-            })?;
-        let next_config = profile_config(next, snapshot)?;
-        inbound_tag = inbound_tag_on_port(next_config, port).ok_or_else(|| {
-            ResolveError::NoInboundOnPort {
-                node: next.name.clone(),
-                port,
-            }
-        })?;
-        node = next;
+            .unwrap_or_default()
     }
-    Err(ResolveError::TooDeep { max: MAX_HOPS })
-}
 
-fn entry_node<'a>(channel: &Channel, nodes: &'a [Node]) -> Result<&'a Node, ResolveError> {
-    let profile_uuid =
-        channel
-            .profile_uuid
-            .as_deref()
-            .ok_or_else(|| ResolveError::ChannelWithoutProfile {
-                remark: channel.remark.clone(),
-            })?;
-
-    let candidates: Vec<&Node> = nodes
-        .iter()
-        .filter(|n| {
-            n.profile_uuid.as_deref() == Some(profile_uuid)
-                && n.inbound_tags.iter().any(|t| t == &channel.inbound_tag)
-        })
-        .collect();
-
-    match candidates.as_slice() {
-        [] => Err(ResolveError::NoEntryNode {
-            inbound_tag: channel.inbound_tag.clone(),
-            profile_uuid: profile_uuid.to_string(),
-        }),
-        [only] => Ok(only),
-        // Several nodes share the profile and the inbound; the channel address decides.
-        several => several
-            .iter()
-            .copied()
-            .find(|n| n.address == channel.address)
-            .ok_or_else(|| ResolveError::AmbiguousEntryNode {
-                inbound_tag: channel.inbound_tag.clone(),
-                address: channel.address.clone(),
-                candidates: several.iter().map(|n| n.name.clone()).collect(),
-            }),
+    fn kind(&self) -> OutboundKind {
+        OutboundKind::from_protocol(self.protocol())
     }
-}
 
-fn profile_config<'a>(node: &Node, snapshot: &'a Snapshot) -> Result<&'a Value, ResolveError> {
-    let uuid = node
-        .profile_uuid
-        .as_deref()
-        .ok_or_else(|| ResolveError::NodeWithoutProfile {
-            node: node.name.clone(),
-        })?;
-    snapshot
-        .profiles
-        .get(uuid)
-        .map(|p| &p.config)
-        .ok_or_else(|| ResolveError::ProfileMissing {
-            uuid: uuid.to_string(),
-        })
-}
-
-/// Outbound the traffic of `inbound_tag` ends up in. Xray sends traffic that matches no rule
-/// into the first outbound of the list — mirroring that here keeps rule-less exit profiles working.
-fn outbound_for<'a>(
-    config: &'a Value,
-    inbound_tag: &str,
-    node: &Node,
-) -> Result<&'a Value, ResolveError> {
-    // profile_uuid is expected to be Some here (profile_config already required it to resolve
-    // this config), but the fallback keeps the label legible instead of panicking, and spells
-    // out what it actually contains so an incident read never mistakes a node name for a UUID.
-    let profile_label = node
-        .profile_uuid
-        .clone()
-        .unwrap_or_else(|| format!("<node '{}' has no profile uuid>", node.name));
-    let outbounds = config
-        .get("outbounds")
-        .and_then(Value::as_array)
-        .filter(|o| !o.is_empty())
-        .ok_or_else(|| ResolveError::NoOutbounds {
-            profile: profile_label.clone(),
-        })?;
-
-    let matched_rule = config
-        .get("routing")
-        .and_then(|r| r.get("rules"))
-        .and_then(Value::as_array)
-        .and_then(|rules| rules.iter().find(|rule| rule_matches(rule, inbound_tag)));
-
-    // A rule matching is the "found a rule" case; a rule with no outboundTag (e.g. it
-    // routes via balancerTag instead) is a distinct case from "no rule matched at all" —
-    // conflating them would silently fall back to the first outbound and could report a
-    // wrong exit instead of failing loudly.
-    let routed_tag = match matched_rule {
-        Some(rule) => match rule.get("outboundTag").and_then(Value::as_str) {
-            Some(tag) => Some(tag),
-            None => {
-                let how = if rule.get("balancerTag").is_some() {
-                    UnsupportedSelector::BalancerTag
-                } else {
-                    UnsupportedSelector::NoOutboundTag
-                };
-                return Err(ResolveError::UnsupportedRule {
-                    inbound_tag: inbound_tag.to_string(),
-                    how,
-                });
-            }
-        },
-        None => None,
-    };
-
-    match routed_tag {
-        Some(tag) => outbounds
-            .iter()
-            .find(|o| o.get("tag").and_then(Value::as_str) == Some(tag))
-            .ok_or_else(|| ResolveError::UnknownOutbound {
-                profile: profile_label,
-                tag: tag.to_string(),
-            }),
-        None => Ok(&outbounds[0]),
+    /// Destination of a proxying outbound: vless uses `vnext`, trojan and shadowsocks use
+    /// `servers`.
+    fn destination(&self) -> Option<Destination> {
+        let settings = self.0.get("settings")?;
+        let first = settings
+            .get("vnext")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .or_else(|| {
+                settings
+                    .get("servers")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+            })?;
+        let address = first.get("address")?.as_str()?.to_string();
+        let port = u16::try_from(first.get("port")?.as_u64()?).ok()?;
+        Some(Destination { address, port })
     }
 }
 
@@ -295,33 +241,171 @@ fn rule_matches(rule: &Value, inbound_tag: &str) -> bool {
         .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some(inbound_tag)))
 }
 
-/// Destination of a proxying outbound: vless uses `vnext`, trojan and shadowsocks use `servers`.
-fn destination(outbound: &Value) -> Option<Destination> {
-    let settings = outbound.get("settings")?;
-    let first = settings
-        .get("vnext")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .or_else(|| {
-            settings
-                .get("servers")
-                .and_then(Value::as_array)
-                .and_then(|a| a.first())
-        })?;
-    let address = first.get("address")?.as_str()?.to_string();
-    let port = u16::try_from(first.get("port")?.as_u64()?).ok()?;
-    Some(Destination { address, port })
+/// Follows one snapshot's routing to the node a channel actually leaves through.
+///
+/// The snapshot is held rather than passed along: every step of a cascade needs it, and threading
+/// it through each of them made it an argument of everything here.
+pub struct Resolver<'a> {
+    snapshot: &'a Snapshot,
 }
 
-fn inbound_tag_on_port(config: &Value, port: u16) -> Option<String> {
-    config
-        .get("inbounds")?
-        .as_array()?
-        .iter()
-        .find(|i| i.get("port").and_then(Value::as_u64) == Some(u64::from(port)))
-        .and_then(|i| i.get("tag"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+impl<'a> Resolver<'a> {
+    pub fn new(snapshot: &'a Snapshot) -> Self {
+        Self { snapshot }
+    }
+
+    /// The node this channel is declared to exit through.
+    ///
+    /// The node itself, not its name: what the caller does with it — is it disabled, what is its
+    /// egress address — are questions about a node, and answering them by matching names would
+    /// mean a second list keyed by the same strings.
+    pub fn exit_of(&self, channel: &Channel) -> Result<&'a Node, ResolveError> {
+        let nodes = &self.snapshot.nodes;
+        let mut node = self.entry_node(channel)?;
+        let mut inbound_tag = channel.inbound_tag.clone();
+        // The name is borrowed from the snapshot the resolver already holds: a hop does not have
+        // to be copied to be remembered.
+        let mut visited: HashSet<(&'a str, String)> = HashSet::new();
+
+        for _ in 0..MAX_HOPS {
+            if !visited.insert((node.name.as_str(), inbound_tag.clone())) {
+                return Err(ResolveError::Cycle {
+                    node: node.name.clone(),
+                    inbound_tag,
+                });
+            }
+            let outbound = outbound_for(self.config_of(node)?, &inbound_tag, node)?;
+
+            match outbound.kind() {
+                OutboundKind::NodeEgress => return Ok(node),
+                OutboundKind::Blackhole => {
+                    return Err(ResolveError::Blackhole {
+                        inbound_tag,
+                        tag: outbound.name(),
+                    })
+                }
+                OutboundKind::OpaqueTerminal => {
+                    return Err(ResolveError::OpaqueTerminal {
+                        tag: outbound.name(),
+                        protocol: outbound.protocol().to_string(),
+                    })
+                }
+                OutboundKind::Proxy => {}
+            }
+
+            let Destination { address, port } =
+                outbound
+                    .destination()
+                    .ok_or_else(|| ResolveError::NoDestination {
+                        tag: outbound.name(),
+                    })?;
+            let next = nodes.iter().find(|n| n.address == address).ok_or_else(|| {
+                ResolveError::UnknownNextHop {
+                    tag: outbound.name(),
+                    address,
+                }
+            })?;
+            inbound_tag = self
+                .config_of(next)?
+                .inbound_tag_on_port(port)
+                .ok_or_else(|| ResolveError::NoInboundOnPort {
+                    node: next.name.clone(),
+                    port,
+                })?;
+            node = next;
+        }
+        Err(ResolveError::TooDeep { max: MAX_HOPS })
+    }
+
+    fn entry_node(&self, channel: &Channel) -> Result<&'a Node, ResolveError> {
+        let profile_uuid =
+            channel
+                .profile_uuid
+                .as_deref()
+                .ok_or_else(|| ResolveError::ChannelWithoutProfile {
+                    remark: channel.remark.clone(),
+                })?;
+
+        let candidates: Vec<&'a Node> = self
+            .snapshot
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.profile_uuid.as_deref() == Some(profile_uuid)
+                    && n.inbound_tags.iter().any(|t| t == &channel.inbound_tag)
+            })
+            .collect();
+
+        match candidates.as_slice() {
+            [] => Err(ResolveError::NoEntryNode {
+                inbound_tag: channel.inbound_tag.clone(),
+                profile_uuid: profile_uuid.to_string(),
+            }),
+            [only] => Ok(only),
+            // Several nodes share the profile and the inbound; the channel address decides.
+            several => several
+                .iter()
+                .copied()
+                .find(|n| n.address == channel.address)
+                .ok_or_else(|| ResolveError::AmbiguousEntryNode {
+                    inbound_tag: channel.inbound_tag.clone(),
+                    address: channel.address.clone(),
+                    candidates: several.iter().map(|n| n.name.clone()).collect(),
+                }),
+        }
+    }
+
+    fn config_of(&self, node: &Node) -> Result<Config<'a>, ResolveError> {
+        let uuid =
+            node.profile_uuid
+                .as_deref()
+                .ok_or_else(|| ResolveError::NodeWithoutProfile {
+                    node: node.name.clone(),
+                })?;
+        self.snapshot
+            .profiles
+            .get(uuid)
+            .map(|p| Config(&p.config))
+            .ok_or_else(|| ResolveError::ProfileMissing {
+                uuid: uuid.to_string(),
+            })
+    }
+}
+
+/// The outbound the traffic of `inbound_tag` ends up in.
+fn outbound_for<'a>(
+    config: Config<'a>,
+    inbound_tag: &str,
+    node: &Node,
+) -> Result<Outbound<'a>, ResolveError> {
+    // profile_uuid is expected to be Some here (`config_of` already required it to resolve this
+    // config), but the fallback keeps the label legible instead of panicking, and spells out what
+    // it actually contains so an incident read never mistakes a node name for a UUID.
+    let profile_label = node
+        .profile_uuid
+        .clone()
+        .unwrap_or_else(|| format!("<node '{}' has no profile uuid>", node.name));
+    let outbounds = config
+        .outbounds()
+        .ok_or_else(|| ResolveError::NoOutbounds {
+            profile: profile_label.clone(),
+        })?;
+
+    match config.route_for(inbound_tag) {
+        Routed::Unsupported(how) => Err(ResolveError::UnsupportedRule {
+            inbound_tag: inbound_tag.to_string(),
+            how,
+        }),
+        Routed::FirstOutbound => Ok(Outbound(&outbounds[0])),
+        Routed::Tag(tag) => {
+            config
+                .outbound_tagged(tag)
+                .ok_or_else(|| ResolveError::UnknownOutbound {
+                    profile: profile_label,
+                    tag: tag.to_string(),
+                })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -414,7 +498,7 @@ mod tests {
             vec![exit_profile("p-exit", "in-exit", 443)],
         );
         let ch = channel("beta direct", "in-exit", "p-exit", "beta.example.com");
-        assert_eq!(resolve_exit(&ch, &snap).unwrap(), "beta");
+        assert_eq!(Resolver::new(&snap).exit_of(&ch).unwrap().name, "beta");
     }
 
     #[test]
@@ -434,7 +518,7 @@ mod tests {
             outbound: json!({}),
         };
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::ChannelWithoutProfile { remark }) if remark == "orphaned host"
         ));
     }
@@ -452,7 +536,7 @@ mod tests {
             ],
         );
         let ch = channel("cdn front", "in-bridge", "p-bridge", "cdn.example.com");
-        assert_eq!(resolve_exit(&ch, &snap).unwrap(), "gamma");
+        assert_eq!(Resolver::new(&snap).exit_of(&ch).unwrap().name, "gamma");
     }
 
     #[test]
@@ -463,7 +547,7 @@ mod tests {
         );
         let ch = channel("orphan", "in-exit", "p-exit", "beta.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::NoEntryNode { .. })
         ));
     }
@@ -485,7 +569,7 @@ mod tests {
         );
         let ch = channel("blocked", "in", "p", "beta.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::Blackhole { .. })
         ));
     }
@@ -507,7 +591,7 @@ mod tests {
         );
         let ch = channel("typo", "in", "p", "beta.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::UnknownOutbound { .. })
         ));
     }
@@ -527,7 +611,7 @@ mod tests {
         );
         let ch = channel("dangling", "in-bridge", "p-bridge", "cdn.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::UnknownNextHop { .. })
         ));
     }
@@ -546,7 +630,7 @@ mod tests {
         );
         let ch = channel("wrong port", "in-bridge", "p-bridge", "cdn.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::NoInboundOnPort { .. })
         ));
     }
@@ -567,7 +651,7 @@ mod tests {
             vec![profile],
         );
         let ch = channel("balancer", "in", "p", "beta.example.com");
-        let err = resolve_exit(&ch, &snap).unwrap_err();
+        let err = Resolver::new(&snap).exit_of(&ch).unwrap_err();
         assert!(matches!(err, ResolveError::UnsupportedRule { .. }));
         assert_eq!(
             err.to_string(),
@@ -592,7 +676,7 @@ mod tests {
         );
         let ch = channel("warp", "in", "p", "beta.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::OpaqueTerminal { .. })
         ));
     }
@@ -614,7 +698,7 @@ mod tests {
         );
         let ch = channel("broken", "in", "p", "beta.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::NoDestination { .. })
         ));
     }
@@ -629,7 +713,7 @@ mod tests {
             vec![exit_profile("p-exit", "in-exit", 443)],
         );
         let ch = channel("neither", "in-exit", "p-exit", "gamma.example.com");
-        let err = resolve_exit(&ch, &snap).unwrap_err();
+        let err = Resolver::new(&snap).exit_of(&ch).unwrap_err();
         // The candidates are kept as a list and named in the message, in order.
         assert!(matches!(
             &err,
@@ -656,7 +740,7 @@ mod tests {
         );
         let ch = channel("loop", "in-a", "p-a", "alpha.example.com");
         assert!(matches!(
-            resolve_exit(&ch, &snap),
+            Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::Cycle { .. })
         ));
     }

@@ -1,4 +1,5 @@
 use clap::Parser;
+use remnawave_healthcheck_core::model::EchoUrl;
 use std::path::PathBuf;
 
 /// Health checker for a Remnawave installation. Keeps no inventory of its own: nodes, channels,
@@ -34,10 +35,13 @@ pub struct Args {
     #[arg(long, default_value = ".xray-cache")]
     pub xray_cache: PathBuf,
 
+    /// Warn this many days before a certificate expires. Not signed: a negative number would
+    /// have meant "warn about everything, always", which clap now refuses at the flag itself.
     #[arg(long, default_value_t = 14)]
-    pub cert_warn_days: i64,
+    pub cert_warn_days: u32,
+    /// Warn when the node last took a config this many days ago.
     #[arg(long, default_value_t = 7)]
-    pub config_warn_days: i64,
+    pub config_warn_days: u32,
 
     /// Skip node-side checks entirely (no SSH is attempted)
     #[arg(long)]
@@ -58,6 +62,9 @@ pub struct Args {
     pub socks_base_port: u16,
     /// Endpoint that echoes back the caller's IP address; used both through each channel's tunnel
     /// and on the node itself, so that both sides of an exit comparison ask the same service
+    /// Parsed, not merely read: this value is quoted into a shell command line on every node,
+    /// and `EchoUrl` is where a URL that could break out of that quoting is refused — by clap,
+    /// before a run exists.
     #[arg(long, default_value = "https://api.ipify.org")]
-    pub echo_url: String,
+    pub echo_url: EchoUrl,
 }

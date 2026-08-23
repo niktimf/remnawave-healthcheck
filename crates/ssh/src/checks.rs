@@ -43,8 +43,8 @@ struct HostChecks<'a> {
     node: &'a Node,
     facts: &'a HostFacts,
     now: DateTime<Utc>,
-    cert_warn_days: i64,
-    config_warn_days: i64,
+    cert_warn_days: u32,
+    config_warn_days: u32,
 }
 
 /// One node-side check: it reads the host and answers with a verdict, never with a key.
@@ -69,8 +69,8 @@ pub fn check_host(
     node: &Node,
     facts: &HostFacts,
     now: DateTime<Utc>,
-    cert_warn_days: i64,
-    config_warn_days: i64,
+    cert_warn_days: u32,
+    config_warn_days: u32,
 ) -> Vec<CheckResult> {
     let host = HostChecks {
         node,
@@ -309,7 +309,7 @@ impl HostChecks<'_> {
             None => Verdict::warn("no config-push line in node logs"),
             Some(when) => {
                 let age = (self.now - when).num_days();
-                let severity = if age > self.config_warn_days {
+                let severity = if age > i64::from(self.config_warn_days) {
                     Severity::Warn
                 } else {
                     Severity::Ok
@@ -339,7 +339,7 @@ impl HostChecks<'_> {
         let days = (not_after - self.now).num_days();
         let severity = if days < 0 {
             Severity::Fail
-        } else if days < self.cert_warn_days {
+        } else if days < i64::from(self.cert_warn_days) {
             Severity::Warn
         } else {
             Severity::Ok
