@@ -120,10 +120,16 @@ impl std::fmt::Display for EchoUrl {
 ///
 /// Container names and paths used to be literals in this tool's source, where
 /// breaking out of a command was impossible by construction. Once they can be
-/// set from the environment they are attacker-adjacent input reaching a remote
-/// shell, so what is allowed is listed rather than what is forbidden: letters,
-/// digits, and `.` `_` `-` `/`. A space, a quote, `;`, `$`, a backtick or a `*`
-/// is refused here, once, and cannot appear in any command built from one.
+/// set from the environment they are input reaching a remote shell, and what is
+/// accepted is exactly what needs no shell quoting at all — `shlex` deciding
+/// that, rather than a list of characters written out here.
+///
+/// Refused rather than escaped, which is what `shlex` is normally for. These
+/// values travel through nested shells: a container name reaches one, while the
+/// acme directory sits inside single quotes of our own inside `sudo sh -c`. A
+/// value escaped for one level would end the quoting of the other, and the
+/// number of levels differs per command — while a value that needs no quoting
+/// survives any number of them unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellWord(String);
 
@@ -133,13 +139,15 @@ impl ShellWord {
     }
 }
 
-/// A value that could not be put into a command line safely.
+/// A value that could not be put into a command line as it stands.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NotAShellWord {
     #[error("a value used in a remote command may not be empty")]
     Empty,
-    #[error("a value used in a remote command may only contain letters, digits, '.', '_', '-' and '/': {0}")]
-    Forbidden(String),
+    #[error(
+        "a value used in a remote command must need no shell quoting: {0}"
+    )]
+    NeedsQuoting(String),
 }
 
 impl std::str::FromStr for ShellWord {
@@ -149,12 +157,12 @@ impl std::str::FromStr for ShellWord {
         if s.is_empty() {
             return Err(NotAShellWord::Empty);
         }
-        if !s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')
-        }) {
-            return Err(NotAShellWord::Forbidden(s.to_string()));
+        // Compared by content, not by `Cow` variant: if quoting it changes
+        // nothing, then nothing about it needed quoting.
+        match shlex::try_quote(s) {
+            Ok(quoted) if quoted == s => Ok(Self(s.to_string())),
+            _ => Err(NotAShellWord::NeedsQuoting(s.to_string())),
         }
-        Ok(Self(s.to_string()))
     }
 }
 
@@ -402,19 +410,27 @@ mod tests {
     fn a_shell_word_takes_only_what_a_command_line_can_carry() {
         use std::str::FromStr;
 
-        for ordinary in ["remnanode", "/root/.acme.sh", "node-1_eu.example"] {
+        for ordinary in [
+            "remnanode",
+            "/root/.acme.sh",
+            "node-1_eu.example",
+            // Legal in a path and needing no quoting, so accepted — a
+            // hand-written list of characters refused this one.
+            "/home/user@corp/.acme.sh",
+        ] {
             assert_eq!(
                 ShellWord::from_str(ordinary).unwrap().as_str(),
                 ordinary
             );
         }
         // Each of these ends the command it is pasted into and starts another.
-        for hostile in
-            ["a b", "a;id", "a$(id)", "a`id`", "a'b", "a\"b", "a|b", "*"]
-        {
+        for hostile in [
+            "a b", "a;id", "a$(id)", "a`id`", "a'b", "a\"b", "a|b", "*", "~/x",
+            "a\nb", "a\0b",
+        ] {
             assert_eq!(
                 ShellWord::from_str(hostile),
-                Err(NotAShellWord::Forbidden(hostile.to_string())),
+                Err(NotAShellWord::NeedsQuoting(hostile.to_string())),
                 "{hostile}"
             );
         }
