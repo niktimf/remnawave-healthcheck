@@ -3,6 +3,7 @@ use crate::ports::SocksPorts;
 use crate::telegram::Notifier;
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
+use remnawave_healthcheck_core::keys::CheckKey;
 use remnawave_healthcheck_core::model::{Channel, CheckResult, Node, Severity, Snapshot};
 use remnawave_healthcheck_core::report::Outcome;
 use remnawave_healthcheck_core::{checks, report, state, topology};
@@ -141,7 +142,7 @@ impl Run {
         }
         let setup_failed = results
             .iter()
-            .any(|r| r.key == SETUP_KEY && r.severity == Severity::Fail);
+            .any(|r| r.key == CheckKey::ChannelSetup.key() && r.severity == Severity::Fail);
         setup_failed
             .then_some("partial run (channel probing could not start, so no channel was checked)")
     }
@@ -304,14 +305,10 @@ impl Run {
     }
 }
 
-/// Key of the single result that stands in for the whole channel family when probing could not
-/// be set up at all.
-const SETUP_KEY: &str = "channels:setup";
-
 /// The one result that stands in for every channel when probing could not be set up.
 fn setup_failed(detail: impl Into<String>) -> Vec<CheckResult> {
     vec![CheckResult::new(
-        SETUP_KEY,
+        CheckKey::ChannelSetup.key(),
         "channel probing setup",
         Severity::Fail,
         detail,
@@ -609,7 +606,7 @@ mod tests {
         assert!(run.partial_run_reason(&[]).is_none());
 
         let setup_failed = vec![CheckResult::new(
-            SETUP_KEY,
+            CheckKey::ChannelSetup.key(),
             "channel probing setup",
             Severity::Fail,
             "obtaining xray 26.6.27: connection refused",

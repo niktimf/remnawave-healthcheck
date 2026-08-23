@@ -1,3 +1,4 @@
+use crate::keys::{CheckKey, NodeAspect};
 use crate::model::{CheckResult, Node, PanelState, Severity, Snapshot};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,9 +22,14 @@ pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
                 ),
                 PanelState::Connected => (Severity::Ok, "connected".to_string()),
             };
+            let aspect = NodeAspect::Panel;
             CheckResult::new(
-                format!("node:{}:panel", n.name),
-                format!("{} panel status", n.name),
+                CheckKey::Node {
+                    node: &n.name,
+                    aspect,
+                }
+                .key(),
+                format!("{} {}", n.name, aspect.title()),
                 severity,
                 detail,
             )
@@ -39,60 +45,116 @@ pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
 /// Sets, not counts: one channel dropped and another one duplicated leaves the counts equal and
 /// would have made a broken join look green.
 pub fn subscription_coverage(snapshot: &Snapshot) -> CheckResult {
-    let resolved: BTreeSet<&str> = snapshot
-        .channels
-        .iter()
-        .map(|c| c.remark.as_str())
-        .collect();
-    // Counted in one pass: both the set of served remarks and the ones served more than once come
-    // out of the same tally.
-    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
-    for remark in &snapshot.served_remarks {
-        *tally.entry(remark.as_str()).or_default() += 1;
-    }
-    let served: BTreeSet<&str> = tally.keys().copied().collect();
-
-    let missing: Vec<&str> = resolved.difference(&served).copied().collect();
-    let unexpected: Vec<&str> = served.difference(&resolved).copied().collect();
-    // A remark served twice makes the join ambiguous: both channels would be probed with whichever
-    // outbound happened to win, so one of them would be reported on evidence that is not its own.
-    let duplicated: Vec<&str> = tally
-        .iter()
-        .filter(|(_, count)| **count > 1)
-        .map(|(remark, _)| *remark)
-        .collect();
-
-    let key = "subscription:coverage";
-    let title = "subscription coverage";
-    if missing.is_empty() && unexpected.is_empty() && duplicated.is_empty() {
-        return CheckResult::new(
-            key,
-            title,
+    let coverage = Coverage::of(snapshot);
+    // The gaps are what decides the severity, so they are asked for once and the answer is used
+    // for both: a run is healthy exactly when there is nothing to report, and the two can no
+    // longer disagree about what "nothing" means.
+    let gaps = coverage.gaps();
+    let (severity, detail) = if gaps.is_empty() {
+        (
             Severity::Ok,
             format!(
                 "subscription served all {} resolved channels",
-                resolved.len()
+                coverage.resolved
             ),
-        );
+        )
+    } else {
+        (Severity::Fail, gaps.join("; "))
+    };
+    CheckResult::new(
+        CheckKey::SubscriptionCoverage.key(),
+        "subscription coverage",
+        severity,
+        detail,
+    )
+}
+
+/// How the channels the panel resolved and the remarks the subscription served failed to line up.
+///
+/// Ordered sets rather than lists: a remark can be missing, unexpected or duplicated only once,
+/// and the order these are reported in should not depend on which way the snapshot happened to be
+/// built. Both properties hold today because every one of them comes out of a `BTree*`; keeping
+/// them in the types is what stops a later rewrite from quietly reporting a name twice.
+struct Coverage<'a> {
+    /// How many channels the panel resolved — the number the healthy message reports.
+    resolved: usize,
+    /// Resolved by the panel, never served by the subscription.
+    missing: BTreeSet<&'a str>,
+    /// Served by the subscription, never resolved by the panel.
+    unexpected: BTreeSet<&'a str>,
+    /// Served more than once, with how many times. The count is kept because it says which
+    /// mistake this is: twice is usually one host duplicated, while a dozen is a remark template
+    /// in the panel collapsing that many hosts onto a single name.
+    duplicated: BTreeMap<&'a str, usize>,
+}
+
+impl<'a> Coverage<'a> {
+    fn of(snapshot: &'a Snapshot) -> Self {
+        let resolved: BTreeSet<&str> = snapshot
+            .channels
+            .iter()
+            .map(|c| c.remark.as_str())
+            .collect();
+        // Counted in one pass: both the set of served remarks and the ones served more than once
+        // come out of the same tally.
+        let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+        for remark in &snapshot.served_remarks {
+            *tally.entry(remark.as_str()).or_default() += 1;
+        }
+        let served: BTreeSet<&str> = tally.keys().copied().collect();
+
+        Self {
+            resolved: resolved.len(),
+            missing: resolved.difference(&served).copied().collect(),
+            unexpected: served.difference(&resolved).copied().collect(),
+            // A remark served twice makes the join ambiguous: both channels would be probed with
+            // whichever outbound happened to win, so one of them would be reported on evidence
+            // that is not its own.
+            duplicated: tally.into_iter().filter(|(_, times)| *times > 1).collect(),
+        }
     }
 
-    let mut parts = Vec::new();
-    if !missing.is_empty() {
-        parts.push(format!("not served: {}", missing.join(", ")));
+    /// Every way the two sides disagree, one description apiece.
+    ///
+    /// One list, and the only place that enumerates the kinds of disagreement there are. A fourth
+    /// kind is a row here and nothing else — which is the point: the old shape stated the same
+    /// enumeration twice, once to render it and once to decide whether the check was green, and
+    /// they could drift apart without a word from the compiler.
+    fn gaps(&self) -> Vec<String> {
+        let named = |remarks: &BTreeSet<&str>| commas(remarks.iter().copied());
+        let counted = commas(
+            self.duplicated
+                .iter()
+                .map(|(remark, times)| format!("{remark} \u{00d7}{times}")),
+        );
+
+        // An empty rendering is an absent gap: each of these lists is empty exactly when that
+        // kind of disagreement did not happen.
+        [
+            ("not served", named(&self.missing)),
+            (
+                "served but not resolved by the panel",
+                named(&self.unexpected),
+            ),
+            (
+                "served more than once, so their configs cannot be told apart",
+                counted,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, remarks)| !remarks.is_empty())
+        .map(|(what, remarks)| format!("{what}: {remarks}"))
+        .collect()
     }
-    if !unexpected.is_empty() {
-        parts.push(format!(
-            "served but not resolved by the panel: {}",
-            unexpected.join(", ")
-        ));
-    }
-    if !duplicated.is_empty() {
-        parts.push(format!(
-            "served more than once, so their configs cannot be told apart: {}",
-            duplicated.join(", ")
-        ));
-    }
-    CheckResult::new(key, title, Severity::Fail, parts.join("; "))
+}
+
+/// Comma-separated list, the way every detail line in this module writes one.
+fn commas(items: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
+    items
+        .into_iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// Inbounds that are live on a node but never reach the monitoring user — typically the user was
@@ -112,7 +174,7 @@ pub fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
                 continue;
             }
             out.push(CheckResult::new(
-                format!("monitoring:coverage:{tag}"),
+                CheckKey::MonitoringCoverage { inbound: tag }.key(),
                 format!("inbound {tag} monitored"),
                 Severity::Warn,
                 format!(
@@ -137,7 +199,7 @@ pub fn xray_version_drift(nodes: &[Node]) -> CheckResult {
         .into_iter()
         .collect();
 
-    let key = "xray:version-drift";
+    let key = CheckKey::XrayVersionDrift.key();
     let title = "xray version drift";
     match versions.as_slice() {
         [] => CheckResult::new(key, title, Severity::Ok, "no versions reported"),
@@ -247,6 +309,9 @@ mod tests {
         assert_eq!(r.severity, Severity::Fail);
         assert!(r.detail.contains("ch-in-b"), "{}", r.detail);
         assert!(r.detail.contains("more than once"), "{}", r.detail);
+        // How many times it was served is part of the reason: two is a duplicated host, a dozen
+        // is a remark template collapsing that many hosts onto one name.
+        assert!(r.detail.contains("ch-in-a \u{00d7}2"), "{}", r.detail);
     }
 
     #[test]

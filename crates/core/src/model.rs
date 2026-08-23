@@ -232,16 +232,15 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Stable key of this channel's check, unique by construction.
-    ///
-    /// The remark alone is not: it is rendered from a template configured in the panel and
-    /// nothing there enforces uniqueness. Two channels sharing a remark would share a key, and
-    /// since the problem set is a map, one of them would silently vanish from the alert while the
-    /// report on stdout still showed both. The client-facing endpoint is what tells two hosts of
-    /// the same inbound apart, so it goes into the key; the human-facing title stays the plain
-    /// remark.
+    /// Stable key of this channel's check, unique by construction. Built by `CheckKey`, which is
+    /// where every key of every check comes from and where the reasoning lives.
     pub fn check_key(&self) -> String {
-        format!("channel:{}@{}:{}", self.remark, self.address, self.port)
+        crate::keys::CheckKey::Channel {
+            remark: &self.remark,
+            address: &self.address,
+            port: self.port,
+        }
+        .key()
     }
 }
 

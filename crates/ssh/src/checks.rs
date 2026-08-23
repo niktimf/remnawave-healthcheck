@@ -1,5 +1,6 @@
 use crate::facts::HostFacts;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use remnawave_healthcheck_core::keys::{CheckKey, NodeAspect};
 use remnawave_healthcheck_core::model::{CheckResult, Node, Severity};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,19 +51,20 @@ struct HostChecks<'a> {
 /// One node-side check: it reads the host and answers with a verdict, never with a key.
 type Check = fn(&HostChecks) -> Verdict;
 
-/// Every node-side check there is, in report order.
+/// Every check this crate runs against a host, in report order.
 ///
 /// One list, so an unreachable host cannot report a different set of checks than a reachable one.
-/// A suffix is part of a check's key and therefore of the tool's memory across runs: renaming one
-/// makes the old key look recovered and the new one look new.
-const CHECKS: [(&str, Check); 7] = [
-    ("containers", |h| h.containers()),
-    ("ports", |h| h.ports()),
-    ("users", |h| h.users()),
-    ("config-age", |h| h.config_age()),
-    ("cert", |h| h.cert()),
-    ("cert-renewal", |h| h.renewal()),
-    ("egress-ip", |h| h.egress()),
+/// What each one is called is not decided here: an aspect carries its own name, and every key of
+/// every check in the tool is built from one place, so nothing in this table can collide with a
+/// check that lives in another crate.
+const CHECKS: [(NodeAspect, Check); 7] = [
+    (NodeAspect::Containers, |h| h.containers()),
+    (NodeAspect::Ports, |h| h.ports()),
+    (NodeAspect::Users, |h| h.users()),
+    (NodeAspect::ConfigAge, |h| h.config_age()),
+    (NodeAspect::CertExpiry, |h| h.cert()),
+    (NodeAspect::CertRenewal, |h| h.renewal()),
+    (NodeAspect::EgressIp, |h| h.egress()),
 ];
 
 pub fn check_host(
@@ -82,7 +84,7 @@ pub fn check_host(
 
     CHECKS
         .iter()
-        .map(|(suffix, check)| {
+        .map(|(aspect, check)| {
             // An unreachable host answers every check with the one reason none of them could run,
             // rather than with a shorter list that would read as "nothing else was wrong".
             let verdict = match &facts.unreachable_reason {
@@ -90,8 +92,12 @@ pub fn check_host(
                 None => check(&host),
             };
             CheckResult::new(
-                format!("node:{}:{}", node.name, suffix),
-                format!("{} {}", node.name, suffix),
+                CheckKey::Node {
+                    node: &node.name,
+                    aspect: *aspect,
+                }
+                .key(),
+                format!("{} {}", node.name, aspect.title()),
                 verdict.severity,
                 verdict.detail,
             )
@@ -556,7 +562,7 @@ mod tests {
             "node:beta:ports",
             "node:beta:users",
             "node:beta:config-age",
-            "node:beta:cert",
+            "node:beta:cert-expiry",
             "node:beta:cert-renewal",
             "node:beta:egress-ip",
         ];
@@ -742,13 +748,13 @@ mod tests {
         let mut facts = healthy_facts();
         facts.cert = Some("notAfter=Aug 30 10:00:00 2026 GMT\n".into());
         assert_eq!(
-            severity_of(&check_host(&node(), &facts, now(), 14, 7), ":cert"),
+            severity_of(&check_host(&node(), &facts, now(), 14, 7), ":cert-expiry"),
             Severity::Warn
         );
 
         facts.cert = Some("notAfter=Aug 10 10:00:00 2026 GMT\n".into());
         assert_eq!(
-            severity_of(&check_host(&node(), &facts, now(), 14, 7), ":cert"),
+            severity_of(&check_host(&node(), &facts, now(), 14, 7), ":cert-expiry"),
             Severity::Fail
         );
     }
@@ -829,7 +835,7 @@ mod tests {
         let mut facts = healthy_facts();
         facts.cert = None;
         let r = check_host(&node(), &facts, now(), 14, 7);
-        let cert = r.iter().find(|c| c.key.ends_with(":cert")).unwrap();
+        let cert = r.iter().find(|c| c.key.ends_with(":cert-expiry")).unwrap();
         assert_eq!(cert.severity, Severity::Ok);
         assert!(cert.detail.contains("no TLS endpoint"));
     }
@@ -842,7 +848,7 @@ mod tests {
         let mut facts = healthy_facts();
         facts.cert = Some(String::new());
         let r = check_host(&node(), &facts, now(), 14, 7);
-        let cert = r.iter().find(|c| c.key.ends_with(":cert")).unwrap();
+        let cert = r.iter().find(|c| c.key.ends_with(":cert-expiry")).unwrap();
         assert_eq!(cert.severity, Severity::Warn);
         assert_eq!(cert.detail, "certificate not parsed");
     }
