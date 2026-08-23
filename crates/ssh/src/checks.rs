@@ -96,7 +96,7 @@ pub fn check_host(
                     node: &node.name,
                     aspect: *aspect,
                 }
-                .key(),
+                .to_string(),
                 format!("{} {}", node.name, aspect.title()),
                 verdict.severity,
                 verdict.detail,

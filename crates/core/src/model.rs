@@ -240,7 +240,7 @@ impl Channel {
             address: &self.address,
             port: self.port,
         }
-        .key()
+        .to_string()
     }
 }
 

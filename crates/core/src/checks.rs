@@ -28,7 +28,7 @@ pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
                     node: &n.name,
                     aspect,
                 }
-                .key(),
+                .to_string(),
                 format!("{} {}", n.name, aspect.title()),
                 severity,
                 detail,
@@ -62,7 +62,7 @@ pub fn subscription_coverage(snapshot: &Snapshot) -> CheckResult {
         (Severity::Fail, gaps.join("; "))
     };
     CheckResult::new(
-        CheckKey::SubscriptionCoverage.key(),
+        CheckKey::SubscriptionCoverage.to_string(),
         "subscription coverage",
         severity,
         detail,
@@ -174,7 +174,7 @@ pub fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
                 continue;
             }
             out.push(CheckResult::new(
-                CheckKey::MonitoringCoverage { inbound: tag }.key(),
+                CheckKey::MonitoringCoverage { inbound: tag }.to_string(),
                 format!("inbound {tag} monitored"),
                 Severity::Warn,
                 format!(
@@ -199,7 +199,7 @@ pub fn xray_version_drift(nodes: &[Node]) -> CheckResult {
         .into_iter()
         .collect();
 
-    let key = CheckKey::XrayVersionDrift.key();
+    let key = CheckKey::XrayVersionDrift.to_string();
     let title = "xray version drift";
     match versions.as_slice() {
         [] => CheckResult::new(key, title, Severity::Ok, "no versions reported"),

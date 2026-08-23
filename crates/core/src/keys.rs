@@ -14,7 +14,12 @@
 
 /// A node-side check. Every one there is: the node checks are a closed set, and seeing them all
 /// at once is the point of naming them here rather than spelling their suffixes at each call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `EnumIter` and not `Display`: what can be walked is the list of variants, which is exactly one
+/// thing, while the two strings below are two — a key part and a report label, answering to
+/// different masters. A `Display` would leave `{aspect}` ambiguous at every call site, and the
+/// direction that goes wrong quietly is a title reaching a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::EnumIter)]
 pub enum NodeAspect {
     /// What the panel itself says about the node. The only one of these that costs no SSH.
     Panel,
@@ -31,21 +36,16 @@ pub enum NodeAspect {
 }
 
 impl NodeAspect {
-    /// Every aspect, so that a test can walk them and no list of checks has to be maintained
-    /// twice.
-    pub const ALL: [NodeAspect; 8] = [
-        NodeAspect::Panel,
-        NodeAspect::Containers,
-        NodeAspect::Ports,
-        NodeAspect::Users,
-        NodeAspect::ConfigAge,
-        NodeAspect::CertExpiry,
-        NodeAspect::CertRenewal,
-        NodeAspect::EgressIp,
-    ];
-
-    /// The part of the key that names this aspect. Part of the contract: changing one costs a
-    /// single run in which the old key reads as recovered and the new one as new.
+    /// The part of the key that names this aspect.
+    ///
+    /// Written out rather than derived from the variant's name, though `kebab-case` of these
+    /// names happens to spell exactly these strings. Deriving it would make the key a function of
+    /// a Rust identifier: renaming `CertExpiry` to something clearer would silently rename the
+    /// key with it and reset the history of every node under it. The `match` is what keeps a
+    /// rename free.
+    ///
+    /// Part of the contract: changing one of these strings costs a single run in which the old
+    /// key reads as recovered and the new one as new.
     pub fn slug(self) -> &'static str {
         match self {
             NodeAspect::Panel => "panel",
@@ -80,6 +80,9 @@ impl NodeAspect {
 /// Every key the tool produces comes from here, so the namespaces are visible together and a new
 /// check cannot quietly reuse one. What it cannot do by itself is stop two variants from spelling
 /// the same string — that is what `keys_are_unique_across_every_kind_of_check` is for.
+///
+/// It renders as its key and as nothing else, which is why that rendering is `Display` rather
+/// than a method of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckKey<'a> {
     Node {
@@ -104,19 +107,21 @@ pub enum CheckKey<'a> {
     XrayVersionDrift,
 }
 
-impl CheckKey<'_> {
-    pub fn key(&self) -> String {
+impl std::fmt::Display for CheckKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CheckKey::Node { node, aspect } => format!("node:{node}:{}", aspect.slug()),
+            CheckKey::Node { node, aspect } => write!(f, "node:{node}:{}", aspect.slug()),
             CheckKey::Channel {
                 remark,
                 address,
                 port,
-            } => format!("channel:{remark}@{address}:{port}"),
-            CheckKey::ChannelSetup => "channels:setup".to_string(),
-            CheckKey::SubscriptionCoverage => "subscription:coverage".to_string(),
-            CheckKey::MonitoringCoverage { inbound } => format!("monitoring:coverage:{inbound}"),
-            CheckKey::XrayVersionDrift => "xray:version-drift".to_string(),
+            } => write!(f, "channel:{remark}@{address}:{port}"),
+            CheckKey::ChannelSetup => f.write_str("channels:setup"),
+            CheckKey::SubscriptionCoverage => f.write_str("subscription:coverage"),
+            CheckKey::MonitoringCoverage { inbound } => {
+                write!(f, "monitoring:coverage:{inbound}")
+            }
+            CheckKey::XrayVersionDrift => f.write_str("xray:version-drift"),
         }
     }
 }
@@ -125,15 +130,15 @@ impl CheckKey<'_> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use strum::IntoEnumIterator;
 
     /// One of every kind of check, with the same node and the same names throughout: if two kinds
     /// can collide, this is the shape in which they do.
     fn one_of_each() -> Vec<CheckKey<'static>> {
-        let mut keys: Vec<CheckKey<'static>> = NodeAspect::ALL
-            .iter()
+        let mut keys: Vec<CheckKey<'static>> = NodeAspect::iter()
             .map(|aspect| CheckKey::Node {
                 node: "beta",
-                aspect: *aspect,
+                aspect,
             })
             .collect();
         keys.extend([
@@ -156,32 +161,26 @@ mod tests {
         // rendering the same string. A collision would not fail a run — it would silently drop
         // one of the two problems out of the alert.
         let keys = one_of_each();
-        let distinct: BTreeSet<String> = keys.iter().map(CheckKey::key).collect();
+        let rendered = || keys.iter().map(ToString::to_string);
+        let distinct: BTreeSet<String> = rendered().collect();
         assert_eq!(
             distinct.len(),
             keys.len(),
             "two checks share a key: {:?}",
-            keys.iter().map(CheckKey::key).collect::<Vec<String>>()
+            rendered().collect::<Vec<String>>()
         );
     }
 
     #[test]
     fn a_node_aspect_is_named_the_same_way_everywhere() {
-        let slugs: BTreeSet<&str> = NodeAspect::ALL.iter().map(|a| a.slug()).collect();
-        assert_eq!(
-            slugs.len(),
-            NodeAspect::ALL.len(),
-            "two aspects share a slug"
-        );
-        let titles: BTreeSet<&str> = NodeAspect::ALL.iter().map(|a| a.title()).collect();
-        assert_eq!(
-            titles.len(),
-            NodeAspect::ALL.len(),
-            "two aspects share a title"
-        );
+        let aspects = NodeAspect::iter().count();
+        let slugs: BTreeSet<&str> = NodeAspect::iter().map(|a| a.slug()).collect();
+        assert_eq!(slugs.len(), aspects, "two aspects share a slug");
+        let titles: BTreeSet<&str> = NodeAspect::iter().map(|a| a.title()).collect();
+        assert_eq!(titles.len(), aspects, "two aspects share a title");
         // Slugs go into keys, which are read in alerts and compared between runs: no spaces, and
         // no colon, which is what separates the parts of a key.
-        for aspect in NodeAspect::ALL {
+        for aspect in NodeAspect::iter() {
             let slug = aspect.slug();
             assert!(!slug.is_empty(), "{aspect:?}");
             assert!(
@@ -205,7 +204,7 @@ mod tests {
 
     #[test]
     fn a_key_names_its_namespace_and_then_its_subject() {
-        let key = |k: CheckKey<'_>| k.key();
+        let key = |k: CheckKey<'_>| k.to_string();
         assert_eq!(
             key(CheckKey::Node {
                 node: "beta",

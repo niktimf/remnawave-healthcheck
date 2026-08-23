@@ -142,7 +142,7 @@ impl Run {
         }
         let setup_failed = results
             .iter()
-            .any(|r| r.key == CheckKey::ChannelSetup.key() && r.severity == Severity::Fail);
+            .any(|r| r.key == CheckKey::ChannelSetup.to_string() && r.severity == Severity::Fail);
         setup_failed
             .then_some("partial run (channel probing could not start, so no channel was checked)")
     }
@@ -308,7 +308,7 @@ impl Run {
 /// The one result that stands in for every channel when probing could not be set up.
 fn setup_failed(detail: impl Into<String>) -> Vec<CheckResult> {
     vec![CheckResult::new(
-        CheckKey::ChannelSetup.key(),
+        CheckKey::ChannelSetup.to_string(),
         "channel probing setup",
         Severity::Fail,
         detail,
@@ -606,7 +606,7 @@ mod tests {
         assert!(run.partial_run_reason(&[]).is_none());
 
         let setup_failed = vec![CheckResult::new(
-            CheckKey::ChannelSetup.key(),
+            CheckKey::ChannelSetup.to_string(),
             "channel probing setup",
             Severity::Fail,
             "obtaining xray 26.6.27: connection refused",
