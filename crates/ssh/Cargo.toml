@@ -11,3 +11,6 @@ remnawave-healthcheck-core = { path = "../core" }
 chrono.workspace = true
 openssh.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

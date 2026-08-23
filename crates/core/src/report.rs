@@ -10,9 +10,11 @@ pub fn overall(results: &[CheckResult]) -> Severity {
         .unwrap_or(Severity::Ok)
 }
 
-/// How a run ended, as the process reports it. The three numbers behind these variants are the
-/// tool's contract with whatever runs it (a CI job reads them), which is why they live in one
-/// place instead of being spelled out at every `return`.
+/// How a run ended, as the process reports it.
+///
+/// The three numbers behind these variants are the tool's contract with whatever runs it (a CI
+/// job reads them), which is why they live in one place instead of being spelled out at every
+/// `return`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Everything that was looked at is fine. Warnings do not break the build.
@@ -26,18 +28,18 @@ pub enum Outcome {
 
 impl Outcome {
     /// The process exit status.
-    pub fn code(self) -> u8 {
+    pub const fn code(self) -> u8 {
         match self {
-            Outcome::Ok => 0,
-            Outcome::Failed => 1,
-            Outcome::Aborted => 2,
+            Self::Ok => 0,
+            Self::Failed => 1,
+            Self::Aborted => 2,
         }
     }
 }
 
 impl From<Outcome> for std::process::ExitCode {
     fn from(outcome: Outcome) -> Self {
-        std::process::ExitCode::from(outcome.code())
+        Self::from(outcome.code())
     }
 }
 
@@ -53,7 +55,9 @@ pub fn outcome(results: &[CheckResult]) -> Outcome {
 /// Plain-text table, worst first. Written by hand so `core` stays dependency-light.
 pub fn render(results: &[CheckResult]) -> String {
     let mut rows: Vec<&CheckResult> = results.iter().collect();
-    rows.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.key.cmp(&b.key)));
+    rows.sort_by(|a, b| {
+        b.severity.cmp(&a.severity).then_with(|| a.key.cmp(&b.key))
+    });
 
     // Characters, not bytes: a title is a host remark rendered from a panel template, and those
     // carry Cyrillic and emoji. Padding by byte length would widen exactly the rows that contain
@@ -81,7 +85,10 @@ pub fn render(results: &[CheckResult]) -> String {
     out
 }
 
-fn column_width<'a>(values: impl Iterator<Item = &'a str>, min: usize) -> usize {
+fn column_width<'a>(
+    values: impl Iterator<Item = &'a str>,
+    min: usize,
+) -> usize {
     values
         .map(|v| v.chars().count())
         .max()
@@ -96,7 +103,12 @@ mod tests {
 
     fn results() -> Vec<CheckResult> {
         vec![
-            CheckResult::new("node:beta:cert", "beta cert", Severity::Ok, "40d left"),
+            CheckResult::new(
+                "node:beta:cert",
+                "beta cert",
+                Severity::Ok,
+                "40d left",
+            ),
             CheckResult::new("channel:b", "b", Severity::Fail, "no exit"),
             CheckResult::new("channel:a", "a", Severity::Warn, "node disabled"),
         ]

@@ -30,7 +30,7 @@ async fn download_into(version: &str, dir: &Path) -> Result<()> {
     let url = release_url(version);
     let bytes = reqwest::Client::new()
         .get(&url)
-        .timeout(std::time::Duration::from_secs(180))
+        .timeout(std::time::Duration::from_mins(3))
         .send()
         .await
         .with_context(|| format!("downloading {url}"))?
@@ -49,8 +49,9 @@ async fn download_into(version: &str, dir: &Path) -> Result<()> {
         unpack_into(bytes, &partial).inspect_err(|_| {
             let _ = std::fs::remove_file(&partial);
         })?;
-        std::fs::rename(&partial, &target)
-            .with_context(|| format!("moving the unpacked binary into {}", target.display()))?;
+        std::fs::rename(&partial, &target).with_context(|| {
+            format!("moving the unpacked binary into {}", target.display())
+        })?;
         Ok(())
     })
     .await??;

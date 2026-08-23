@@ -11,7 +11,7 @@ fn is_proxy(outbound: &Value) -> bool {
 }
 
 /// One config the subscription rendered: its remark and the first proxy outbound in it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedConfig {
     /// The only thing that joins a served config to the channel the panel resolved
     /// (see `map::build_snapshot`).

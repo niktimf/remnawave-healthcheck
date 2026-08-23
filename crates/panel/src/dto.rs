@@ -115,11 +115,13 @@ impl From<&NodeDto> for Node {
         let profile = dto.config_profile.as_ref();
         // Taken once: a node with no profile simply has no active inbounds, and both lists below
         // are then empty for the same reason.
-        let inbounds: &[InboundDto] = profile.map_or(&[], |p| p.active_inbounds.as_slice());
-        Node {
+        let inbounds: &[InboundDto] =
+            profile.map_or(&[], |p| p.active_inbounds.as_slice());
+        Self {
             name: dto.name.clone(),
             address: dto.address.clone(),
-            profile_uuid: profile.and_then(|p| p.active_config_profile_uuid.clone()),
+            profile_uuid: profile
+                .and_then(|p| p.active_config_profile_uuid.clone()),
             inbound_tags: inbounds.iter().map(|i| i.tag.clone()).collect(),
             inbound_ports: inbounds.iter().filter_map(|i| i.port).collect(),
             is_disabled: dto.is_disabled,
@@ -133,7 +135,7 @@ impl From<&NodeDto> for Node {
 
 impl From<ProfileDto> for Profile {
     fn from(dto: ProfileDto) -> Self {
-        Profile {
+        Self {
             uuid: dto.uuid,
             name: dto.name,
             config: dto.config,

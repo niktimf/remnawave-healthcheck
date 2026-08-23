@@ -59,19 +59,23 @@ impl std::fmt::Debug for Notifier {
 /// environment variable looks like by the time it reaches here.
 fn parse_thread_id(thread_id: Option<&str>) -> Option<i64> {
     let thread = thread_id.map(str::trim).filter(|t| !t.is_empty())?;
-    match thread.parse::<i64>() {
-        Ok(id) => Some(id),
-        Err(_) => {
-            eprintln!("[alert] ignoring non-numeric thread id {thread:?}");
-            None
-        }
+    if let Ok(id) = thread.parse::<i64>() {
+        Some(id)
+    } else {
+        eprintln!("[alert] ignoring non-numeric thread id {thread:?}");
+        None
     }
 }
 
 /// Post a message. Returns false on any failure — a dead notifier must never break the run,
 /// but the reason is printed: the API body is where the real cause is ("chat not found",
 /// "bot was kicked", "Unauthorized" = token revoked, "group chat was upgraded to a supergroup").
-async fn post(token: &str, chat_id: &str, text: &str, thread_id: Option<i64>) -> bool {
+async fn post(
+    token: &str,
+    chat_id: &str,
+    text: &str,
+    thread_id: Option<i64>,
+) -> bool {
     let mut payload = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
@@ -158,7 +162,7 @@ mod tests {
         };
         assert_eq!(thread_of(Some("42")), Some(42));
         assert_eq!(thread_of(Some(" 42 ")), Some(42));
-        assert_eq!(thread_of(Some("-100123")), Some(-100123));
+        assert_eq!(thread_of(Some("-100123")), Some(-100_123));
         // Neither of these is a topic to post into, and neither may reach a payload.
         assert_eq!(thread_of(Some("general")), None);
         assert_eq!(thread_of(Some("")), None);
@@ -178,7 +182,9 @@ mod tests {
 
     #[test]
     fn a_notifier_never_prints_its_token() {
-        let notifier = Notifier::new(Some("123:secret"), Some("chat"), Some("42")).unwrap();
+        let notifier =
+            Notifier::new(Some("123:secret"), Some("chat"), Some("42"))
+                .unwrap();
         let printed = format!("{notifier:?}");
         assert!(!printed.contains("secret"), "{printed}");
         assert!(printed.contains("chat"), "{printed}");

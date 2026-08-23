@@ -6,7 +6,9 @@ use std::collections::HashMap;
 /// One textual encoding, and only one: the state file goes through `Display`/`FromStr` too, so
 /// what is written there is the same `OK`/`WARN`/`FAIL` the report and the alerts show. A derived
 /// encoding would give the same value a second spelling that nothing else in the tool understands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(into = "String", try_from = "String")]
 pub enum Severity {
     Ok,
@@ -30,7 +32,7 @@ impl TryFrom<String> for Severity {
 
 impl Severity {
     pub fn is_ok(self) -> bool {
-        self == Severity::Ok
+        self == Self::Ok
     }
 }
 
@@ -41,9 +43,9 @@ impl std::fmt::Display for Severity {
         // `pad`, not `write_str`: the report table formats severities with a width (`{:<6}`),
         // and only `pad` honours it.
         f.pad(match self {
-            Severity::Ok => "OK",
-            Severity::Warn => "WARN",
-            Severity::Fail => "FAIL",
+            Self::Ok => "OK",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
         })
     }
 }
@@ -58,9 +60,9 @@ impl std::str::FromStr for Severity {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "OK" => Ok(Severity::Ok),
-            "WARN" => Ok(Severity::Warn),
-            "FAIL" => Ok(Severity::Fail),
+            "OK" => Ok(Self::Ok),
+            "WARN" => Ok(Self::Warn),
+            "FAIL" => Ok(Self::Fail),
             other => Err(ParseSeverityError(other.to_string())),
         }
     }
@@ -141,7 +143,7 @@ impl CheckResult {
 }
 
 /// A node as the panel describes it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub name: String,
     /// Address the panel uses to reach the node; also the SSH target.
@@ -209,13 +211,13 @@ impl Node {
     /// Deliberately narrower than the panel's own notion of a usable node, which also requires the
     /// node to be connected and not connecting: a node that dropped its connection is exactly the
     /// one whose host this tool still wants to look at over SSH.
-    pub fn is_enabled(&self) -> bool {
+    pub const fn is_enabled(&self) -> bool {
         !self.is_disabled
     }
 }
 
 /// A client-facing channel, exactly as the monitoring user receives it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Channel {
     /// Host remark; used as the human-facing channel name and as part of the check key.
     pub remark: String,
@@ -245,7 +247,7 @@ impl Channel {
 }
 
 /// An Xray config profile: the full JSON, as stored in the panel.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub uuid: String,
     pub name: String,
@@ -253,7 +255,7 @@ pub struct Profile {
 }
 
 /// Everything one run needs from the panel.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub nodes: Vec<Node>,
     pub profiles: HashMap<String, Profile>,
@@ -343,7 +345,10 @@ mod tests {
         assert_ne!(a.check_key(), c.check_key());
         assert!(a.check_key().starts_with("channel:"));
         // Stable across calls: the diff between two runs depends on it.
-        assert_eq!(a.check_key(), channel("alpha.example.com", 443).check_key());
+        assert_eq!(
+            a.check_key(),
+            channel("alpha.example.com", 443).check_key()
+        );
     }
 
     #[test]
@@ -365,19 +370,30 @@ mod tests {
         let ordinary = "https://api.ipify.org";
         assert_eq!(EchoUrl::from_str(ordinary).unwrap().as_str(), ordinary);
         // Everything else a URL may carry is literal inside single quotes, and stays allowed.
-        assert!(EchoUrl::from_str("https://e.example.com/ip?fmt=$x&y=`z`;#|").is_ok());
+        assert!(EchoUrl::from_str("https://e.example.com/ip?fmt=$x&y=`z`;#|")
+            .is_ok());
     }
 
     #[test]
     fn check_result_carries_key_title_and_detail() {
-        let r = CheckResult::new("channel:alpha", "alpha", Severity::Fail, "no exit");
+        let r = CheckResult::new(
+            "channel:alpha",
+            "alpha",
+            Severity::Fail,
+            "no exit",
+        );
         assert_eq!(r.key, "channel:alpha");
         assert_eq!(r.title, "alpha");
         assert_eq!(r.severity, Severity::Fail);
         assert_eq!(r.detail, "no exit");
     }
 
-    fn node(disabled: bool, connecting: bool, connected: bool, message: Option<&str>) -> Node {
+    fn node(
+        disabled: bool,
+        connecting: bool,
+        connected: bool,
+        message: Option<&str>,
+    ) -> Node {
         Node {
             name: "alpha".into(),
             address: "192.0.2.1".into(),
@@ -418,7 +434,8 @@ mod tests {
     }
 
     #[test]
-    fn a_disconnected_node_carries_the_panels_own_reason_only_when_there_is_one() {
+    fn a_disconnected_node_carries_the_panels_own_reason_only_when_there_is_one(
+    ) {
         assert_eq!(
             node(false, false, false, Some("boom")).panel_state(),
             PanelState::Disconnected {

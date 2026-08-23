@@ -18,8 +18,8 @@ pub struct ProbeOutcome {
 impl ProbeOutcome {
     /// A probe that never got as far as asking the tunnel anything: no exit address, and the
     /// reason in place of xray's stderr.
-    fn not_probed(reason: String) -> Self {
-        ProbeOutcome {
+    const fn not_probed(reason: String) -> Self {
+        Self {
             exit_ip: None,
             stderr_tail: reason,
         }
@@ -92,7 +92,8 @@ async fn attempt(
 
     // Built before xray is started: nothing here depends on the child, and a client that cannot
     // be built must not leave a process running behind it.
-    let client = socks_client(socks_port).map_err(|e| format!("socks client: {e}"))?;
+    let client =
+        socks_client(socks_port).map_err(|e| format!("socks client: {e}"))?;
 
     let mut child = tokio::process::Command::new(xray_bin)
         .arg("run")
@@ -145,7 +146,8 @@ async fn ask_echo(client: &reqwest::Client, echo_url: &str) -> Option<IpAddr> {
 /// HTTP client that speaks to the tunnel's local SOCKS port. `socks5h`: name resolution happens
 /// at the far end, so the echo endpoint's name is never looked up locally.
 fn socks_client(socks_port: u16) -> reqwest::Result<reqwest::Client> {
-    let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))?;
+    let proxy =
+        reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))?;
     reqwest::Client::builder()
         .proxy(proxy)
         .timeout(Duration::from_secs(8))
@@ -208,7 +210,8 @@ fn scratch_dir_in(base: &Path) -> std::io::Result<ScratchDir> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
-    let unique = base.join(format!("{nanos}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    let unique =
+        base.join(format!("{nanos}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
     std::fs::DirBuilder::new().mode(0o700).create(&unique)?;
     Ok(ScratchDir(unique))
 }
@@ -242,8 +245,8 @@ mod tests {
     /// other test is doing in the base the tool itself uses.
     #[tokio::test]
     async fn a_dead_spawn_leaves_no_scratch_dir_behind() {
-        let base =
-            std::env::temp_dir().join(format!("rwhc-test-dead-spawn-{}", std::process::id()));
+        let base = std::env::temp_dir()
+            .join(format!("rwhc-test-dead-spawn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
 
         let outcome = probe_under(
@@ -288,7 +291,12 @@ mod tests {
 
     fn list_dir(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir)
-            .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .map(|entries| {
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .map(|e| e.path())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }

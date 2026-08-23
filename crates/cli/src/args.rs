@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "remnawave-healthcheck", version)]
 pub struct Args {
-    /// Base URL of the panel, e.g. https://panel.example.com
+    /// Base URL of the panel, e.g. <https://panel.example.com>
     #[arg(long, env = "REMNAWAVE_PANEL_URL")]
     pub panel_url: String,
 
@@ -23,7 +23,7 @@ pub struct Args {
     pub telegram_bot_token: Option<String>,
     #[arg(long, env = "TELEGRAM_CHAT_ID")]
     pub telegram_chat_id: Option<String>,
-    /// message_thread_id of a supergroup topic
+    /// `message_thread_id` of a supergroup topic
     #[arg(long, env = "TELEGRAM_THREAD_ID")]
     pub telegram_thread_id: Option<String>,
     /// Link to the CI run, appended to alerts

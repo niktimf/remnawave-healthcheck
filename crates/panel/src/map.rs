@@ -17,7 +17,8 @@ pub fn build_snapshot(
 ) -> Snapshot {
     // Recorded before the map collapses duplicates: a remark served twice is exactly what the
     // coverage check needs to see, and the map would hide it.
-    let served_remarks: Vec<String> = rendered.iter().map(|c| c.remark.clone()).collect();
+    let served_remarks: Vec<String> =
+        rendered.iter().map(|c| c.remark.clone()).collect();
     let served: HashMap<String, Value> = rendered
         .into_iter()
         .map(|c| (c.remark, c.outbound))
@@ -26,7 +27,10 @@ pub fn build_snapshot(
     let channels: Vec<Channel> = resolved
         .into_iter()
         .map(|r| Channel {
-            outbound: served.get(&r.final_remark).cloned().unwrap_or(Value::Null),
+            outbound: served
+                .get(&r.final_remark)
+                .cloned()
+                .unwrap_or(Value::Null),
             remark: r.final_remark,
             inbound_tag: r.metadata.inbound_tag,
             profile_uuid: r.metadata.config_profile_uuid,

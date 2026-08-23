@@ -2,8 +2,9 @@ use crate::model::{CheckResult, Severity};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// One non-OK check as the problem set remembers it. Severity stays a `Severity` rather than
-/// being glued into the detail text: the diff compares severities, and re-parsing them out of a
+/// One non-OK check as the problem set remembers it.
+///
+/// Severity stays a `Severity` rather than being glued into the detail text: the diff compares severities, and re-parsing them out of a
 /// rendered string is how a typo turns into a missed escalation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
@@ -11,7 +12,7 @@ pub struct Problem {
     pub detail: String,
 }
 
-/// Non-OK checks of one run, keyed by the stable check key. BTreeMap keeps output deterministic.
+/// Non-OK checks of one run, keyed by the stable check key. `BTreeMap` keeps output deterministic.
 pub type ProblemSet = BTreeMap<String, Problem>;
 
 /// What changed between two runs.
@@ -24,11 +25,15 @@ pub struct Diff {
 
 impl Diff {
     pub fn is_empty(&self) -> bool {
-        self.new.is_empty() && self.recovered.is_empty() && self.escalated.is_empty()
+        self.new.is_empty()
+            && self.recovered.is_empty()
+            && self.escalated.is_empty()
     }
 }
 
-/// Non-OK results of one run, keyed by check key. Keys must be unique by construction — two
+/// Non-OK results of one run, keyed by check key.
+///
+/// Keys must be unique by construction — two
 /// results sharing one key collapse into a single entry here, and the loser disappears from the
 /// alert without a trace (see `Channel::check_key`).
 pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
@@ -47,6 +52,8 @@ pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
         .collect()
 }
 
+/// What changed since the previous run.
+///
 /// Appearing and disappearing keys always count. So does a severity escalation on a key that
 /// was already a problem. Softening (FAIL -> WARN) is deliberately silent: the problem is still
 /// there and re-alerting on it is noise.
@@ -62,7 +69,10 @@ pub fn diff(current: &ProblemSet, previous: &ProblemSet) -> Diff {
 
 /// The entries of `from` the predicate keeps. Owned, because a diff outlives the two sets it was
 /// computed from.
-fn select(from: &ProblemSet, keep: impl Fn(&str, &Problem) -> bool) -> ProblemSet {
+fn select(
+    from: &ProblemSet,
+    keep: impl Fn(&str, &Problem) -> bool,
+) -> ProblemSet {
     from.iter()
         .filter(|(k, v)| keep(k, v))
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -71,15 +81,16 @@ fn select(from: &ProblemSet, keep: impl Fn(&str, &Problem) -> bool) -> ProblemSe
 
 /// Every variant is spelled out: a wildcard here would give a future severity a red circle
 /// silently instead of failing to compile.
-fn icon(severity: Severity) -> &'static str {
+const fn icon(severity: Severity) -> &'static str {
     match severity {
         Severity::Warn => "\u{1F7E1}",
         Severity::Ok | Severity::Fail => "\u{1F534}",
     }
 }
 
-/// Escape the characters Telegram's HTML parse mode treats specially. Public because every path
-/// that puts text into an alert needs it, the out-of-band panel-failure alert included. A check's
+/// Escape the characters Telegram's HTML parse mode treats specially.
+///
+/// Public because every path that puts text into an alert needs it, the out-of-band panel-failure alert included. A check's
 /// own key or detail text (xray stderr, a panel status message) is not under our control and can
 /// contain a stray `<` or bare `&`; unescaped, that either mangles the message's markup or makes Telegram reject
 /// the whole alert with "can't parse entities" — losing the alert entirely, which is exactly the
@@ -125,13 +136,21 @@ pub fn format_message(d: &Diff, run_url: Option<&str>) -> String {
     lines.join("\n")
 }
 
-/// A problem set is a map of strings to two owned fields, so serialising it cannot fail for any
-/// reason short of a bug in this crate. Swallowing an error here would write `{}` — an empty
-/// problem set — and the next run would report every still-broken check as recovered.
+/// The state file's contents for this run.
+///
+/// # Panics
+///
+/// Never in practice: a problem set is a map of strings to two owned fields, so serialising it
+/// cannot fail for any reason short of a bug in this crate. Swallowing that error instead would
+/// write `{}` — an empty problem set — and the next run would report every still-broken check as
+/// recovered.
 pub fn to_json(state: &ProblemSet) -> String {
-    serde_json::to_string_pretty(state).expect("a problem set always serialises")
+    serde_json::to_string_pretty(state)
+        .expect("a problem set always serialises")
 }
 
+/// The previous run's problem set, as read from the state file.
+///
 /// Anything unreadable is treated as "no previous run" — a corrupt state file must not break
 /// the run, it only costs one round of re-alerting.
 pub fn from_json(raw: &str) -> ProblemSet {
@@ -178,8 +197,10 @@ mod tests {
 
     #[test]
     fn diff_reports_new_recovered_and_escalated() {
-        let previous = ps(&[("a", Severity::Warn, "x"), ("b", Severity::Fail, "y")]);
-        let current = ps(&[("a", Severity::Fail, "x"), ("c", Severity::Fail, "z")]);
+        let previous =
+            ps(&[("a", Severity::Warn, "x"), ("b", Severity::Fail, "y")]);
+        let current =
+            ps(&[("a", Severity::Fail, "x"), ("c", Severity::Fail, "z")]);
         let d = diff(&current, &previous);
         assert_eq!(d.new.keys().collect::<Vec<_>>(), vec!["c"]);
         assert_eq!(d.recovered.keys().collect::<Vec<_>>(), vec!["b"]);
@@ -199,7 +220,8 @@ mod tests {
     fn a_changed_detail_at_the_same_severity_is_silent() {
         // Only the severity decides an escalation; a reworded detail is not news.
         let previous = ps(&[("a", Severity::Fail, "no exit (tunnel dead)")]);
-        let current = ps(&[("a", Severity::Fail, "no exit (tunnel dead) | xray: boom")]);
+        let current =
+            ps(&[("a", Severity::Fail, "no exit (tunnel dead) | xray: boom")]);
         assert!(diff(&current, &previous).is_empty());
     }
 
@@ -221,7 +243,8 @@ mod tests {
     fn the_state_file_is_a_map_of_key_to_severity_and_detail() {
         let s = ps(&[("channel:a", Severity::Warn, "slow")]);
         let raw = to_json(&s);
-        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("state file is JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("state file is JSON");
         assert_eq!(parsed["channel:a"]["severity"], "WARN");
         assert_eq!(parsed["channel:a"]["detail"], "slow");
     }
@@ -230,7 +253,10 @@ mod tests {
     fn a_state_file_with_an_unreadable_entry_is_treated_as_no_previous_run() {
         // Half a problem set is not a problem set: silently keeping the readable half would make
         // the missing keys look recovered.
-        assert!(from_json(r#"{"channel:a": {"severity": "Nope", "detail": "x"}}"#).is_empty());
+        assert!(from_json(
+            r#"{"channel:a": {"severity": "Nope", "detail": "x"}}"#
+        )
+        .is_empty());
         assert!(from_json(r#"{"channel:a": "FAIL: x"}"#).is_empty());
     }
 

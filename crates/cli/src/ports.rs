@@ -33,20 +33,20 @@ impl SocksPorts {
         // Both operands are `u16`, so this sum cannot overflow a `u32` and needs no saturating.
         let highest = u32::from(base) + u32::from(count.get()) - 1;
         ensure!(
-            highest <= u32::from(u16::MAX),
+            u16::try_from(highest).is_ok(),
             "--socks-base-port {base} plus --concurrency {concurrency} would need a port above 65535 ({highest}); lower one of them"
         );
         Ok(Self { base, count })
     }
 
     /// How many channels may be probed at once — the size of one batch.
-    pub fn concurrency(&self) -> usize {
+    pub fn concurrency(self) -> usize {
         usize::from(self.count.get())
     }
 
     /// One port per slot in a batch, in order. Zipping a batch against this cannot run out of
     /// either side: the batch is cut to `concurrency()`, which is how many ports there are.
-    pub fn iter(&self) -> impl Iterator<Item = u16> {
+    pub fn iter(self) -> impl Iterator<Item = u16> {
         let (base, count) = (self.base, self.count.get());
         (0..count).map(move |offset| base + offset)
     }
@@ -92,7 +92,8 @@ mod tests {
         // The property the whole type exists for: no two slots share a port.
         let ports = SocksPorts::new(10800, 8).unwrap();
         let handed_out: Vec<u16> = ports.iter().collect();
-        let unique: std::collections::BTreeSet<u16> = handed_out.iter().copied().collect();
+        let unique: std::collections::BTreeSet<u16> =
+            handed_out.iter().copied().collect();
         assert_eq!(handed_out.len(), unique.len());
         assert_eq!(handed_out.len(), ports.concurrency());
     }

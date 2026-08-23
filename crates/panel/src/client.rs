@@ -43,7 +43,8 @@ impl PanelClient {
     /// Everything one run needs, in four requests.
     pub async fn snapshot(&self, short_uuid: &str) -> Result<Snapshot> {
         let nodes = self.get("/api/nodes", Auth::WithToken).await?;
-        let profiles = self.get("/api/config-profiles", Auth::WithToken).await?;
+        let profiles =
+            self.get("/api/config-profiles", Auth::WithToken).await?;
         let raw = self
             .get(
                 &format!(
@@ -59,7 +60,8 @@ impl PanelClient {
         let nodes = dto::parse_nodes(&nodes).context("parsing /api/nodes")?;
         Ok(map::build_snapshot(
             &nodes,
-            dto::parse_profiles(&profiles).context("parsing /api/config-profiles")?,
+            dto::parse_profiles(&profiles)
+                .context("parsing /api/config-profiles")?,
             dto::parse_resolved(&raw).context("parsing raw subscription")?,
             subscription::parse(&sub).context("parsing JSON subscription")?,
         ))
@@ -79,7 +81,8 @@ pub fn short_uuid_from_url(url: &str) -> Option<&str> {
     let without_query = url.split('?').next()?;
     // Only look inside the path, not the host: `sub.example.com` in `https://sub.example.com/`
     // must not be mistaken for a path segment.
-    let after_scheme = without_query.split("://").nth(1).unwrap_or(without_query);
+    let after_scheme =
+        without_query.split("://").nth(1).unwrap_or(without_query);
     let (_host, path) = after_scheme.split_once('/')?;
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {

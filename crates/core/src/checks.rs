@@ -15,12 +15,19 @@ pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
                 PanelState::Disabled => {
                     (Severity::Warn, "disabled by an administrator".to_string())
                 }
-                PanelState::Connecting => (Severity::Warn, "connecting".to_string()),
+                PanelState::Connecting => {
+                    (Severity::Warn, "connecting".to_string())
+                }
                 PanelState::Disconnected { reason } => (
                     Severity::Fail,
-                    format!("not connected: {}", reason.unwrap_or("no reason given")),
+                    format!(
+                        "not connected: {}",
+                        reason.unwrap_or("no reason given")
+                    ),
                 ),
-                PanelState::Connected => (Severity::Ok, "connected".to_string()),
+                PanelState::Connected => {
+                    (Severity::Ok, "connected".to_string())
+                }
             };
             let aspect = NodeAspect::Panel;
             CheckResult::new(
@@ -37,8 +44,9 @@ pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
         .collect()
 }
 
-/// The panel resolved a set of channels for the monitoring user; the rendered subscription served
-/// a set of remarks. The two must be the same set — that join by remark is what gives every
+/// Whether the subscription served exactly the channels the panel resolved.
+///
+/// The two must be the same set — that join by remark is what gives every
 /// channel its outbound, so a mismatch means channels are being probed with the wrong config or
 /// not at all, while the panel still looks healthy.
 ///
@@ -110,7 +118,10 @@ impl<'a> Coverage<'a> {
             // A remark served twice makes the join ambiguous: both channels would be probed with
             // whichever outbound happened to win, so one of them would be reported on evidence
             // that is not its own.
-            duplicated: tally.into_iter().filter(|(_, times)| *times > 1).collect(),
+            duplicated: tally
+                .into_iter()
+                .filter(|(_, times)| *times > 1)
+                .collect(),
         }
     }
 
@@ -132,10 +143,7 @@ impl<'a> Coverage<'a> {
         // kind of disagreement did not happen.
         [
             ("not served", named(&self.missing)),
-            (
-                "served but not resolved by the panel",
-                named(&self.unexpected),
-            ),
+            ("served but not resolved by the panel", named(&self.unexpected)),
             (
                 "served more than once, so their configs cannot be told apart",
                 counted,
@@ -187,9 +195,11 @@ pub fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
     out
 }
 
-/// Nodes running different Xray versions have broken channels for us before (client and node must
-/// agree on features such as sessionIDTable). There is no configured expectation — the drift itself
-/// is the signal.
+/// Whether the enabled nodes agree on an Xray version.
+///
+/// Nodes running different versions have broken channels for us before: client and node must
+/// agree on features such as sessionIDTable. There is no configured expectation — the drift
+/// itself is the signal.
 pub fn xray_version_drift(nodes: &[Node]) -> CheckResult {
     let versions: Vec<&str> = nodes
         .iter()
@@ -202,8 +212,15 @@ pub fn xray_version_drift(nodes: &[Node]) -> CheckResult {
     let key = CheckKey::XrayVersionDrift.to_string();
     let title = "xray version drift";
     match versions.as_slice() {
-        [] => CheckResult::new(key, title, Severity::Ok, "no versions reported"),
-        [only] => CheckResult::new(key, title, Severity::Ok, format!("all nodes on {only}")),
+        [] => {
+            CheckResult::new(key, title, Severity::Ok, "no versions reported")
+        }
+        [only] => CheckResult::new(
+            key,
+            title,
+            Severity::Ok,
+            format!("all nodes on {only}"),
+        ),
         several => CheckResult::new(
             key,
             title,
@@ -220,12 +237,21 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    fn node(name: &str, disabled: bool, connected: bool, version: &str, tags: &[&str]) -> Node {
+    fn node(
+        name: &str,
+        disabled: bool,
+        connected: bool,
+        version: &str,
+        tags: &[&str],
+    ) -> Node {
         Node {
             name: name.into(),
             address: format!("192.0.2.{}", name.len()),
             profile_uuid: Some("p".into()),
-            inbound_tags: tags.iter().map(|s| s.to_string()).collect(),
+            inbound_tags: tags
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             inbound_ports: vec![443],
             is_disabled: disabled,
             is_connected: connected,
@@ -235,7 +261,11 @@ mod tests {
         }
     }
 
-    fn snap(nodes: Vec<Node>, channel_tags: &[&str], served: &[&str]) -> Snapshot {
+    fn snap(
+        nodes: Vec<Node>,
+        channel_tags: &[&str],
+        served: &[&str],
+    ) -> Snapshot {
         Snapshot {
             nodes,
             profiles: HashMap::new(),
@@ -250,7 +280,10 @@ mod tests {
                     outbound: json!({}),
                 })
                 .collect(),
-            served_remarks: served.iter().map(|r| r.to_string()).collect(),
+            served_remarks: served
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
         }
     }
 
@@ -261,7 +294,8 @@ mod tests {
             node("beta", false, false, "26.6.27", &["in-b"]),
             node("gamma", false, true, "26.6.27", &["in-c"]),
         ]);
-        let by_key = |k: &str| results.iter().find(|r| r.key == k).unwrap().severity;
+        let by_key =
+            |k: &str| results.iter().find(|r| r.key == k).unwrap().severity;
         assert_eq!(by_key("node:alpha:panel"), Severity::Warn);
         assert_eq!(by_key("node:beta:panel"), Severity::Fail);
         assert_eq!(by_key("node:gamma:panel"), Severity::Ok);
@@ -276,7 +310,8 @@ mod tests {
     fn a_reconnecting_node_warns_without_repeating_a_stale_reason() {
         // `node` leaves a "boom" in `last_status_message`, which is what the panel does too: it
         // sets `isConnecting` without clearing the reason of the attempt before.
-        let mut reconnecting = node("alpha", false, false, "26.6.27", &["in-a"]);
+        let mut reconnecting =
+            node("alpha", false, false, "26.6.27", &["in-a"]);
         reconnecting.is_connecting = true;
         let results = node_status(&[reconnecting]);
         assert_eq!(results[0].severity, Severity::Warn);
@@ -286,16 +321,26 @@ mod tests {
 
     #[test]
     fn subscription_coverage_is_ok_only_when_the_two_sets_match() {
-        let ok = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &["ch-in-a", "ch-in-b"]));
+        let ok = subscription_coverage(&snap(
+            vec![],
+            &["in-a", "in-b"],
+            &["ch-in-a", "ch-in-b"],
+        ));
         assert_eq!(ok.severity, Severity::Ok);
         let bad = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &[]));
         assert_eq!(bad.severity, Severity::Fail);
-        assert!(bad.detail.contains("ch-in-a") && bad.detail.contains("ch-in-b"));
+        assert!(
+            bad.detail.contains("ch-in-a") && bad.detail.contains("ch-in-b")
+        );
     }
 
     #[test]
     fn subscription_coverage_names_the_channel_the_subscription_dropped() {
-        let r = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &["ch-in-a"]));
+        let r = subscription_coverage(&snap(
+            vec![],
+            &["in-a", "in-b"],
+            &["ch-in-a"],
+        ));
         assert_eq!(r.severity, Severity::Fail);
         assert!(r.detail.contains("ch-in-b"), "{}", r.detail);
         assert!(!r.detail.contains("ch-in-a"), "{}", r.detail);
@@ -305,7 +350,11 @@ mod tests {
     fn one_channel_dropped_and_another_duplicated_no_longer_cancels_out() {
         // The counts match (two resolved, two served) but the join is broken: the old count-based
         // check reported this as green.
-        let r = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &["ch-in-a", "ch-in-a"]));
+        let r = subscription_coverage(&snap(
+            vec![],
+            &["in-a", "in-b"],
+            &["ch-in-a", "ch-in-a"],
+        ));
         assert_eq!(r.severity, Severity::Fail);
         assert!(r.detail.contains("ch-in-b"), "{}", r.detail);
         assert!(r.detail.contains("more than once"), "{}", r.detail);
@@ -316,7 +365,11 @@ mod tests {
 
     #[test]
     fn a_remark_served_but_never_resolved_also_fails() {
-        let r = subscription_coverage(&snap(vec![], &["in-a"], &["ch-in-a", "ch-ghost"]));
+        let r = subscription_coverage(&snap(
+            vec![],
+            &["in-a"],
+            &["ch-in-a", "ch-ghost"],
+        ));
         assert_eq!(r.severity, Severity::Fail);
         assert!(r.detail.contains("ch-ghost"), "{}", r.detail);
     }
@@ -364,6 +417,9 @@ mod tests {
             node("beta", false, true, "26.3.27", &[]),
         ]);
         assert_eq!(drifted.severity, Severity::Warn);
-        assert!(drifted.detail.contains("26.3.27") && drifted.detail.contains("26.6.27"));
+        assert!(
+            drifted.detail.contains("26.3.27")
+                && drifted.detail.contains("26.6.27")
+        );
     }
 }

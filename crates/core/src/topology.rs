@@ -32,7 +32,9 @@ pub enum ResolveError {
     NoOutbounds { profile: String },
     #[error("profile {profile} has no outbound tagged '{tag}'")]
     UnknownOutbound { profile: String, tag: String },
-    #[error("inbound '{inbound_tag}' is routed into blackhole outbound '{tag}'")]
+    #[error(
+        "inbound '{inbound_tag}' is routed into blackhole outbound '{tag}'"
+    )]
     Blackhole { inbound_tag: String, tag: String },
     #[error(
         "the rule for inbound '{inbound_tag}' selects its outbound in a way this tool cannot follow ({how})"
@@ -70,8 +72,8 @@ pub enum UnsupportedSelector {
 impl std::fmt::Display for UnsupportedSelector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            UnsupportedSelector::BalancerTag => "balancerTag",
-            UnsupportedSelector::NoOutboundTag => "no outboundTag",
+            Self::BalancerTag => "balancerTag",
+            Self::NoOutboundTag => "no outboundTag",
         })
     }
 }
@@ -94,10 +96,10 @@ enum OutboundKind {
 impl OutboundKind {
     fn from_protocol(protocol: &str) -> Self {
         match protocol {
-            "freedom" => OutboundKind::NodeEgress,
-            "blackhole" => OutboundKind::Blackhole,
-            "wireguard" | "dns" | "loopback" => OutboundKind::OpaqueTerminal,
-            _ => OutboundKind::Proxy,
+            "freedom" => Self::NodeEgress,
+            "blackhole" => Self::Blackhole,
+            "wireguard" | "dns" | "loopback" => Self::OpaqueTerminal,
+            _ => Self::Proxy,
         }
     }
 }
@@ -125,7 +127,7 @@ struct Config<'a>(&'a Value);
 
 impl<'a> Config<'a> {
     /// Outbounds in declaration order, or `None` when the profile declares none at all.
-    fn outbounds(&self) -> Option<&'a [Value]> {
+    fn outbounds(self) -> Option<&'a [Value]> {
         self.0
             .get("outbounds")
             .and_then(Value::as_array)
@@ -134,13 +136,15 @@ impl<'a> Config<'a> {
     }
 
     /// Where this config sends the traffic of one inbound.
-    fn route_for(&self, inbound_tag: &str) -> Routed<'a> {
+    fn route_for(self, inbound_tag: &str) -> Routed<'a> {
         let matched = self
             .0
             .get("routing")
             .and_then(|routing| routing.get("rules"))
             .and_then(Value::as_array)
-            .and_then(|rules| rules.iter().find(|rule| rule_matches(rule, inbound_tag)));
+            .and_then(|rules| {
+                rules.iter().find(|rule| rule_matches(rule, inbound_tag))
+            });
 
         let Some(rule) = matched else {
             return Routed::FirstOutbound;
@@ -154,19 +158,24 @@ impl<'a> Config<'a> {
         }
     }
 
-    fn outbound_tagged(&self, tag: &str) -> Option<Outbound<'a>> {
+    fn outbound_tagged(self, tag: &str) -> Option<Outbound<'a>> {
         self.outbounds()?
             .iter()
-            .find(|outbound| outbound.get("tag").and_then(Value::as_str) == Some(tag))
+            .find(|outbound| {
+                outbound.get("tag").and_then(Value::as_str) == Some(tag)
+            })
             .map(Outbound)
     }
 
-    fn inbound_tag_on_port(&self, port: u16) -> Option<String> {
+    fn inbound_tag_on_port(self, port: u16) -> Option<String> {
         self.0
             .get("inbounds")?
             .as_array()?
             .iter()
-            .find(|inbound| inbound.get("port").and_then(Value::as_u64) == Some(u64::from(port)))
+            .find(|inbound| {
+                inbound.get("port").and_then(Value::as_u64)
+                    == Some(u64::from(port))
+            })
             .and_then(|inbound| inbound.get("tag"))
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -196,7 +205,7 @@ struct Outbound<'a>(&'a Value);
 impl<'a> Outbound<'a> {
     /// How this outbound appears in an error message, and only there: the happy path never needs
     /// a tag, and an outbound without one is an absence rather than the literal "<untagged>".
-    fn name(&self) -> String {
+    fn name(self) -> String {
         self.0
             .get("tag")
             .and_then(Value::as_str)
@@ -204,20 +213,20 @@ impl<'a> Outbound<'a> {
             .to_string()
     }
 
-    fn protocol(&self) -> &'a str {
+    fn protocol(self) -> &'a str {
         self.0
             .get("protocol")
             .and_then(Value::as_str)
             .unwrap_or_default()
     }
 
-    fn kind(&self) -> OutboundKind {
+    fn kind(self) -> OutboundKind {
         OutboundKind::from_protocol(self.protocol())
     }
 
     /// Destination of a proxying outbound: vless uses `vnext`, trojan and shadowsocks use
     /// `servers`.
-    fn destination(&self) -> Option<Destination> {
+    fn destination(self) -> Option<Destination> {
         let settings = self.0.get("settings")?;
         let first = settings
             .get("vnext")
@@ -238,19 +247,22 @@ impl<'a> Outbound<'a> {
 fn rule_matches(rule: &Value, inbound_tag: &str) -> bool {
     rule.get("inboundTag")
         .and_then(Value::as_array)
-        .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some(inbound_tag)))
+        .is_some_and(|tags| {
+            tags.iter().any(|t| t.as_str() == Some(inbound_tag))
+        })
 }
 
 /// Follows one snapshot's routing to the node a channel actually leaves through.
 ///
 /// The snapshot is held rather than passed along: every step of a cascade needs it, and threading
 /// it through each of them made it an argument of everything here.
+#[derive(Debug, Clone, Copy)]
 pub struct Resolver<'a> {
     snapshot: &'a Snapshot,
 }
 
 impl<'a> Resolver<'a> {
-    pub fn new(snapshot: &'a Snapshot) -> Self {
+    pub const fn new(snapshot: &'a Snapshot) -> Self {
         Self { snapshot }
     }
 
@@ -259,7 +271,7 @@ impl<'a> Resolver<'a> {
     /// The node itself, not its name: what the caller does with it — is it disabled, what is its
     /// egress address — are questions about a node, and answering them by matching names would
     /// mean a second list keyed by the same strings.
-    pub fn exit_of(&self, channel: &Channel) -> Result<&'a Node, ResolveError> {
+    pub fn exit_of(self, channel: &Channel) -> Result<&'a Node, ResolveError> {
         let nodes = &self.snapshot.nodes;
         let mut node = self.entry_node(channel)?;
         let mut inbound_tag = channel.inbound_tag.clone();
@@ -274,7 +286,8 @@ impl<'a> Resolver<'a> {
                     inbound_tag,
                 });
             }
-            let outbound = outbound_for(self.config_of(node)?, &inbound_tag, node)?;
+            let outbound =
+                outbound_for(self.config_of(node)?, &inbound_tag, node)?;
 
             match outbound.kind() {
                 OutboundKind::NodeEgress => return Ok(node),
@@ -293,18 +306,17 @@ impl<'a> Resolver<'a> {
                 OutboundKind::Proxy => {}
             }
 
-            let Destination { address, port } =
-                outbound
-                    .destination()
-                    .ok_or_else(|| ResolveError::NoDestination {
-                        tag: outbound.name(),
-                    })?;
-            let next = nodes.iter().find(|n| n.address == address).ok_or_else(|| {
-                ResolveError::UnknownNextHop {
+            let Destination { address, port } = outbound
+                .destination()
+                .ok_or_else(|| ResolveError::NoDestination {
+                    tag: outbound.name(),
+                })?;
+            let next = nodes.iter().find(|n| n.address == address).ok_or_else(
+                || ResolveError::UnknownNextHop {
                     tag: outbound.name(),
                     address,
-                }
-            })?;
+                },
+            )?;
             inbound_tag = self
                 .config_of(next)?
                 .inbound_tag_on_port(port)
@@ -317,14 +329,13 @@ impl<'a> Resolver<'a> {
         Err(ResolveError::TooDeep { max: MAX_HOPS })
     }
 
-    fn entry_node(&self, channel: &Channel) -> Result<&'a Node, ResolveError> {
+    fn entry_node(self, channel: &Channel) -> Result<&'a Node, ResolveError> {
         let profile_uuid =
-            channel
-                .profile_uuid
-                .as_deref()
-                .ok_or_else(|| ResolveError::ChannelWithoutProfile {
+            channel.profile_uuid.as_deref().ok_or_else(|| {
+                ResolveError::ChannelWithoutProfile {
                     remark: channel.remark.clone(),
-                })?;
+                }
+            })?;
 
         let candidates: Vec<&'a Node> = self
             .snapshot
@@ -350,18 +361,20 @@ impl<'a> Resolver<'a> {
                 .ok_or_else(|| ResolveError::AmbiguousEntryNode {
                     inbound_tag: channel.inbound_tag.clone(),
                     address: channel.address.clone(),
-                    candidates: several.iter().map(|n| n.name.clone()).collect(),
+                    candidates: several
+                        .iter()
+                        .map(|n| n.name.clone())
+                        .collect(),
                 }),
         }
     }
 
-    fn config_of(&self, node: &Node) -> Result<Config<'a>, ResolveError> {
-        let uuid =
-            node.profile_uuid
-                .as_deref()
-                .ok_or_else(|| ResolveError::NodeWithoutProfile {
-                    node: node.name.clone(),
-                })?;
+    fn config_of(self, node: &Node) -> Result<Config<'a>, ResolveError> {
+        let uuid = node.profile_uuid.as_deref().ok_or_else(|| {
+            ResolveError::NodeWithoutProfile {
+                node: node.name.clone(),
+            }
+        })?;
         self.snapshot
             .profiles
             .get(uuid)
@@ -381,15 +394,15 @@ fn outbound_for<'a>(
     // profile_uuid is expected to be Some here (`config_of` already required it to resolve this
     // config), but the fallback keeps the label legible instead of panicking, and spells out what
     // it actually contains so an incident read never mistakes a node name for a UUID.
-    let profile_label = node
-        .profile_uuid
-        .clone()
-        .unwrap_or_else(|| format!("<node '{}' has no profile uuid>", node.name));
-    let outbounds = config
-        .outbounds()
-        .ok_or_else(|| ResolveError::NoOutbounds {
-            profile: profile_label.clone(),
-        })?;
+    let profile_label = node.profile_uuid.clone().unwrap_or_else(|| {
+        format!("<node '{}' has no profile uuid>", node.name)
+    });
+    let outbounds =
+        config
+            .outbounds()
+            .ok_or_else(|| ResolveError::NoOutbounds {
+                profile: profile_label.clone(),
+            })?;
 
     match config.route_for(inbound_tag) {
         Routed::Unsupported(how) => Err(ResolveError::UnsupportedRule {
@@ -397,14 +410,12 @@ fn outbound_for<'a>(
             how,
         }),
         Routed::FirstOutbound => Ok(Outbound(&outbounds[0])),
-        Routed::Tag(tag) => {
-            config
-                .outbound_tagged(tag)
-                .ok_or_else(|| ResolveError::UnknownOutbound {
-                    profile: profile_label,
-                    tag: tag.to_string(),
-                })
-        }
+        Routed::Tag(tag) => config.outbound_tagged(tag).ok_or_else(|| {
+            ResolveError::UnknownOutbound {
+                profile: profile_label,
+                tag: tag.to_string(),
+            }
+        }),
     }
 }
 
@@ -420,7 +431,10 @@ mod tests {
             name: name.into(),
             address: address.into(),
             profile_uuid: Some(profile.into()),
-            inbound_tags: tags.iter().map(|s| s.to_string()).collect(),
+            inbound_tags: tags
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             inbound_ports: vec![],
             is_disabled: false,
             is_connected: true,
@@ -480,7 +494,12 @@ mod tests {
         }
     }
 
-    fn channel(remark: &str, inbound_tag: &str, profile: &str, address: &str) -> Channel {
+    fn channel(
+        remark: &str,
+        inbound_tag: &str,
+        profile: &str,
+        address: &str,
+    ) -> Channel {
         Channel {
             remark: remark.into(),
             inbound_tag: inbound_tag.into(),
@@ -497,7 +516,8 @@ mod tests {
             vec![node("beta", "192.0.2.20", "p-exit", &["in-exit"])],
             vec![exit_profile("p-exit", "in-exit", 443)],
         );
-        let ch = channel("beta direct", "in-exit", "p-exit", "beta.example.com");
+        let ch =
+            channel("beta direct", "in-exit", "p-exit", "beta.example.com");
         assert_eq!(Resolver::new(&snap).exit_of(&ch).unwrap().name, "beta");
     }
 
@@ -531,11 +551,19 @@ mod tests {
                 node("gamma", "192.0.2.30", "p-exit", &["in-exit"]),
             ],
             vec![
-                bridge_profile("p-bridge", "in-bridge", 443, "to-gamma", "192.0.2.30", 2087),
+                bridge_profile(
+                    "p-bridge",
+                    "in-bridge",
+                    443,
+                    "to-gamma",
+                    "192.0.2.30",
+                    2087,
+                ),
                 exit_profile("p-exit", "in-exit", 2087),
             ],
         );
-        let ch = channel("cdn front", "in-bridge", "p-bridge", "cdn.example.com");
+        let ch =
+            channel("cdn front", "in-bridge", "p-bridge", "cdn.example.com");
         assert_eq!(Resolver::new(&snap).exit_of(&ch).unwrap().name, "gamma");
     }
 
@@ -609,7 +637,8 @@ mod tests {
                 2087,
             )],
         );
-        let ch = channel("dangling", "in-bridge", "p-bridge", "cdn.example.com");
+        let ch =
+            channel("dangling", "in-bridge", "p-bridge", "cdn.example.com");
         assert!(matches!(
             Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::UnknownNextHop { .. })
@@ -624,11 +653,19 @@ mod tests {
                 node("gamma", "192.0.2.30", "p-exit", &["in-exit"]),
             ],
             vec![
-                bridge_profile("p-bridge", "in-bridge", 443, "to-gamma", "192.0.2.30", 9999),
+                bridge_profile(
+                    "p-bridge",
+                    "in-bridge",
+                    443,
+                    "to-gamma",
+                    "192.0.2.30",
+                    9999,
+                ),
                 exit_profile("p-exit", "in-exit", 2087),
             ],
         );
-        let ch = channel("wrong port", "in-bridge", "p-bridge", "cdn.example.com");
+        let ch =
+            channel("wrong port", "in-bridge", "p-bridge", "cdn.example.com");
         assert!(matches!(
             Resolver::new(&snap).exit_of(&ch),
             Err(ResolveError::NoInboundOnPort { .. })

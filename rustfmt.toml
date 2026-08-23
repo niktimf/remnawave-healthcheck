@@ -1,0 +1,5 @@
+hard_tabs = false
+max_width = 80
+reorder_imports = true
+reorder_modules = true
+fn_call_width = 80

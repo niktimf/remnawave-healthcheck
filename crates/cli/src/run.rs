@@ -4,13 +4,16 @@ use crate::telegram::Notifier;
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use remnawave_healthcheck_core::keys::CheckKey;
-use remnawave_healthcheck_core::model::{Channel, CheckResult, Node, Severity, Snapshot};
+use remnawave_healthcheck_core::model::{
+    Channel, CheckResult, Node, Severity, Snapshot,
+};
 use remnawave_healthcheck_core::report::Outcome;
 use remnawave_healthcheck_core::{checks, report, state, topology};
 use remnawave_healthcheck_panel::{short_uuid_from_url, PanelClient};
 use remnawave_healthcheck_probe as probe;
 use remnawave_healthcheck_ssh as node_ssh;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -53,8 +56,9 @@ impl Run {
 
     async fn execute(&self) -> Result<Outcome> {
         let args = &self.args;
-        let short_uuid = short_uuid_from_url(&args.subscription_url)
-            .context("subscription URL has no shortUuid in its last path segment")?;
+        let short_uuid = short_uuid_from_url(&args.subscription_url).context(
+            "subscription URL has no shortUuid in its last path segment",
+        )?;
         let client = PanelClient::new(&args.panel_url, &args.api_token)?;
         let snapshot = match client
             .snapshot(short_uuid)
@@ -71,12 +75,13 @@ impl Run {
         results.extend(checks::monitoring_coverage(&snapshot));
         results.push(checks::xray_version_drift(&snapshot.nodes));
 
-        let mut egress: HashMap<String, IpAddr> = HashMap::new();
-        if !args.no_ssh {
+        let egress: HashMap<String, IpAddr> = if args.no_ssh {
+            HashMap::new()
+        } else {
             let (node_results, addresses) = self.node_checks(&snapshot).await;
             results.extend(node_results);
-            egress = addresses;
-        }
+            addresses
+        };
 
         if !args.no_channels {
             results.extend(self.channel_checks(&snapshot, &egress).await);
@@ -121,7 +126,9 @@ impl Run {
             return Ok(report::outcome(&results));
         }
         std::fs::write(&args.state_file, state::to_json(&current))
-            .with_context(|| format!("writing {}", args.state_file.display()))?;
+            .with_context(|| {
+                format!("writing {}", args.state_file.display())
+            })?;
 
         Ok(report::outcome(&results))
     }
@@ -136,13 +143,17 @@ impl Run {
     /// are not there — and both would otherwise be written as the new truth, turning every
     /// previously failing channel into a RECOVERED notification about a channel nobody looked
     /// at.
-    fn partial_run_reason(&self, results: &[CheckResult]) -> Option<&'static str> {
+    fn partial_run_reason(
+        &self,
+        results: &[CheckResult],
+    ) -> Option<&'static str> {
         if self.args.no_ssh || self.args.no_channels {
             return Some("partial run (--no-ssh or --no-channels given)");
         }
-        let setup_failed = results
-            .iter()
-            .any(|r| r.key == CheckKey::ChannelSetup.to_string() && r.severity == Severity::Fail);
+        let setup_failed = results.iter().any(|r| {
+            r.key == CheckKey::ChannelSetup.to_string()
+                && r.severity == Severity::Fail
+        });
         setup_failed
             .then_some("partial run (channel probing could not start, so no channel was checked)")
     }
@@ -165,7 +176,7 @@ impl Run {
             state::escape_html(&format!("{err:#}"))
         );
         if let Some(url) = self.args.run_url.as_deref() {
-            text.push_str(&format!("\n\n{url}"));
+            let _ = write!(text, "\n\n{url}");
         }
         let sent = notifier.send(&text).await;
         eprintln!("healthcheck failed: {err:#}");
@@ -187,11 +198,19 @@ enum StateFileRead {
     Content(String),
 }
 
-fn classify_state_read(result: std::io::Result<String>, path: &Path) -> StateFileRead {
+fn classify_state_read(
+    result: std::io::Result<String>,
+    path: &Path,
+) -> StateFileRead {
     match result {
         Ok(s) => StateFileRead::Content(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => StateFileRead::FirstRun,
-        Err(e) => StateFileRead::Unreadable(format!("could not read {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            StateFileRead::FirstRun
+        }
+        Err(e) => StateFileRead::Unreadable(format!(
+            "could not read {}: {e}",
+            path.display()
+        )),
     }
 }
 
@@ -213,7 +232,9 @@ impl Run {
                     .parse::<IpAddr>()
                     .is_err()
                     .then_some(node.address.as_str());
-                let facts = node_ssh::gather(&node.address, domain, &args.echo_url).await;
+                let facts =
+                    node_ssh::gather(&node.address, domain, &args.echo_url)
+                        .await;
                 (node, facts)
             });
         }
@@ -253,11 +274,16 @@ impl Run {
     ) -> Vec<CheckResult> {
         let args = &self.args;
         let Some(version) = required_xray_version(snapshot) else {
-            return setup_failed("no node reported an Xray version, so no binary can be chosen");
+            return setup_failed(
+                "no node reported an Xray version, so no binary can be chosen",
+            );
         };
-        let binary = match probe::xray::ensure(&version, &args.xray_cache).await {
+        let binary = match probe::xray::ensure(&version, &args.xray_cache).await
+        {
             Ok(b) => b,
-            Err(e) => return setup_failed(format!("obtaining xray {version}: {e:#}")),
+            Err(e) => {
+                return setup_failed(format!("obtaining xray {version}: {e:#}"))
+            }
         };
         let mut results = Vec::new();
         let timeout = Duration::from_secs(args.probe_timeout_secs);
@@ -274,19 +300,25 @@ impl Run {
                     // Once per channel: the key identifies this check in the state file, and having
                     // two places build it is how the two spellings drift apart.
                     let key = channel.check_key();
-                    let expect = match channel_precheck(&key, channel, snapshot) {
+                    let expect = match channel_precheck(&key, channel, snapshot)
+                    {
                         Precheck::Probe(expect) => expect,
                         Precheck::Decided(decided) => return decided,
                     };
 
                     let config = probe::config::build(&channel.outbound, port);
-                    let mut outcome = probe::probe(&binary, &config, port, timeout, echo_url).await;
+                    let mut outcome =
+                        probe::probe(&binary, &config, port, timeout, echo_url)
+                            .await;
                     // Retry only a dead tunnel: no exit at all is the common single blip. A wrong
                     // exit is deterministic — the outbound config does not change between the two
                     // calls — so retrying it would only double the timeout on infra that is
                     // genuinely broken, without ever changing the answer.
                     if outcome.exit_ip.is_none() {
-                        outcome = probe::probe(&binary, &config, port, timeout, echo_url).await;
+                        outcome = probe::probe(
+                            &binary, &config, port, timeout, echo_url,
+                        )
+                        .await;
                     }
                     probe::classify(
                         &key,
@@ -322,7 +354,11 @@ fn setup_failed(detail: impl Into<String>) -> Vec<CheckResult> {
 /// Its outbound is `Value::Null`, and handing that to the config builder produces a config xray
 /// refuses to start — the channel would then be reported as "no exit (tunnel dead)", after two
 /// full probe timeouts, pointing the reader at the tunnel instead of at the subscription.
-fn channel_precheck<'a>(key: &str, channel: &Channel, snapshot: &'a Snapshot) -> Precheck<'a> {
+fn channel_precheck<'a>(
+    key: &str,
+    channel: &Channel,
+    snapshot: &'a Snapshot,
+) -> Precheck<'a> {
     let decided = |severity, detail: String| {
         Precheck::Decided(CheckResult::new(
             key,
@@ -386,7 +422,7 @@ fn required_xray_version(snapshot: &Snapshot) -> Option<String> {
 
 /// How a delivery attempt reads on stderr. The parenthetical points at the line `telegram::send`
 /// printed just above, which carries the API's own reason for the refusal.
-fn delivery_label(sent: bool) -> &'static str {
+const fn delivery_label(sent: bool) -> &'static str {
     if sent {
         "sent"
     } else {
@@ -414,7 +450,9 @@ impl Run {
             diff.recovered.len()
         );
         let Some(notifier) = &self.notifier else {
-            eprintln!("[alert] {counted}, but no Telegram credentials were given");
+            eprintln!(
+                "[alert] {counted}, but no Telegram credentials were given"
+            );
             return Delivery::NotConfigured;
         };
         let message = state::format_message(diff, self.args.run_url.as_deref());
@@ -440,10 +478,7 @@ async fn test_alert(args: &Args) -> Result<Outcome> {
     let sent = notifier
         .send("\u{2705} healthcheck: alert delivery test (safe to ignore)")
         .await;
-    eprintln!(
-        "[alert] TEST: delivery {}",
-        if sent { "OK" } else { "FAILED" }
-    );
+    eprintln!("[alert] TEST: delivery {}", if sent { "OK" } else { "FAILED" });
     Ok(if sent { Outcome::Ok } else { Outcome::Failed })
 }
 
@@ -544,7 +579,9 @@ mod tests {
     fn decided(precheck: Precheck<'_>) -> CheckResult {
         match precheck {
             Precheck::Decided(result) => result,
-            Precheck::Probe(expect) => panic!("expected a decided channel, got exit {expect:?}"),
+            Precheck::Probe(expect) => {
+                panic!("expected a decided channel, got exit {expect:?}")
+            }
         }
     }
 
@@ -602,7 +639,8 @@ mod tests {
 
     #[test]
     fn a_failed_probe_setup_makes_the_run_partial() {
-        let run = Run::new(test_args()).expect("the test flags agree with each other");
+        let run = Run::new(test_args())
+            .expect("the test flags agree with each other");
         assert!(run.partial_run_reason(&[]).is_none());
 
         let setup_failed = vec![CheckResult::new(
@@ -665,7 +703,8 @@ mod tests {
 
     #[test]
     fn existing_state_file_content_passes_through() {
-        let got = classify_state_read(Ok("{}".to_string()), Path::new("state.json"));
+        let got =
+            classify_state_read(Ok("{}".to_string()), Path::new("state.json"));
         assert!(matches!(got, StateFileRead::Content(s) if s == "{}"));
     }
 

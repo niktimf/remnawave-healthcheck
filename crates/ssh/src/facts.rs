@@ -68,9 +68,9 @@ impl CommandOutcome {
     /// with the outcome afterwards, and the largest of these texts is a 200-line container log.
     fn text(self) -> String {
         match self {
-            CommandOutcome::Ran { text, .. } => text,
-            CommandOutcome::TimedOut => "ssh timeout".to_string(),
-            CommandOutcome::Failed(e) => format!("ssh error: {e}"),
+            Self::Ran { text, .. } => text,
+            Self::TimedOut => "ssh timeout".to_string(),
+            Self::Failed(e) => format!("ssh error: {e}"),
         }
     }
 }
@@ -143,14 +143,21 @@ async fn run(session: &Session, command: &str) -> CommandOutcome {
 /// different endpoints could disagree about the address of a multi-homed host and turn a healthy
 /// channel red. It arrives as an `EchoUrl`, which is to say it has already been established that
 /// quoting it into a command line is safe.
-pub async fn gather(target: &str, domain: Option<&str>, echo_url: &EchoUrl) -> HostFacts {
+pub async fn gather(
+    target: &str,
+    domain: Option<&str>,
+    echo_url: &EchoUrl,
+) -> HostFacts {
     // Opening the session is the reachability check: there is nothing to ask a host that could
     // not be reached, and why it could not be reached is the reason to report.
     let session = match connect(target).await {
         Ok(session) => session,
         Err(e) => {
             return HostFacts {
-                unreachable_reason: Some(format!("ssh unreachable: {}", error_detail(&e))),
+                unreachable_reason: Some(format!(
+                    "ssh unreachable: {}",
+                    error_detail(&e)
+                )),
                 ..HostFacts::default()
             }
         }
@@ -271,7 +278,7 @@ mod tests {
     /// failure carries. Ignored by default because it needs `ssh` installed and a host that
     /// refuses port 22 — run it with `cargo test -- --ignored` when the transport changes.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs the ssh binary and a host that refuses port 22"]
     async fn an_unreachable_host_yields_a_reason_from_the_real_transport() {
         let echo_url: EchoUrl = "https://example.invalid".parse().unwrap();
         let facts = gather("127.0.0.1", None, &echo_url).await;
