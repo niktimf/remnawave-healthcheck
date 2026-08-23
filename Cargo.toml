@@ -36,3 +36,21 @@ option_if_let_else = "allow"
 # These crates are internal to this workspace and are not published. An `# Errors` section on
 # each would restate the error type the signature already names.
 missing_errors_doc = "allow"
+
+# Line tables and nothing else: a backtrace keeps its file and line numbers,
+# while the rest of the DWARF — the part that makes a debug build slow to link —
+# is not generated at all.
+[profile.dev]
+debug = "line-tables-only"
+
+# `panic` is deliberately left at "unwind". Two guarantees in this tool are
+# `Drop` implementations, and `abort` does not run destructors: the probe's
+# scratch directory holds an xray config with the monitoring user's VLESS
+# credentials until its guard removes it, and an ssh session's `Drop` is what
+# tells the multiplex master to exit instead of leaving it behind.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Symbols stay so a panic in CI names its frames; only the DWARF goes.
+strip = "debuginfo"

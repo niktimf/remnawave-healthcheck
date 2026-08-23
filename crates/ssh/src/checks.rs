@@ -1,4 +1,6 @@
 use crate::facts::HostFacts;
+use crate::facts::PORT80_CLOSED;
+use crate::settings::NodeSettings;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use remnawave_healthcheck_core::keys::{CheckKey, NodeAspect};
 use remnawave_healthcheck_core::model::{CheckResult, Node, Severity};
@@ -44,8 +46,7 @@ struct HostChecks<'a> {
     node: &'a Node,
     facts: &'a HostFacts,
     now: DateTime<Utc>,
-    cert_warn_days: u32,
-    config_warn_days: u32,
+    settings: &'a NodeSettings,
 }
 
 /// One node-side check: it reads the host and answers with a verdict, never
@@ -71,15 +72,13 @@ pub fn check_host(
     node: &Node,
     facts: &HostFacts,
     now: DateTime<Utc>,
-    cert_warn_days: u32,
-    config_warn_days: u32,
+    settings: &NodeSettings,
 ) -> Vec<CheckResult> {
     let host = HostChecks {
         node,
         facts,
         now,
-        cert_warn_days,
-        config_warn_days,
+        settings,
     };
 
     CHECKS
@@ -134,10 +133,6 @@ impl HostChecks<'_> {
     }
 }
 
-/// The one container this tool does expect by name: without it the node runs no
-/// Xray at all.
-const NODE_CONTAINER: &str = "remnanode";
-
 /// The only container state that is not a problem. `docker ps` also shows
 /// `restarting` and `paused` containers, and the status line of a paused one
 /// still begins with "Up".
@@ -172,9 +167,13 @@ impl HostChecks<'_> {
             .map(|(name, _)| *name)
             .filter(|name| !name.is_empty())
             .collect();
-        if !running.contains(&NODE_CONTAINER) {
+        // The one container expected by name: without it the node runs no Xray
+        // at all. Which name that is comes from the settings, so a node whose
+        // compose file renamed it is configuration, not a broken check.
+        let expected = self.settings.container.as_str();
+        if !running.contains(&expected) {
             return Verdict::fail(format!(
-                "the node container '{NODE_CONTAINER}' is not running (running: {})",
+                "the node container '{expected}' is not running (running: {})",
                 commas(&running)
             ));
         }
@@ -322,11 +321,12 @@ impl HostChecks<'_> {
             None => Verdict::warn("no config-push line in node logs"),
             Some(when) => {
                 let age = (self.now - when).num_days();
-                let severity = if age > i64::from(self.config_warn_days) {
-                    Severity::Warn
-                } else {
-                    Severity::Ok
-                };
+                let severity =
+                    if age > i64::from(self.settings.config_warn_days) {
+                        Severity::Warn
+                    } else {
+                        Severity::Ok
+                    };
                 Verdict::new(
                     severity,
                     format!("{age}d old (last {})", when.date_naive()),
@@ -357,7 +357,7 @@ impl HostChecks<'_> {
         let days = (not_after - self.now).num_days();
         let severity = if days < 0 {
             Severity::Fail
-        } else if days < i64::from(self.cert_warn_days) {
+        } else if days < i64::from(self.settings.cert_warn_days) {
             Severity::Warn
         } else {
             Severity::Ok
@@ -420,12 +420,16 @@ fn quoted_value(line: &str, key: &str) -> Option<String> {
 /// Entries whose renewal time did not parse are kept with `due: None`: `Le_*`
 /// lines without a readable timestamp are a broken acme.sh config, which the
 /// caller must tell apart from no config at all.
-fn parse_renewal(text: &str) -> BTreeMap<Option<String>, RenewalEntry> {
+fn parse_renewal(
+    text: &str,
+    acme_dir: &str,
+) -> BTreeMap<Option<String>, RenewalEntry> {
+    let prefix = format!("{acme_dir}/");
     let mut found: BTreeMap<Option<String>, RenewalEntry> = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
         let domain = line
-            .strip_prefix("/root/.acme.sh/")
+            .strip_prefix(prefix.as_str())
             .and_then(|rest| rest.split('/').next())
             .map(|d| d.trim_end_matches("_ecc").to_string());
 
@@ -450,7 +454,8 @@ impl HostChecks<'_> {
     /// — roughly two months before the expiry check would notice.
     fn renewal(&self) -> Verdict {
         const GRACE_DAYS: i64 = 1;
-        let all = parse_renewal(&self.facts.renewal);
+        let all =
+            parse_renewal(&self.facts.renewal, self.settings.acme_dir.as_str());
         if all.is_empty() {
             return Verdict::ok("no acme.sh config (managed elsewhere)");
         }
@@ -478,7 +483,7 @@ impl HostChecks<'_> {
             ));
         };
 
-        let port80_closed = self.facts.renewal.contains("PORT80=closed");
+        let port80_closed = self.facts.renewal.contains(PORT80_CLOSED);
         let http01: BTreeSet<&Option<String>> = certs
             .iter()
             .filter(|c| c.needs_port_80())
@@ -526,6 +531,18 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use remnawave_healthcheck_core::model::{Node, Severity};
+
+    /// The defaults, which is what a run without any of these set uses.
+    fn settings() -> NodeSettings {
+        NodeSettings {
+            container: "remnanode".parse().unwrap(),
+            acme_dir: "/root/.acme.sh".parse().unwrap(),
+            log_lines: 200,
+            echo_url: "https://echo.example.com".parse().unwrap(),
+            cert_warn_days: 14,
+            config_warn_days: 7,
+        }
+    }
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap()
@@ -590,7 +607,8 @@ mod tests {
                 .collect::<Vec<String>>()
         };
 
-        let reachable = check_host(&node(), &healthy_facts(), now(), 14, 7);
+        let reachable =
+            check_host(&node(), &healthy_facts(), now(), &settings());
         assert_eq!(keys(&reachable), expected);
 
         let unreachable = check_host(
@@ -600,15 +618,14 @@ mod tests {
                 ..HostFacts::default()
             },
             now(),
-            14,
-            7,
+            &settings(),
         );
         assert_eq!(keys(&unreachable), expected);
     }
 
     #[test]
     fn a_healthy_host_is_all_ok() {
-        let r = check_host(&node(), &healthy_facts(), now(), 14, 7);
+        let r = check_host(&node(), &healthy_facts(), now(), &settings());
         for check in &r {
             assert_eq!(
                 check.severity,
@@ -629,7 +646,7 @@ mod tests {
             ),
             ..HostFacts::default()
         };
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         assert_eq!(r.len(), 7, "one result per check, no more, no fewer");
         assert!(r.iter().all(|c| c.severity == Severity::Fail));
         assert!(r.iter().all(|c| c.detail.contains("unreachable")));
@@ -644,7 +661,7 @@ mod tests {
         for state in ["restarting", "paused"] {
             let mut facts = healthy_facts();
             facts.docker_ps = format!("remnanode\trunning\ncaddy\t{state}\n");
-            let r = check_host(&node(), &facts, now(), 14, 7);
+            let r = check_host(&node(), &facts, now(), &settings());
             let containers =
                 r.iter().find(|c| c.key.ends_with(":containers")).unwrap();
             assert_eq!(containers.severity, Severity::Fail, "{state}");
@@ -660,7 +677,7 @@ mod tests {
     fn a_container_the_daemon_calls_unhealthy_fails_while_still_running() {
         let mut facts = healthy_facts();
         facts.unhealthy = "remnanode\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let containers =
             r.iter().find(|c| c.key.ends_with(":containers")).unwrap();
         assert_eq!(containers.severity, Severity::Fail);
@@ -675,7 +692,7 @@ mod tests {
     fn a_missing_node_container_fails_even_when_everything_else_is_up() {
         let mut facts = healthy_facts();
         facts.docker_ps = "caddy\trunning\nwatchtower\trunning\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let containers =
             r.iter().find(|c| c.key.ends_with(":containers")).unwrap();
         assert_eq!(containers.severity, Severity::Fail);
@@ -692,7 +709,7 @@ mod tests {
         facts.listening = "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n\
                            LISTEN 0 4096 127.0.0.1:8443 0.0.0.0:*\n"
             .into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let ports = r.iter().find(|c| c.key.ends_with(":ports")).unwrap();
         assert_eq!(ports.severity, Severity::Fail);
         assert!(ports.detail.contains("8443"), "{}", ports.detail);
@@ -708,7 +725,10 @@ mod tests {
                            LISTEN 0 4096 [::1]:9000 [::]:*\n"
                 .into();
         assert_eq!(
-            severity_of(&check_host(&node(), &facts, now(), 14, 7), ":ports"),
+            severity_of(
+                &check_host(&node(), &facts, now(), &settings()),
+                ":ports"
+            ),
             Severity::Ok
         );
         let public = public_listen_ports(&facts.listening);
@@ -731,7 +751,7 @@ mod tests {
     fn an_unknown_egress_address_warns_instead_of_passing_quietly() {
         let mut facts = healthy_facts();
         facts.egress_ip = "curl: (28) Operation timed out\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let egress = r.iter().find(|c| c.key.ends_with(":egress-ip")).unwrap();
         assert_eq!(egress.severity, Severity::Warn);
         assert!(
@@ -740,7 +760,7 @@ mod tests {
             egress.detail
         );
 
-        let ok = check_host(&node(), &healthy_facts(), now(), 14, 7);
+        let ok = check_host(&node(), &healthy_facts(), now(), &settings());
         let egress = ok.iter().find(|c| c.key.ends_with(":egress-ip")).unwrap();
         assert_eq!(egress.severity, Severity::Ok);
         assert!(egress.detail.contains("192.0.2.20"));
@@ -750,7 +770,7 @@ mod tests {
     fn a_port_from_the_panel_that_is_not_listening_fails() {
         let mut facts = healthy_facts();
         facts.listening = "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let ports = r.iter().find(|c| c.key.ends_with(":ports")).unwrap();
         assert_eq!(ports.severity, Severity::Fail);
         assert!(ports.detail.contains("8443"));
@@ -761,7 +781,7 @@ mod tests {
         let mut facts = healthy_facts();
         facts.node_logs =
             "2026-08-01T09:00:00 inbound in-a has 42 users\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         assert_eq!(severity_of(&r, ":config-age"), Severity::Warn);
     }
 
@@ -770,7 +790,7 @@ mod tests {
         let mut facts = healthy_facts();
         facts.node_logs =
             "2026-08-22T09:00:00 inbound in-a has 0 users\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         assert_eq!(severity_of(&r, ":users"), Severity::Fail);
     }
 
@@ -780,7 +800,7 @@ mod tests {
         facts.cert = Some("notAfter=Aug 30 10:00:00 2026 GMT\n".into());
         assert_eq!(
             severity_of(
-                &check_host(&node(), &facts, now(), 14, 7),
+                &check_host(&node(), &facts, now(), &settings()),
                 ":cert-expiry"
             ),
             Severity::Warn
@@ -789,7 +809,7 @@ mod tests {
         facts.cert = Some("notAfter=Aug 10 10:00:00 2026 GMT\n".into());
         assert_eq!(
             severity_of(
-                &check_host(&node(), &facts, now(), 14, 7),
+                &check_host(&node(), &facts, now(), &settings()),
                 ":cert-expiry"
             ),
             Severity::Fail
@@ -802,7 +822,7 @@ mod tests {
         facts.renewal = "/root/.acme.sh/beta.example.com/beta.example.com.conf:Le_Webroot='no'\n\
                          /root/.acme.sh/beta.example.com/beta.example.com.conf:Le_NextRenewTimeStr='2026-06-01T10:00:00Z'\n\
                          PORT80=closed\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let renewal =
             r.iter().find(|c| c.key.ends_with(":cert-renewal")).unwrap();
         assert_eq!(renewal.severity, Severity::Fail);
@@ -819,7 +839,7 @@ mod tests {
         facts.renewal = facts.renewal.replace("PORT80=open", "PORT80=closed");
         assert_eq!(
             severity_of(
-                &check_host(&node(), &facts, now(), 14, 7),
+                &check_host(&node(), &facts, now(), &settings()),
                 ":cert-renewal"
             ),
             Severity::Warn
@@ -835,7 +855,7 @@ mod tests {
             .replace("PORT80=open", "PORT80=closed");
         assert_eq!(
             severity_of(
-                &check_host(&node(), &facts, now(), 14, 7),
+                &check_host(&node(), &facts, now(), &settings()),
                 ":cert-renewal"
             ),
             Severity::Ok
@@ -845,8 +865,8 @@ mod tests {
     #[test]
     fn a_host_without_acme_is_silent_about_renewal() {
         let mut facts = healthy_facts();
-        facts.renewal = "NO_ACME_CONF\nPORT80=closed\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        facts.renewal = "PORT80=closed\n".into();
+        let r = check_host(&node(), &facts, now(), &settings());
         let renewal =
             r.iter().find(|c| c.key.ends_with(":cert-renewal")).unwrap();
         assert_eq!(renewal.severity, Severity::Ok);
@@ -859,7 +879,7 @@ mod tests {
         facts.renewal = "/root/.acme.sh/beta.example.com/beta.example.com.conf:Le_Webroot='no'\n\
                          /root/.acme.sh/beta.example.com/beta.example.com.conf:Le_NextRenewTimeStr='not-a-timestamp'\n\
                          PORT80=open\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let renewal =
             r.iter().find(|c| c.key.ends_with(":cert-renewal")).unwrap();
         assert_eq!(renewal.severity, Severity::Warn);
@@ -869,8 +889,8 @@ mod tests {
     #[test]
     fn no_acme_conf_output_still_reads_ok_after_the_unreadable_time_fix() {
         let mut facts = healthy_facts();
-        facts.renewal = "NO_ACME_CONF\nPORT80=closed\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        facts.renewal = "PORT80=closed\n".into();
+        let r = check_host(&node(), &facts, now(), &settings());
         let renewal =
             r.iter().find(|c| c.key.ends_with(":cert-renewal")).unwrap();
         assert_eq!(renewal.severity, Severity::Ok);
@@ -881,7 +901,7 @@ mod tests {
     fn a_node_without_a_tls_endpoint_is_silent_about_its_certificate() {
         let mut facts = healthy_facts();
         facts.cert = None;
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let cert = r.iter().find(|c| c.key.ends_with(":cert-expiry")).unwrap();
         assert_eq!(cert.severity, Severity::Ok);
         assert!(cert.detail.contains("no TLS endpoint"));
@@ -895,7 +915,7 @@ mod tests {
         // with no TLS.
         let mut facts = healthy_facts();
         facts.cert = Some(String::new());
-        let r = check_host(&node(), &facts, now(), 14, 7);
+        let r = check_host(&node(), &facts, now(), &settings());
         let cert = r.iter().find(|c| c.key.ends_with(":cert-expiry")).unwrap();
         assert_eq!(cert.severity, Severity::Warn);
         assert_eq!(cert.detail, "certificate not parsed");

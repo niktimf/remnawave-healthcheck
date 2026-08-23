@@ -1,5 +1,5 @@
 use clap::Parser;
-use remnawave_healthcheck_core::model::EchoUrl;
+use remnawave_healthcheck_core::model::{EchoUrl, ShellWord};
 use std::path::PathBuf;
 
 /// Health checker for a Remnawave installation. Keeps no inventory of its own:
@@ -32,38 +32,58 @@ pub struct Args {
     #[arg(long, env = "RUN_URL")]
     pub run_url: Option<String>,
 
-    #[arg(long, default_value = ".healthcheck-state.json")]
+    #[arg(
+        long,
+        env = "REMNAWAVE_STATE_FILE",
+        default_value = ".healthcheck-state.json"
+    )]
     pub state_file: PathBuf,
-    #[arg(long, default_value = ".xray-cache")]
+    #[arg(long, env = "REMNAWAVE_XRAY_CACHE", default_value = ".xray-cache")]
     pub xray_cache: PathBuf,
 
     /// Warn this many days before a certificate expires
-    #[arg(long, default_value_t = 14)]
+    #[arg(long, env = "REMNAWAVE_CERT_WARN_DAYS", default_value_t = 14)]
     pub cert_warn_days: u32,
     /// Warn when the node last took a config this many days ago.
-    #[arg(long, default_value_t = 7)]
+    #[arg(long, env = "REMNAWAVE_CONFIG_WARN_DAYS", default_value_t = 7)]
     pub config_warn_days: u32,
 
     /// Skip node-side checks entirely (no SSH is attempted)
-    #[arg(long)]
+    #[arg(long, env = "REMNAWAVE_NO_SSH")]
     pub no_ssh: bool,
     /// Skip channel probing (no Xray is downloaded or started)
-    #[arg(long)]
+    #[arg(long, env = "REMNAWAVE_NO_CHANNELS")]
     pub no_channels: bool,
     /// Send one test message to Telegram and exit, bypassing the diff
-    #[arg(long)]
+    #[arg(long, env = "REMNAWAVE_TEST_ALERT")]
     pub test_alert: bool,
 
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, env = "REMNAWAVE_CONCURRENCY", default_value_t = 8)]
     pub concurrency: usize,
-    #[arg(long, default_value_t = 22)]
+    #[arg(long, env = "REMNAWAVE_PROBE_TIMEOUT_SECS", default_value_t = 22)]
     pub probe_timeout_secs: u64,
     /// First local SOCKS port; each channel gets the next one
-    #[arg(long, default_value_t = 10800)]
+    #[arg(long, env = "REMNAWAVE_SOCKS_BASE_PORT", default_value_t = 10800)]
     pub socks_base_port: u16,
+    /// Container the node's Xray runs in, as its compose file names it
+    #[arg(long, env = "REMNAWAVE_NODE_CONTAINER", default_value = "remnanode")]
+    pub node_container: ShellWord,
+
+    /// Directory acme.sh keeps its per-domain configuration in
+    #[arg(long, env = "REMNAWAVE_ACME_DIR", default_value = "/root/.acme.sh")]
+    pub acme_dir: ShellWord,
+
+    /// How many lines of the node's container log to read
+    #[arg(long, env = "REMNAWAVE_NODE_LOG_LINES", default_value_t = 200)]
+    pub node_log_lines: usize,
+
     /// Endpoint that echoes back the caller's IP address. Asked through each
     /// channel's tunnel and on the node itself, so both sides of an exit
     /// comparison ask the same service.
-    #[arg(long, default_value = "https://api.ipify.org")]
+    #[arg(
+        long,
+        env = "REMNAWAVE_ECHO_URL",
+        default_value = "https://api.ipify.org"
+    )]
     pub echo_url: EchoUrl,
 }

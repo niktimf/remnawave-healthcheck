@@ -12,6 +12,7 @@ use remnawave_healthcheck_core::{checks, report, state, topology};
 use remnawave_healthcheck_panel::{short_uuid_from_url, PanelClient};
 use remnawave_healthcheck_probe as probe;
 use remnawave_healthcheck_ssh as node_ssh;
+use remnawave_healthcheck_ssh::NodeSettings;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
@@ -37,6 +38,9 @@ struct Run {
     args: Args,
     ports: SocksPorts,
     notifier: Option<Notifier>,
+    /// How the nodes are laid out, settled once so no check is handed it a
+    /// piece at a time.
+    node: NodeSettings,
 }
 
 impl Run {
@@ -47,10 +51,19 @@ impl Run {
             args.telegram_chat_id.as_deref(),
             args.telegram_thread_id.as_deref(),
         );
+        let node = NodeSettings {
+            container: args.node_container.clone(),
+            acme_dir: args.acme_dir.clone(),
+            log_lines: args.node_log_lines,
+            echo_url: args.echo_url.clone(),
+            cert_warn_days: args.cert_warn_days,
+            config_warn_days: args.config_warn_days,
+        };
         Ok(Self {
             args,
             ports,
             notifier,
+            node,
         })
     }
 
@@ -219,7 +232,6 @@ impl Run {
         &self,
         snapshot: &Snapshot,
     ) -> (Vec<CheckResult>, HashMap<String, IpAddr>) {
-        let args = &self.args;
         let now = chrono::Utc::now();
         let mut pending = FuturesUnordered::new();
         for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
@@ -232,8 +244,7 @@ impl Run {
                     .is_err()
                     .then_some(node.address.as_str());
                 let facts =
-                    node_ssh::gather(&node.address, domain, &args.echo_url)
-                        .await;
+                    node_ssh::gather(&node.address, domain, &self.node).await;
                 (node, facts)
             });
         }
@@ -244,13 +255,7 @@ impl Run {
             if let Some(ip) = facts.egress_address() {
                 egress.insert(node.name.clone(), ip);
             }
-            results.extend(node_ssh::check_host(
-                node,
-                &facts,
-                now,
-                args.cert_warn_days,
-                args.config_warn_days,
-            ));
+            results.extend(node_ssh::check_host(node, &facts, now, &self.node));
         }
         (results, egress)
     }
@@ -533,6 +538,9 @@ mod tests {
             probe_timeout_secs: 22,
             socks_base_port: 10800,
             echo_url: "https://echo.example.com".parse().unwrap(),
+            node_container: "remnanode".parse().unwrap(),
+            acme_dir: "/root/.acme.sh".parse().unwrap(),
+            node_log_lines: 200,
         }
     }
 

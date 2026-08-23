@@ -3,5 +3,7 @@ target/
 *.state.json
 # Default --state-file name; it holds node names, channel details and panel error texts.
 .healthcheck-state.json
+# Copied from .env.example and filled in: holds the API token and the bot token.
+.env
 .superpowers/
 .idea/

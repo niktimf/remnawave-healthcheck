@@ -116,6 +116,54 @@ impl std::fmt::Display for EchoUrl {
     }
 }
 
+/// A value that is pasted into a command line on a node.
+///
+/// Container names and paths used to be literals in this tool's source, where
+/// breaking out of a command was impossible by construction. Once they can be
+/// set from the environment they are attacker-adjacent input reaching a remote
+/// shell, so what is allowed is listed rather than what is forbidden: letters,
+/// digits, and `.` `_` `-` `/`. A space, a quote, `;`, `$`, a backtick or a `*`
+/// is refused here, once, and cannot appear in any command built from one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellWord(String);
+
+impl ShellWord {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A value that could not be put into a command line safely.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotAShellWord {
+    #[error("a value used in a remote command may not be empty")]
+    Empty,
+    #[error("a value used in a remote command may only contain letters, digits, '.', '_', '-' and '/': {0}")]
+    Forbidden(String),
+}
+
+impl std::str::FromStr for ShellWord {
+    type Err = NotAShellWord;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(NotAShellWord::Empty);
+        }
+        if !s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')
+        }) {
+            return Err(NotAShellWord::Forbidden(s.to_string()));
+        }
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl std::fmt::Display for ShellWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One check outcome. `key` is stable across runs and is what the diff
 /// compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +396,29 @@ mod tests {
             a.check_key(),
             channel("alpha.example.com", 443).check_key()
         );
+    }
+
+    #[test]
+    fn a_shell_word_takes_only_what_a_command_line_can_carry() {
+        use std::str::FromStr;
+
+        for ordinary in ["remnanode", "/root/.acme.sh", "node-1_eu.example"] {
+            assert_eq!(
+                ShellWord::from_str(ordinary).unwrap().as_str(),
+                ordinary
+            );
+        }
+        // Each of these ends the command it is pasted into and starts another.
+        for hostile in
+            ["a b", "a;id", "a$(id)", "a`id`", "a'b", "a\"b", "a|b", "*"]
+        {
+            assert_eq!(
+                ShellWord::from_str(hostile),
+                Err(NotAShellWord::Forbidden(hostile.to_string())),
+                "{hostile}"
+            );
+        }
+        assert_eq!(ShellWord::from_str(""), Err(NotAShellWord::Empty));
     }
 
     #[test]

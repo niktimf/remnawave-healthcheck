@@ -1,5 +1,5 @@
+use crate::settings::NodeSettings;
 use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
-use remnawave_healthcheck_core::model::EchoUrl;
 use std::time::Duration;
 
 /// How long the initial connection may take (`ssh -o ConnectTimeout`).
@@ -40,14 +40,28 @@ impl HostFacts {
     }
 }
 
+/// What the renewal command prints when port 80 is open, and when it is not.
+///
+/// Not a setting: this is the wire format between the command below and the
+/// check that reads it back, so both sides say it once, from here. Changing it
+/// changes nothing about a node — only what this tool says to itself.
+pub(crate) const PORT80_OPEN: &str = "PORT80=open";
+pub(crate) const PORT80_CLOSED: &str = "PORT80=closed";
+
 /// Renewal state of acme.sh plus whether port 80 is open for http-01.
 ///
 /// The glob is expanded inside `sudo sh -c`; a non-root shell cannot look into
-/// /root. `-H` forces the `filename:` prefix even when the glob expands to one
-/// file, which is the common case — without it `parse_renewal` cannot recover
-/// the domain.
-const RENEWAL_CMD: &str = "sudo sh -c 'grep -HE \"Le_NextRenewTimeStr|Le_Webroot\" /root/.acme.sh/*/*.conf \
-2>/dev/null || echo NO_ACME_CONF; ufw status 2>/dev/null | grep -qE \"^80/tcp\" && echo PORT80=open || echo PORT80=closed'";
+/// the acme directory. `-H` forces the `filename:` prefix even when the glob
+/// expands to one file, which is the common case — without it `parse_renewal`
+/// cannot recover the domain.
+fn renewal_cmd(settings: &NodeSettings) -> String {
+    let acme = &settings.acme_dir;
+    format!(
+        "sudo sh -c 'grep -HE \"Le_NextRenewTimeStr|Le_Webroot\" {acme}/*/*.conf \
+         2>/dev/null; ufw status 2>/dev/null | grep -qE \"^80/tcp\" \
+         && echo {PORT80_OPEN} || echo {PORT80_CLOSED}'"
+    )
+}
 
 /// What became of one remote command.
 ///
@@ -136,6 +150,21 @@ async fn run(session: &Session, command: &str) -> CommandOutcome {
     }
 }
 
+/// The same command twice: once through `sudo`, and once without, for a host
+/// where this tool's login may already talk to the docker socket.
+fn sudo_or_not(command: &str) -> String {
+    format!("sudo {command} 2>/dev/null || {command}")
+}
+
+/// The node container's log. `2>&1` because the node writes to both streams.
+fn logs_cmd(settings: &NodeSettings) -> String {
+    let (lines, container) = (settings.log_lines, &settings.container);
+    format!(
+        "sudo docker logs --tail {lines} {container} 2>&1 || \
+         docker logs --tail {lines} {container}"
+    )
+}
+
 /// Collect everything the node-side checks need, in one pass.
 ///
 /// `echo_url` is the endpoint the channel probes use, passed in rather than
@@ -144,7 +173,7 @@ async fn run(session: &Session, command: &str) -> CommandOutcome {
 pub async fn gather(
     target: &str,
     domain: Option<&str>,
-    echo_url: &EchoUrl,
+    settings: &NodeSettings,
 ) -> HostFacts {
     // Opening the session is the reachability check, and why it failed is the
     // reason to report.
@@ -162,17 +191,28 @@ pub async fn gather(
     };
 
     // Single-quoted for the remote shell, which `EchoUrl` is what makes safe.
-    let egress_cmd = format!("curl -fsS --max-time 8 '{echo_url}'");
+    let egress_cmd = format!("curl -fsS --max-time 8 '{}'", settings.echo_url);
     let cert_cmd = domain.map(|d| {
         format!("echo | openssl s_client -connect {d}:443 -servername {d} 2>/dev/null | openssl x509 -noout -enddate")
     });
 
+    // Bound before the join: a command built inline would be a temporary that
+    // the futures outlive.
+    let containers =
+        sudo_or_not("docker ps --format '{{.Names}}\\t{{.State}}'");
+    let unhealthy_cmd = sudo_or_not(
+        "docker ps --filter health=unhealthy --format '{{.Names}}'",
+    );
+    let listening_cmd = sudo_or_not("ss -ltn");
+    let logs = logs_cmd(settings);
+    let renewal_cmd = renewal_cmd(settings);
+
     let (docker_ps, unhealthy, listening, node_logs, renewal, egress_ip) = tokio::join!(
-        run(&session, "sudo docker ps --format '{{.Names}}\\t{{.State}}' 2>/dev/null || docker ps --format '{{.Names}}\\t{{.State}}'"),
-        run(&session, "sudo docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null || docker ps --filter health=unhealthy --format '{{.Names}}'"),
-        run(&session, "sudo ss -ltn 2>/dev/null || ss -ltn"),
-        run(&session, "sudo docker logs --tail 200 remnanode 2>&1 || docker logs --tail 200 remnanode"),
-        run(&session, RENEWAL_CMD),
+        run(&session, &containers),
+        run(&session, &unhealthy_cmd),
+        run(&session, &listening_cmd),
+        run(&session, &logs),
+        run(&session, &renewal_cmd),
         run(&session, &egress_cmd),
     );
     let cert = match cert_cmd {
@@ -203,6 +243,40 @@ fn last_non_empty_line(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defaults, which is what a run without any of these set uses.
+    fn settings() -> NodeSettings {
+        NodeSettings {
+            container: "remnanode".parse().unwrap(),
+            acme_dir: "/root/.acme.sh".parse().unwrap(),
+            log_lines: 200,
+            echo_url: "https://echo.example.com".parse().unwrap(),
+            cert_warn_days: 14,
+            config_warn_days: 7,
+        }
+    }
+
+    #[test]
+    fn a_command_carries_the_container_and_the_acme_directory_it_was_given() {
+        let mut settings = settings();
+        settings.container = "node-eu".parse().unwrap();
+        settings.acme_dir = "/home/deploy/.acme.sh".parse().unwrap();
+        settings.log_lines = 50;
+
+        let logs = logs_cmd(&settings);
+        assert!(logs.contains("--tail 50 node-eu"), "{logs}");
+        assert!(!logs.contains("remnanode"), "{logs}");
+
+        // The same directory the parser strips off the lines this grep prints.
+        let renewal = renewal_cmd(&settings);
+        assert!(
+            renewal.contains("/home/deploy/.acme.sh/*/*.conf"),
+            "{renewal}"
+        );
+        assert!(
+            renewal.contains(PORT80_OPEN) && renewal.contains(PORT80_CLOSED)
+        );
+    }
 
     #[test]
     fn the_egress_address_is_trimmed_and_validated() {
@@ -278,8 +352,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs the ssh binary and a host that refuses port 22"]
     async fn an_unreachable_host_yields_a_reason_from_the_real_transport() {
-        let echo_url: EchoUrl = "https://example.invalid".parse().unwrap();
-        let facts = gather("127.0.0.1", None, &echo_url).await;
+        let facts = gather("127.0.0.1", None, &settings()).await;
         let reason = facts
             .unreachable_reason
             .expect("a host with no sshd is unreachable");
