@@ -10,13 +10,13 @@ use std::net::IpAddr;
 
 /// Turn one probe into a check result.
 ///
-/// `key` is the channel's stable check key (`Channel::check_key`) and `remark` only the title a
-/// human reads: the remark is not unique enough to key a check by, and this module is not the
-/// place that decides what is.
+/// `key` is the channel's stable check key and `remark` only the title a human
+/// reads: a remark is not unique enough to key a check by.
 ///
-/// `expect_ip` is what the expected exit node reports as its own egress address. When it is
-/// unknown (SSH checks disabled, or the node was unreachable) the channel is not silently passed:
-/// it warns, so the report never claims a verification it did not perform.
+/// `expect_ip` is what the exit node reports as its own egress address. When it
+/// is unknown — SSH checks off, or the node unreachable — the channel warns
+/// rather than passing, so the report never claims a verification it did not
+/// perform.
 pub fn classify(
     key: &str,
     remark: &str,

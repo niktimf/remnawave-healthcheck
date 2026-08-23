@@ -1,29 +1,24 @@
 //! Every check key this tool can produce, in one place.
 //!
-//! A key is the tool's memory across runs: the problem set is a map keyed by it, and the diff
-//! decides what is new, worse or recovered by comparing those keys between runs. Two facts follow,
-//! and both are why the keys live here rather than at the places that build them.
+//! A key is the tool's memory across runs, and two things follow from that.
 //!
-//! A key must be unique. Two results sharing one collapse into a single entry in the problem set,
-//! and the loser disappears from the alert without a trace. The keys used to be assembled in four
-//! files across three crates, where nothing showed the namespaces side by side and nothing stopped
-//! a new check from picking one that was already taken.
+//! It must be unique: two results sharing a key collapse into one entry in the
+//! problem set, and the loser disappears from the alert without a trace.
 //!
-//! A key must be stable. Renaming one makes the old key look recovered and the new one look new,
-//! once, for anything that was failing under it.
+//! It must be stable: renaming one makes the old key look recovered and the new
+//! one look new, once, for anything that was failing under it.
 
-/// A node-side check. Every one there is: the node checks are a closed set, and seeing them all
-/// at once is the point of naming them here rather than spelling their suffixes at each call site.
+/// A node-side check, and every one there is: seeing the closed set at once is
+/// the point of naming them here instead of at each call site.
 ///
-/// `EnumIter` and not `Display`: what can be walked is the list of variants, which is exactly one
-/// thing, while the two strings below are two — a key part and a report label, answering to
-/// different masters. A `Display` would leave `{aspect}` ambiguous at every call site, and the
-/// direction that goes wrong quietly is a title reaching a key.
+/// `EnumIter` but no `Display`: the two strings below answer to different
+/// masters — a key part and a report label — so `{aspect}` would be ambiguous,
+/// and the direction that goes wrong quietly is a title reaching a key.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::EnumIter,
 )]
 pub enum NodeAspect {
-    /// What the panel itself says about the node. The only one of these that costs no SSH.
+    /// What the panel says about the node — the only one costing no SSH.
     Panel,
     Containers,
     Ports,
@@ -31,23 +26,19 @@ pub enum NodeAspect {
     ConfigAge,
     /// How long the certificate has left.
     CertExpiry,
-    /// Whether the machinery that renews the certificate still works — a different question from
-    /// `CertExpiry`, and one that is answerable about two months earlier.
+    /// Whether renewal still works — a different question from `CertExpiry`,
+    /// answerable about two months earlier.
     CertRenewal,
     EgressIp,
 }
 
 impl NodeAspect {
-    /// The part of the key that names this aspect.
+    /// The part of the key that names this aspect, and part of the contract.
     ///
-    /// Written out rather than derived from the variant's name, though `kebab-case` of these
-    /// names happens to spell exactly these strings. Deriving it would make the key a function of
-    /// a Rust identifier: renaming `CertExpiry` to something clearer would silently rename the
-    /// key with it and reset the history of every node under it. The `match` is what keeps a
-    /// rename free.
-    ///
-    /// Part of the contract: changing one of these strings costs a single run in which the old
-    /// key reads as recovered and the new one as new.
+    /// Written out rather than derived, though `kebab-case` of the variant
+    /// names would spell exactly these strings: deriving would make the key a
+    /// function of a Rust identifier, so renaming `CertExpiry` for clarity
+    /// would reset the certificate history of every node.
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Panel => "panel",
@@ -61,8 +52,8 @@ impl NodeAspect {
         }
     }
 
-    /// How the check is labelled in the report, next to the node's name. Free to reword: no
-    /// history depends on a title.
+    /// How the check is labelled in the report, next to the node's name. Free
+    /// to reword: no history depends on a title.
     pub const fn title(self) -> &'static str {
         match self {
             Self::Panel => "panel status",
@@ -79,22 +70,19 @@ impl NodeAspect {
 
 /// The identity of one check result.
 ///
-/// Every key the tool produces comes from here, so the namespaces are visible together and a new
-/// check cannot quietly reuse one. What it cannot do by itself is stop two variants from spelling
-/// the same string — that is what `keys_are_unique_across_every_kind_of_check` is for.
-///
-/// It renders as its key and as nothing else, which is why that rendering is `Display` rather
-/// than a method of its own.
+/// Every key comes from here, so the namespaces are visible together and a new
+/// check cannot quietly reuse one. What this cannot do by itself is stop two
+/// variants from spelling the same string — that is what
+/// `keys_are_unique_across_every_kind_of_check` is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckKey<'a> {
     Node {
         node: &'a str,
         aspect: NodeAspect,
     },
-    /// One client-facing channel. The endpoint is part of the key because a remark is not unique:
-    /// it is rendered from a panel template and nothing there enforces uniqueness, so two hosts of
-    /// the same inbound can share one — and sharing a key means one of them vanishing from the
-    /// alert while the report still shows both.
+    /// The endpoint is part of the key because a remark is not unique: it is
+    /// rendered from a panel template, so two hosts of the same inbound can
+    /// share one — and a shared key means one of them vanishes from the alert.
     Channel {
         remark: &'a str,
         address: &'a str,
@@ -138,8 +126,8 @@ mod tests {
     use std::collections::BTreeSet;
     use strum::IntoEnumIterator;
 
-    /// One of every kind of check, with the same node and the same names throughout: if two kinds
-    /// can collide, this is the shape in which they do.
+    /// One of every kind, same name in every position: if two kinds can
+    /// collide, this is the shape in which they do.
     fn one_of_each() -> Vec<CheckKey<'static>> {
         let mut keys: Vec<CheckKey<'static>> = NodeAspect::iter()
             .map(|aspect| CheckKey::Node {
@@ -163,9 +151,9 @@ mod tests {
 
     #[test]
     fn keys_are_unique_across_every_kind_of_check() {
-        // The compiler keeps the variants apart; nothing but this keeps two of them from
-        // rendering the same string. A collision would not fail a run — it would silently drop
-        // one of the two problems out of the alert.
+        // The compiler keeps the variants apart; only this keeps two of them
+        // from rendering the same string. A collision does not fail a run — it
+        // drops one of the two problems out of the alert.
         let keys = one_of_each();
         let rendered = || keys.iter().map(ToString::to_string);
         let distinct: BTreeSet<String> = rendered().collect();
@@ -186,8 +174,8 @@ mod tests {
         let titles: BTreeSet<&str> =
             NodeAspect::iter().map(super::NodeAspect::title).collect();
         assert_eq!(titles.len(), aspects, "two aspects share a title");
-        // Slugs go into keys, which are read in alerts and compared between runs: no spaces, and
-        // no colon, which is what separates the parts of a key.
+        // Slugs are read in alerts and compared between runs: no spaces, and no
+        // colon, which is what separates the parts of a key.
         for aspect in NodeAspect::iter() {
             let slug = aspect.slug();
             assert!(!slug.is_empty(), "{aspect:?}");
@@ -200,8 +188,8 @@ mod tests {
 
     #[test]
     fn the_two_certificate_checks_are_told_apart_by_name() {
-        // They answer different questions — days left, and whether renewal still works — about
-        // two months apart. An operator reads these keys in an alert, so the pair reads as a pair.
+        // Different questions — days left, and whether renewal still works —
+        // about two months apart, read as a pair in an alert.
         assert_eq!(NodeAspect::CertExpiry.slug(), "cert-expiry");
         assert_eq!(NodeAspect::CertRenewal.slug(), "cert-renewal");
         assert_ne!(

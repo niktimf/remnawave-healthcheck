@@ -4,15 +4,17 @@ use std::collections::BTreeMap;
 
 /// One non-OK check as the problem set remembers it.
 ///
-/// Severity stays a `Severity` rather than being glued into the detail text: the diff compares severities, and re-parsing them out of a
-/// rendered string is how a typo turns into a missed escalation.
+/// Severity stays a `Severity` rather than being glued into the detail text:
+/// the diff compares severities, and re-parsing them out of a rendered string
+/// is how a typo becomes a missed escalation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Problem {
     pub severity: Severity,
     pub detail: String,
 }
 
-/// Non-OK checks of one run, keyed by the stable check key. `BTreeMap` keeps output deterministic.
+/// Non-OK checks of one run, keyed by the stable check key. `BTreeMap` keeps
+/// output deterministic.
 pub type ProblemSet = BTreeMap<String, Problem>;
 
 /// What changed between two runs.
@@ -33,9 +35,8 @@ impl Diff {
 
 /// Non-OK results of one run, keyed by check key.
 ///
-/// Keys must be unique by construction — two
-/// results sharing one key collapse into a single entry here, and the loser disappears from the
-/// alert without a trace (see `Channel::check_key`).
+/// Keys must be unique by construction: two results sharing one collapse into a
+/// single entry here, and the loser disappears from the alert without a trace.
 pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
     results
         .iter()
@@ -54,9 +55,9 @@ pub fn problem_set(results: &[CheckResult]) -> ProblemSet {
 
 /// What changed since the previous run.
 ///
-/// Appearing and disappearing keys always count. So does a severity escalation on a key that
-/// was already a problem. Softening (FAIL -> WARN) is deliberately silent: the problem is still
-/// there and re-alerting on it is noise.
+/// Appearing and disappearing keys count, and so does an escalation on a key
+/// that was already a problem. Softening (FAIL -> WARN) is deliberately silent:
+/// the problem is still there and re-alerting on it is noise.
 pub fn diff(current: &ProblemSet, previous: &ProblemSet) -> Diff {
     Diff {
         new: select(current, |k, _| !previous.contains_key(k)),
@@ -67,8 +68,8 @@ pub fn diff(current: &ProblemSet, previous: &ProblemSet) -> Diff {
     }
 }
 
-/// The entries of `from` the predicate keeps. Owned, because a diff outlives the two sets it was
-/// computed from.
+/// The entries of `from` the predicate keeps. Owned, because a diff outlives
+/// the two sets it was computed from.
 fn select(
     from: &ProblemSet,
     keep: impl Fn(&str, &Problem) -> bool,
@@ -79,8 +80,8 @@ fn select(
         .collect()
 }
 
-/// Every variant is spelled out: a wildcard here would give a future severity a red circle
-/// silently instead of failing to compile.
+/// Every variant is spelled out: a wildcard here would give a future severity a
+/// red circle silently instead of failing to compile.
 const fn icon(severity: Severity) -> &'static str {
     match severity {
         Severity::Warn => "\u{1F7E1}",
@@ -90,11 +91,11 @@ const fn icon(severity: Severity) -> &'static str {
 
 /// Escape the characters Telegram's HTML parse mode treats specially.
 ///
-/// Public because every path that puts text into an alert needs it, the out-of-band panel-failure alert included. A check's
-/// own key or detail text (xray stderr, a panel status message) is not under our control and can
-/// contain a stray `<` or bare `&`; unescaped, that either mangles the message's markup or makes Telegram reject
-/// the whole alert with "can't parse entities" — losing the alert entirely, which is exactly the
-/// failure this tool exists to prevent.
+/// A check's key or detail text (xray stderr, a panel status message) is not
+/// under our control and can carry a stray `<` or bare `&`. Unescaped, that
+/// either mangles the markup or makes Telegram reject the whole alert with
+/// "can't parse entities" — losing it entirely, which is the failure this tool
+/// exists to prevent.
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -108,8 +109,8 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
-/// One problem as it appears in an alert line. The severity label is ours and needs no escaping;
-/// the detail is not (xray stderr, a panel status message) and does.
+/// One problem as an alert line. The severity label is ours and needs no
+/// escaping; the detail is not, and does.
 fn render_problem(p: &Problem) -> String {
     format!("{}: {}", p.severity, escape_html(&p.detail))
 }
@@ -140,10 +141,10 @@ pub fn format_message(d: &Diff, run_url: Option<&str>) -> String {
 ///
 /// # Panics
 ///
-/// Never in practice: a problem set is a map of strings to two owned fields, so serialising it
-/// cannot fail for any reason short of a bug in this crate. Swallowing that error instead would
-/// write `{}` — an empty problem set — and the next run would report every still-broken check as
-/// recovered.
+/// Never in practice: a problem set is a map of strings to two owned fields, so
+/// serialising it cannot fail short of a bug in this crate. Swallowing that
+/// error would write `{}` and make the next run report every still-broken check
+/// as recovered.
 pub fn to_json(state: &ProblemSet) -> String {
     serde_json::to_string_pretty(state)
         .expect("a problem set always serialises")
@@ -151,8 +152,8 @@ pub fn to_json(state: &ProblemSet) -> String {
 
 /// The previous run's problem set, as read from the state file.
 ///
-/// Anything unreadable is treated as "no previous run" — a corrupt state file must not break
-/// the run, it only costs one round of re-alerting.
+/// Anything unreadable is treated as "no previous run" — a corrupt state file
+/// must not break the run, it only costs one round of re-alerting.
 pub fn from_json(raw: &str) -> ProblemSet {
     serde_json::from_str(raw).unwrap_or_default()
 }
@@ -190,7 +191,8 @@ mod tests {
         assert_eq!(got["b"].detail, "meh");
         assert_eq!(got["c"].severity, Severity::Fail);
         assert_eq!(got["c"].detail, "bad");
-        // Rendered into an alert, a problem still reads exactly as it always did.
+        // Rendered into an alert, a problem still reads exactly as it always
+        // did.
         assert_eq!(render_problem(&got["b"]), "WARN: meh");
         assert_eq!(render_problem(&got["c"]), "FAIL: bad");
     }
@@ -218,7 +220,8 @@ mod tests {
 
     #[test]
     fn a_changed_detail_at_the_same_severity_is_silent() {
-        // Only the severity decides an escalation; a reworded detail is not news.
+        // Only the severity decides an escalation; a reworded detail is not
+        // news.
         let previous = ps(&[("a", Severity::Fail, "no exit (tunnel dead)")]);
         let current =
             ps(&[("a", Severity::Fail, "no exit (tunnel dead) | xray: boom")]);
@@ -251,8 +254,8 @@ mod tests {
 
     #[test]
     fn a_state_file_with_an_unreadable_entry_is_treated_as_no_previous_run() {
-        // Half a problem set is not a problem set: silently keeping the readable half would make
-        // the missing keys look recovered.
+        // Half a problem set is not a problem set: silently keeping the
+        // readable half would make the missing keys look recovered.
         assert!(from_json(
             r#"{"channel:a": {"severity": "Nope", "detail": "x"}}"#
         )
@@ -303,7 +306,8 @@ mod tests {
 
     #[test]
     fn alert_lines_keep_their_exact_wording() {
-        // These lines are the tool's user-facing output; the refactor must not reflow them.
+        // These lines are the tool's user-facing output; the refactor must not
+        // reflow them.
         let d = Diff {
             new: ps(&[("channel:a", Severity::Warn, "slow")]),
             recovered: ps(&[("channel:c", Severity::Fail, "no exit")]),

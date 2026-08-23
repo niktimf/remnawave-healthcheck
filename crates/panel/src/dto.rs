@@ -7,8 +7,9 @@ struct Envelope<T> {
     response: T,
 }
 
-/// Only the fields this tool actually uses. Everything else in the payload is ignored on purpose:
-/// mirroring the full schema is what makes clients break on panel upgrades.
+/// Only the fields this tool actually uses. Everything else in the payload is
+/// ignored on purpose: mirroring the full schema is what makes clients break on
+/// panel upgrades.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeDto {
@@ -79,8 +80,9 @@ pub struct ResolvedDto {
 #[serde(rename_all = "camelCase")]
 pub struct MetadataDto {
     pub inbound_tag: String,
-    /// `null` when the host has no config profile attached (legacy host, or a profile that was
-    /// since deleted) — a real panel state per `resolved-proxy-config.schema.ts`, not drift.
+    /// `null` when the host has no config profile attached (legacy host, or a
+    /// profile that was since deleted) — a real panel state per
+    /// `resolved-proxy-config.schema.ts`, not drift.
     #[serde(default)]
     pub config_profile_uuid: Option<String>,
 }
@@ -92,8 +94,8 @@ struct RawSubscriptionData {
     resolved_proxy_configs: Vec<ResolvedDto>,
 }
 
-/// Unwrap one panel response. The envelope is the same for every endpoint; only what sits
-/// inside it differs.
+/// Unwrap one panel response. The envelope is the same for every endpoint; only
+/// what sits inside it differs.
 fn parse_response<T: DeserializeOwned>(body: &str) -> anyhow::Result<T> {
     Ok(serde_json::from_str::<Envelope<T>>(body)?.response)
 }
@@ -113,8 +115,8 @@ pub fn parse_resolved(body: &str) -> anyhow::Result<Vec<ResolvedDto>> {
 impl From<&NodeDto> for Node {
     fn from(dto: &NodeDto) -> Self {
         let profile = dto.config_profile.as_ref();
-        // Taken once: a node with no profile simply has no active inbounds, and both lists below
-        // are then empty for the same reason.
+        // Taken once: a node with no profile simply has no active inbounds, and
+        // both lists below are then empty for the same reason.
         let inbounds: &[InboundDto] =
             profile.map_or(&[], |p| p.active_inbounds.as_slice());
         Self {
@@ -150,9 +152,10 @@ mod tests {
 
     #[test]
     fn resolved_config_with_a_null_profile_uuid_still_parses() {
-        // hosts.schema.ts and resolved-proxy-config.schema.ts both declare configProfileUuid
-        // nullable: a host can be unattached to any config profile (legacy host, or one whose
-        // profile was deleted). This must not fail parsing the whole response over one such host.
+        // hosts.schema.ts and resolved-proxy-config.schema.ts both declare
+        // configProfileUuid nullable: a host can be unattached to any config
+        // profile (legacy host, or one whose profile was deleted). This must
+        // not fail parsing the whole response over one such host.
         let raw = json!({"response": {"resolvedProxyConfigs": [{
             "finalRemark": "orphaned host",
             "address": "orphan.example.com",

@@ -19,20 +19,20 @@ use std::path::Path;
 use std::time::Duration;
 
 pub async fn run(args: Args) -> Result<Outcome> {
-    // Answered before a run is built at all: this mode sends one message and exits, so holding
-    // it to the flags a run needs — a port range that adds up, above all — would refuse the one
-    // command whose whole purpose is to work when the rest of the configuration does not.
+    // This mode sends one message and exits: holding it to the flags a run
+    // needs would refuse the one command whose purpose is to work when the rest
+    // of the configuration does not.
     if args.test_alert {
         return test_alert(&args).await;
     }
     Run::new(args)?.execute().await
 }
 
-/// One run of the tool, with the flag combinations that cannot work already ruled out.
+/// One run of the tool, with the flag combinations that cannot work already
+/// ruled out.
 ///
-/// Everything here is settled once, at construction: nothing further down asks again whether the
-/// ports fit or whether Telegram is configured, because neither question can still be open by
-/// then — a `Run` that exists is one whose flags agreed with each other.
+/// Nothing further down asks again whether the ports fit or whether Telegram is
+/// configured: a `Run` that exists is one whose flags agreed with each other.
 struct Run {
     args: Args,
     ports: SocksPorts,
@@ -89,16 +89,14 @@ impl Run {
 
         print!("{}", report::render(&results));
 
-        // A partial run (some check family was not evaluated) must not touch history: `results`
-        // here is not "everything is fine", it is "everything we looked at is fine". Writing it
-        // as the new state would erase the unevaluated family's problems from the problem set,
-        // and the diff would report them as recovered even though nothing about them actually
-        // changed — and the following full run would then report them as new all over again.
-        // Such runs still print the report and carry the right exit code; they just leave state
-        // and Telegram alone.
+        // A partial run must not touch history: `results` is not "everything is
+        // fine", it is "everything we looked at is fine". Written as the new
+        // state, it would erase the unevaluated family from the problem set,
+        // and the diff would report those checks as recovered and then as new
+        // all over again.
         if let Some(reason) = self.partial_run_reason(&results) {
             eprintln!("[state] {reason}: state file and Telegram notification skipped");
-            return Ok(report::outcome(&results));
+            return Ok(Outcome::of(&results));
         }
 
         let current = state::problem_set(&results);
@@ -116,33 +114,32 @@ impl Run {
         let previous = state::from_json(&previous_raw);
         let diff = state::diff(&current, &previous);
         if !diff.is_empty() && self.notify(&diff).await == Delivery::Failed {
-            // The change was detected but nobody was told. Writing it into the state file now
-            // would mark it "already known" and it would never appear in a diff again — one
-            // network blip would swallow the alert for good. Leaving the file alone costs a
-            // repeated alert next run, which is the harmless direction of the trade.
+            // Detected but not delivered. Writing it now would mark the change
+            // "already known" and it would never appear in a diff again — one
+            // network blip swallowing the alert for good. A repeated alert next
+            // run is the harmless direction of the trade.
             eprintln!(
                 "[state] the alert could not be delivered: state file left untouched so the change is reported again next run"
             );
-            return Ok(report::outcome(&results));
+            return Ok(Outcome::of(&results));
         }
         std::fs::write(&args.state_file, state::to_json(&current))
             .with_context(|| {
                 format!("writing {}", args.state_file.display())
             })?;
 
-        Ok(report::outcome(&results))
+        Ok(Outcome::of(&results))
     }
 }
 
 impl Run {
-    /// Why this run must not be treated as a full picture of the installation, if it must not.
+    /// Why this run must not be treated as a full picture, if it must not.
     ///
-    /// Skipping a family by flag is one way; the other is `channel_checks` failing before it
-    /// could probe anything, which leaves a single `channels:setup` failure in place of every
-    /// `channel:*` result. Both look identical to the state file — a pile of keys that simply
-    /// are not there — and both would otherwise be written as the new truth, turning every
-    /// previously failing channel into a RECOVERED notification about a channel nobody looked
-    /// at.
+    /// Skipping a family by flag is one way; the other is `channel_checks`
+    /// failing before it probed anything, leaving one `channels:setup` failure
+    /// in place of every `channel:*` result. Both look identical to the state
+    /// file, and both would turn every previously failing channel into a
+    /// RECOVERED notification about a channel nobody looked at.
     fn partial_run_reason(
         &self,
         results: &[CheckResult],
@@ -160,15 +157,16 @@ impl Run {
 }
 
 impl Run {
-    /// The panel is the only source of truth this tool has, so a failure to read it means
-    /// nothing at all was checked — and it is the loudest failure there is: panel down, token
-    /// revoked, DNS gone. Letting it end the process on stderr alone would silence the alerting
-    /// channel at exactly the moment it matters, so the reason goes to Telegram directly,
-    /// bypassing the diff. State is left untouched: overwriting it here would make the next
-    /// successful run announce every still-broken check as RECOVERED.
+    /// The panel is the only source of truth here, so failing to read it means
+    /// nothing was checked — and it is the loudest failure there is: panel
+    /// down, token revoked, DNS gone. Ending on stderr alone would silence the
+    /// alerting channel exactly when it matters, so the reason goes to Telegram
+    /// directly, bypassing the diff. State is left untouched: overwriting it
+    /// would make the next successful run announce every still-broken check as
+    /// RECOVERED.
     async fn panel_unreadable(&self, err: anyhow::Error) -> Result<Outcome> {
         let Some(notifier) = &self.notifier else {
-            // Nowhere to send it — behave exactly as before and let `main` report on stderr.
+            // Nowhere to send it: let `main` report on stderr.
             return Err(err);
         };
         let mut text = format!(
@@ -188,9 +186,9 @@ impl Run {
     }
 }
 
-/// Content of the previous run's state file, read result classified. Distinguishing "no file
-/// yet" from "file exists but could not be read" matters: a corrupt or permission-denied state
-/// file must not look identical to a first run in the logs, it deserves a stderr line.
+/// The previous run's state file, read result classified. "No file yet" and
+/// "file exists but could not be read" must not look identical in the logs: the
+/// second deserves a stderr line.
 #[derive(Debug)]
 enum StateFileRead {
     FirstRun,
@@ -215,8 +213,8 @@ fn classify_state_read(
 }
 
 impl Run {
-    /// Node-side checks; also returns each node's own egress address, which is what channel exits
-    /// are compared against.
+    /// Node-side checks, plus each node's own egress address — what channel
+    /// exits are compared against.
     async fn node_checks(
         &self,
         snapshot: &Snapshot,
@@ -226,7 +224,8 @@ impl Run {
         let mut pending = FuturesUnordered::new();
         for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
             pending.push(async move {
-                // An address that is not an IP is also the TLS endpoint worth inspecting.
+                // An address that is not an IP is also the TLS endpoint worth
+                // inspecting.
                 let domain = node
                     .address
                     .parse::<IpAddr>()
@@ -258,15 +257,16 @@ impl Run {
 }
 
 impl Run {
-    /// Probe every channel the monitoring user can see. Channels of a node the panel reports as
-    /// disabled are skipped: `node_status` already said why, and a pile of red would only bury it.
+    /// Probe every channel the monitoring user can see. Channels of a disabled
+    /// node are skipped: `node_status` already said why, and a pile of red
+    /// would bury it.
     ///
-    /// Never propagates an error out of the run: a setup failure here (no node reported an Xray
-    /// version, or the binary could not be downloaded) becomes one `Fail` result instead of
-    /// aborting before the report is printed and before Telegram is notified. A mass infra
-    /// outage is exactly the moment nodes disagree on their version or GitHub is unreachable —
-    /// the report must still go out for everything else that was already checked (node status,
-    /// subscription coverage, monitoring coverage, version drift, all SSH results).
+    /// Never propagates an error out of the run: a setup failure — no node
+    /// reported an Xray version, the binary could not be downloaded — becomes
+    /// one `Fail` result instead of aborting before the report is printed and
+    /// Telegram notified. A mass outage is exactly the moment nodes disagree on
+    /// their version or GitHub is unreachable, and everything already checked
+    /// must still go out.
     async fn channel_checks(
         &self,
         snapshot: &Snapshot,
@@ -290,15 +290,12 @@ impl Run {
 
         for chunk in snapshot.channels.chunks(self.ports.concurrency()) {
             let mut pending = FuturesUnordered::new();
-            // One port per slot, straight from the range that was proven to hold them: a
-            // batch is cut to exactly as many channels as there are ports, so neither side of
-            // this can run out.
             for (channel, port) in chunk.iter().zip(self.ports.iter()) {
                 let binary = binary.clone();
                 let echo_url = args.echo_url.as_str();
                 pending.push(async move {
-                    // Once per channel: the key identifies this check in the state file, and having
-                    // two places build it is how the two spellings drift apart.
+                    // Once per channel: two places building this key is how two
+                    // spellings of it drift apart.
                     let key = channel.check_key();
                     let expect = match channel_precheck(&key, channel, snapshot)
                     {
@@ -310,10 +307,10 @@ impl Run {
                     let mut outcome =
                         probe::probe(&binary, &config, port, timeout, echo_url)
                             .await;
-                    // Retry only a dead tunnel: no exit at all is the common single blip. A wrong
-                    // exit is deterministic — the outbound config does not change between the two
-                    // calls — so retrying it would only double the timeout on infra that is
-                    // genuinely broken, without ever changing the answer.
+                    // Retry only a dead tunnel: no exit at all is the common
+                    // single blip, while a wrong exit is deterministic — the
+                    // outbound does not change between two calls, so retrying
+                    // would double the timeout without changing the answer.
                     if outcome.exit_ip.is_none() {
                         outcome = probe::probe(
                             &binary, &config, port, timeout, echo_url,
@@ -337,7 +334,8 @@ impl Run {
     }
 }
 
-/// The one result that stands in for every channel when probing could not be set up.
+/// The one result that stands in for every channel when probing could not be
+/// set up.
 fn setup_failed(detail: impl Into<String>) -> Vec<CheckResult> {
     vec![CheckResult::new(
         CheckKey::ChannelSetup.to_string(),
@@ -347,13 +345,14 @@ fn setup_failed(detail: impl Into<String>) -> Vec<CheckResult> {
     )]
 }
 
-/// Everything about a channel that can be settled before xray is started: the name of the node it
-/// is supposed to exit through, or the finished check result explaining why it cannot be probed.
+/// Everything about a channel settled before xray is started: the node it
+/// should exit through, or the finished result saying why it cannot be probed.
 ///
-/// The last of those reasons is a channel the panel resolved but the subscription never served.
-/// Its outbound is `Value::Null`, and handing that to the config builder produces a config xray
-/// refuses to start — the channel would then be reported as "no exit (tunnel dead)", after two
-/// full probe timeouts, pointing the reader at the tunnel instead of at the subscription.
+/// The last of those is a channel the panel resolved but the subscription never
+/// served. Its outbound is `Value::Null`, and handing that to the config
+/// builder produces a config xray refuses to start — reported as "no exit
+/// (tunnel dead)" after two full timeouts, pointing the reader at the tunnel
+/// instead of the subscription.
 fn channel_precheck<'a>(
     key: &str,
     channel: &Channel,
@@ -392,18 +391,20 @@ fn channel_precheck<'a>(
     Precheck::Probe(expect)
 }
 
-/// The two ways a channel's pre-probe examination can end. Not a `Result`: neither outcome is an
-/// error, and a reader who sees `Err` here would look for one.
+/// The two ways a pre-probe examination can end. Not a `Result`: neither
+/// outcome is an error, and a reader who saw `Err` would look for one.
 #[derive(Debug)]
 enum Precheck<'a> {
-    /// Nothing stands in the way. Carries the node the channel must exit through.
+    /// Nothing stands in the way. Carries the node the channel must exit
+    /// through.
     Probe(&'a Node),
-    /// The channel is not to be probed, and this is the finished result saying why.
+    /// The channel is not to be probed, and this is the finished result saying
+    /// why.
     Decided(CheckResult),
 }
 
-/// The version the nodes are actually running. When they disagree, `xray:version-drift` has
-/// already warned; probing uses the most common one so the client side matches the majority.
+/// The version the nodes are actually running. When they disagree,
+/// `xray:version-drift` has already warned; probing uses the most common one.
 fn required_xray_version(snapshot: &Snapshot) -> Option<String> {
     let mut tally: HashMap<&str, usize> = HashMap::new();
     for version in snapshot
@@ -420,8 +421,8 @@ fn required_xray_version(snapshot: &Snapshot) -> Option<String> {
         .map(|(version, _)| version.to_string())
 }
 
-/// How a delivery attempt reads on stderr. The parenthetical points at the line `telegram::send`
-/// printed just above, which carries the API's own reason for the refusal.
+/// How a delivery attempt reads on stderr. The parenthetical points at the line
+/// above it, which carries the API's own reason.
 const fn delivery_label(sent: bool) -> &'static str {
     if sent {
         "sent"
@@ -430,8 +431,9 @@ const fn delivery_label(sent: bool) -> &'static str {
     }
 }
 
-/// What became of an alert. `NotConfigured` is not a failure: running without Telegram
-/// credentials is a deliberate configuration, and it must not hold the state file hostage.
+/// What became of an alert. `NotConfigured` is not a failure: running without
+/// Telegram credentials is a deliberate configuration, and it must not hold the
+/// state file hostage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
     Sent,
@@ -441,8 +443,6 @@ enum Delivery {
 
 impl Run {
     async fn notify(&self, diff: &state::Diff) -> Delivery {
-        // Counted once: the two branches below report the same three numbers, and only differ in
-        // whether there was anywhere to send them.
         let counted = format!(
             "{} new / {} worse / {} recovered",
             diff.new.len(),
@@ -536,7 +536,8 @@ mod tests {
         }
     }
 
-    /// One exit node with a plain freedom profile, plus one channel pointing at it.
+    /// One exit node with a plain freedom profile, plus one channel pointing at
+    /// it.
     fn resolvable_snapshot(outbound: serde_json::Value) -> Snapshot {
         let mut node = node("beta", false, Some("26.6.27"));
         node.address = "beta.example.com".into();
@@ -598,10 +599,10 @@ mod tests {
 
     #[test]
     fn a_channel_the_subscription_never_served_fails_without_being_probed() {
-        // outbound == null: building a config out of it would make xray refuse to start and the
-        // channel would be blamed for a dead tunnel after two full timeouts.
+        // outbound == null: building a config out of it would make xray refuse
+        // to start and the channel would be blamed for a dead tunnel after two
+        // full timeouts.
         let snap = resolvable_snapshot(serde_json::Value::Null);
-        // A channel with no config must not reach the probe.
         let decided = decided(precheck_of(&snap));
         assert_eq!(decided.severity, Severity::Fail);
         assert!(
@@ -614,8 +615,6 @@ mod tests {
 
     #[test]
     fn a_channel_whose_exit_is_disabled_only_warns() {
-        // Whether the exit is disabled is now asked of the node the resolver returned, so the
-        // node itself is what the test switches off.
         let mut snap = resolvable_snapshot(json!({"protocol": "vless"}));
         snap.nodes[0].is_disabled = true;
         let decided = decided(precheck_of(&snap));
@@ -630,8 +629,9 @@ mod tests {
         assert_eq!(decided.key, snap.channels[0].check_key());
         assert_eq!(decided.title, "beta direct");
 
-        // Two channels sharing a remark must not share a key, or one of them would silently
-        // disappear from the problem set and therefore from the alert.
+        // Two channels sharing a remark must not share a key, or one of them
+        // would silently disappear from the problem set and therefore from the
+        // alert.
         let mut other = snap.channels[0].clone();
         other.address = "gamma.example.com".into();
         assert_ne!(decided.key, other.check_key());
@@ -710,8 +710,8 @@ mod tests {
 
     #[test]
     fn a_run_cannot_be_built_from_flags_that_would_share_a_port() {
-        // The refusal is the constructor's, and it is the last moment it can be made: past it,
-        // nothing in the run has to ask whether a port is real.
+        // Past the constructor, nothing in the run has to ask whether a port is
+        // real.
         let mut args = test_args();
         args.socks_base_port = 65530;
         args.concurrency = 100;

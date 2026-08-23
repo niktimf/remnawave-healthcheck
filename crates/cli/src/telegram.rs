@@ -2,24 +2,22 @@ use std::time::Duration;
 
 /// Where alerts go, once it is known that they can go anywhere at all.
 ///
-/// Both a token and a chat id are needed to post, and either one alone is useless. Holding them
-/// as a pair that only exists complete means the question "is Telegram configured?" is answered
-/// once, when this is built, instead of at every place that wants to send something — and a
-/// caller holding one of these cannot reach a branch where half the credentials are missing.
+/// Either credential alone is useless, so holding them as a pair that only
+/// exists complete answers "is Telegram configured?" once, when this is built,
+/// instead of at every place that wants to send something.
 #[derive(Clone)]
 pub struct Notifier {
     token: String,
     chat_id: String,
-    /// Parsed once, when the notifier is built. The API wants a number, and a
-    /// `--telegram-thread-id` that is not one is a mistake in the invocation: complaining about
-    /// it belongs to startup, not to every message that goes out afterwards.
+    /// Parsed once, when the notifier is built: a `--telegram-thread-id` that
+    /// is not a number is a mistake in the invocation, and complaining about it
+    /// belongs to startup rather than to every message.
     thread_id: Option<i64>,
 }
 
 impl Notifier {
-    /// `None` when no credentials were given. Running without a notifier is a deliberate
-    /// configuration — the report still prints and the exit code still carries the verdict — so
-    /// this is an absence, not an error.
+    /// `None` when no credentials were given: running without a notifier is a
+    /// deliberate configuration, so this is an absence, not an error.
     pub fn new(
         token: Option<&str>,
         chat_id: Option<&str>,
@@ -40,9 +38,8 @@ impl Notifier {
     }
 }
 
-/// Written by hand, and the token is not in it. A derived `Debug` would put a live bot token into
-/// whatever printed it — the same leak `without_url()` below exists to prevent, arriving by a
-/// different road.
+/// Written by hand, and the token is not in it: a derived `Debug` would put a
+/// live bot token into whatever printed it.
 impl std::fmt::Debug for Notifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Notifier")
@@ -53,10 +50,9 @@ impl std::fmt::Debug for Notifier {
     }
 }
 
-/// The topic id to post into, if one was given and it is a number.
-///
-/// An empty value is no thread at all rather than a malformed one — that is what an unset
-/// environment variable looks like by the time it reaches here.
+/// The topic to post into, if one was given and it is a number. An empty value
+/// is no thread rather than a malformed one — that is what an unset environment
+/// variable looks like by the time it arrives.
 fn parse_thread_id(thread_id: Option<&str>) -> Option<i64> {
     let thread = thread_id.map(str::trim).filter(|t| !t.is_empty())?;
     if let Ok(id) = thread.parse::<i64>() {
@@ -67,9 +63,9 @@ fn parse_thread_id(thread_id: Option<&str>) -> Option<i64> {
     }
 }
 
-/// Post a message. Returns false on any failure — a dead notifier must never break the run,
-/// but the reason is printed: the API body is where the real cause is ("chat not found",
-/// "bot was kicked", "Unauthorized" = token revoked, "group chat was upgraded to a supergroup").
+/// Post a message. False on any failure — a dead notifier must never break the
+/// run — but the reason is printed: the API body carries the real cause ("chat
+/// not found", "bot was kicked", "Unauthorized" = token revoked).
 async fn post(
     token: &str,
     chat_id: &str,
@@ -91,8 +87,9 @@ async fn post(
     {
         Ok(c) => c,
         Err(e) => {
-            // `without_url` here too: a builder error carries no URL today, but nothing about
-            // this call site guarantees that, and the URL of this client would hold the token.
+            // `without_url` here too: a builder error carries no URL today, but
+            // nothing about this call site guarantees that, and the URL of this
+            // client would hold the token.
             eprintln!("[alert] http client: {}", e.without_url());
             return false;
         }
@@ -100,20 +97,21 @@ async fn post(
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     match client.post(&url).json(&payload).send().await {
         Err(e) => {
-            // `without_url`: a reqwest error's Display appends " for url (...)", and that URL
-            // carries the bot token. Any network hiccup would otherwise print the live token to
-            // stderr — into whatever collects this tool's logs.
+            // `without_url`: a reqwest error's Display appends " for url
+            // (...)", and that URL carries the bot token. Any network hiccup
+            // would otherwise print the live token to stderr — into whatever
+            // collects this tool's logs.
             eprintln!("[alert] telegram unreachable: {}", e.without_url());
             false
         }
         Ok(resp) if !resp.status().is_success() => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            // A rate limit is the one refusal that says when to come back, and it reads as an
-            // ordinary failure unless that number is pulled out. Nothing waits for it here: this
-            // tool sends one message per run, and a failed delivery already leaves the state file
-            // untouched so the change is reported again next run — sleeping through a rate limit
-            // would hold the whole run hostage to it instead.
+            // A rate limit is the one refusal that says when to come back, and
+            // reads as an ordinary failure unless that number is pulled out.
+            // Nothing waits for it: this tool sends one message per run, and a
+            // failed delivery already leaves the state file untouched so the
+            // change is reported again next run.
             match retry_after(&body) {
                 Some(seconds) => eprintln!(
                     "[alert] telegram rate limit (HTTP {status}): \
@@ -145,8 +143,8 @@ mod tests {
 
     #[test]
     fn half_a_credential_pair_is_no_notifier() {
-        // Three call sites used to decide this independently; there is one now, so it is worth
-        // pinning that each half alone still means "not configured".
+        // Three call sites used to decide this independently; there is one now,
+        // so each half alone still meaning "not configured" is worth pinning.
         assert!(Notifier::new(Some("token"), None, None).is_none());
         assert!(Notifier::new(None, Some("chat"), None).is_none());
         assert!(Notifier::new(None, None, Some("42")).is_none());
@@ -163,7 +161,8 @@ mod tests {
         assert_eq!(thread_of(Some("42")), Some(42));
         assert_eq!(thread_of(Some(" 42 ")), Some(42));
         assert_eq!(thread_of(Some("-100123")), Some(-100_123));
-        // Neither of these is a topic to post into, and neither may reach a payload.
+        // Neither of these is a topic to post into, and neither may reach a
+        // payload.
         assert_eq!(thread_of(Some("general")), None);
         assert_eq!(thread_of(Some("")), None);
         assert_eq!(thread_of(None), None);
@@ -175,7 +174,8 @@ mod tests {
                         "description":"Too Many Requests: retry after 37",
                         "parameters":{"retry_after":37}}"#;
         assert_eq!(retry_after(body), Some(37));
-        // Every other refusal carries no such number, and must not be reported as if it did.
+        // Every other refusal carries no such number, and must not be reported
+        // as if it did.
         assert_eq!(retry_after(r#"{"ok":false,"error_code":400}"#), None);
         assert_eq!(retry_after("<html>502 Bad Gateway</html>"), None);
     }

@@ -7,11 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-/// What a check concluded, before it is given the identity that makes it a `CheckResult`.
+/// What a check concluded, before it is given the identity that makes it a
+/// `CheckResult`.
 ///
-/// Verdict and identity are kept apart so that no check ever sees a key. A key is this tool's
-/// memory across runs: one handed to the wrong check would make the old key look recovered and
-/// the new one look new, and nothing about the report would look wrong while it happened.
+/// No check ever sees a key. A key is this tool's memory across runs, and one
+/// handed to the wrong check would make the old key look recovered and the new
+/// one look new, with nothing about the report looking wrong while it happened.
 struct Verdict {
     severity: Severity,
     detail: String,
@@ -38,8 +39,7 @@ impl Verdict {
     }
 }
 
-/// Everything the node-side checks are allowed to look at, gathered once so that no check has to
-/// be handed it a piece at a time.
+/// Everything the node-side checks may look at, gathered once.
 struct HostChecks<'a> {
     node: &'a Node,
     facts: &'a HostFacts,
@@ -48,15 +48,15 @@ struct HostChecks<'a> {
     config_warn_days: u32,
 }
 
-/// One node-side check: it reads the host and answers with a verdict, never with a key.
+/// One node-side check: it reads the host and answers with a verdict, never
+/// with a key.
 type Check = fn(&HostChecks) -> Verdict;
 
 /// Every check this crate runs against a host, in report order.
 ///
-/// One list, so an unreachable host cannot report a different set of checks than a reachable one.
-/// What each one is called is not decided here: an aspect carries its own name, and every key of
-/// every check in the tool is built from one place, so nothing in this table can collide with a
-/// check that lives in another crate.
+/// One list, so an unreachable host cannot report a different set of checks
+/// than a reachable one. What each is called is not decided here: an aspect
+/// carries its own name.
 const CHECKS: [(NodeAspect, Check); 7] = [
     (NodeAspect::Containers, |h| h.containers()),
     (NodeAspect::Ports, |h| h.ports()),
@@ -85,8 +85,9 @@ pub fn check_host(
     CHECKS
         .iter()
         .map(|(aspect, check)| {
-            // An unreachable host answers every check with the one reason none of them could run,
-            // rather than with a shorter list that would read as "nothing else was wrong".
+            // An unreachable host answers every check with the one reason none
+            // of them could run, rather than with a shorter list that would
+            // read as "nothing else was wrong".
             let verdict = match &facts.unreachable_reason {
                 Some(reason) => Verdict::fail(reason.clone()),
                 None => check(&host),
@@ -118,10 +119,10 @@ fn commas(items: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
 }
 
 impl HostChecks<'_> {
-    /// The node's own external address, reported as a fact in its own right. It is also the
-    /// yardstick every channel expected to exit here is measured against, so when it is unknown
-    /// the report says so out loud: those channel verdicts are then unverified rather than
-    /// merely uninteresting.
+    /// The node's own external address, and the yardstick every channel
+    /// expected to exit here is measured against — so when it is unknown the
+    /// report says so out loud, and those channel verdicts are unverified
+    /// rather than uninteresting.
     fn egress(&self) -> Verdict {
         match self.facts.egress_address() {
             Some(ip) => Verdict::ok(format!("egress {ip}")),
@@ -133,20 +134,23 @@ impl HostChecks<'_> {
     }
 }
 
-/// The one container this tool does expect by name: without it the node runs no Xray at all.
+/// The one container this tool does expect by name: without it the node runs no
+/// Xray at all.
 const NODE_CONTAINER: &str = "remnanode";
 
-/// The only container state that is not a problem. `docker ps` also shows `restarting` and
-/// `paused` containers, and the status line of a paused one still begins with "Up".
+/// The only container state that is not a problem. `docker ps` also shows
+/// `restarting` and `paused` containers, and the status line of a paused one
+/// still begins with "Up".
 const RUNNING: &str = "running";
 
 impl HostChecks<'_> {
-    /// Any container that is not running — or is running but unhealthy — is a failure. Beyond
-    /// `remnanode` there is no expected list: the node's own container set is the expectation,
-    /// which keeps this free of configuration.
+    /// Any container that is not running — or is running but unhealthy — is a
+    /// failure. Beyond `remnanode` there is no expected list: the node's own
+    /// container set is the expectation, which keeps this free of
+    /// configuration.
     fn containers(&self) -> Verdict {
-        // `name<TAB>state`, split once and read three ways, instead of three passes each
-        // re-splitting the same output.
+        // Split once and read three ways, instead of three passes over the same
+        // output.
         let rows: Vec<(&str, &str)> = self
             .facts
             .docker_ps
@@ -161,8 +165,8 @@ impl HostChecks<'_> {
         if rows.is_empty() {
             return Verdict::fail("no containers running");
         }
-        // A node whose container set looks perfectly healthy but does not include the node
-        // container is not serving anything. Nothing else in this tool would notice on its own.
+        // A container set that looks healthy without the node container is not
+        // serving anything, and nothing else here would notice.
         let running: Vec<&str> = rows
             .iter()
             .map(|(name, _)| *name)
@@ -174,10 +178,9 @@ impl HostChecks<'_> {
                 commas(&running)
             ));
         }
-        // Which containers are unhealthy is the daemon's judgement, taken from its own filter.
-        // Reading it out of a status line would mean matching the substring "(unhealthy)" in
-        // prose written for a human — and would go on quietly matching nothing the day that
-        // prose changes.
+        // The daemon's own judgement. Reading it out of a status line would
+        // mean matching "(unhealthy)" in prose written for a human, and would
+        // go on matching nothing the day that prose changes.
         let unhealthy: BTreeSet<&str> = self
             .facts
             .unhealthy
@@ -200,12 +203,12 @@ impl HostChecks<'_> {
     }
 }
 
-/// Ports of the `ss -ltn` listeners that something outside the node can actually reach.
+/// Ports of the `ss -ltn` listeners something outside the node can reach.
 ///
-/// A listener bound to a loopback address answers only from the node itself — the local fallback
-/// web server of a Vision inbound is exactly that — so counting it would report a client-facing
-/// inbound port as healthy while nothing outside can connect to it. Matching the port number
-/// anywhere in the output did precisely that.
+/// A loopback listener answers only from the node itself — the local fallback
+/// web server of a Vision inbound is one — so counting it would report a
+/// client-facing port as healthy while nothing outside can connect. Matching
+/// the port number anywhere in the output did precisely that.
 fn public_listen_ports(ss_output: &str) -> BTreeSet<u16> {
     let mut ports = BTreeSet::new();
     for line in ss_output.lines() {
@@ -227,12 +230,11 @@ fn public_listen_ports(ss_output: &str) -> BTreeSet<u16> {
 
 /// The address and port of one `ss` local-address field.
 ///
-/// `SocketAddr` does the parsing wherever it can: it already knows `0.0.0.0:443` from `[::]:443`
-/// from `[::1]:9000`, and what it accepts is the same notion of an address the rest of this tool
-/// uses. Two shapes are left over because they are not address syntax at all: `ss` writes a
-/// wildcard as `*`, and it can append an interface scope to a link-local address. Anything else
-/// that does not parse — a resolved hostname, a truncated line — is no address, and a port this
-/// tool cannot place is not one it may call publicly reachable.
+/// `SocketAddr` parses wherever it can, and what it accepts is the same notion
+/// of an address the rest of the tool uses. Two shapes are left over because
+/// they are not address syntax: `ss` writes a wildcard as `*`, and can append
+/// an interface scope. Anything else that does not parse is no address, and a
+/// port this tool cannot place is not one it may call publicly reachable.
 fn listener(field: &str) -> Option<(IpAddr, u16)> {
     if let Ok(socket) = field.parse::<SocketAddr>() {
         return Some((socket.ip(), socket.port()));
@@ -249,7 +251,7 @@ fn listener(field: &str) -> Option<(IpAddr, u16)> {
 }
 
 impl HostChecks<'_> {
-    /// Expected ports come from the inbounds the panel says are active on this self.node.
+    /// Expected ports are the inbounds the panel says are active on this node.
     fn ports(&self) -> Verdict {
         if self.node.inbound_ports.is_empty() {
             return Verdict::ok("no inbound ports declared by the panel");
@@ -270,8 +272,8 @@ impl HostChecks<'_> {
     }
 }
 
-/// Smallest `has N users` count the node logged, or `None` when it logged no such line. Only the
-/// minimum is ever wanted: one inbound with no users is the failure worth reporting.
+/// Smallest `has N users` count the node logged. Only the minimum is wanted:
+/// one inbound with no users is the failure worth reporting.
 fn min_user_count(logs: &str) -> Option<u64> {
     logs.lines()
         .filter_map(|line| {
@@ -294,14 +296,15 @@ impl HostChecks<'_> {
     }
 }
 
-/// Timestamp of the last config push the node logged. A node quietly sitting on a stale config
-/// looks healthy from the panel while its cascade outbounds carry dead credentials.
+/// Timestamp of the last config push the node logged. A node sitting on a stale
+/// config looks healthy from the panel while its cascade outbounds carry dead
+/// credentials.
 fn last_config_push(logs: &str) -> Option<DateTime<Utc>> {
     logs.lines()
         .filter(|l| l.contains(" has ") && l.contains("users"))
         .filter_map(|l| {
-            // Borrowed, not collected: the prefix is a fixed-length ASCII timestamp, and this
-            // runs for every one of up to 200 log lines.
+            // Borrowed, not collected: this runs for every one of up to 200 log
+            // lines.
             let stamp = l.get(..19)?;
             NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%S")
                 .or_else(|_| {
@@ -335,8 +338,8 @@ impl HostChecks<'_> {
 
 impl HostChecks<'_> {
     fn cert(&self) -> Verdict {
-        // No TLS endpoint to ask (the node's address is a bare IP) and an endpoint that answered
-        // with nothing are different situations: the first is nothing to report, the second is a
+        // No endpoint to ask and an endpoint that answered with nothing are
+        // different: the first is nothing to report, the second is a
         // certificate this tool looked at and could not read.
         let Some(probed) = self.facts.cert.as_deref() else {
             return Verdict::ok("no TLS endpoint known for this node");
@@ -366,16 +369,17 @@ impl HostChecks<'_> {
     }
 }
 
-/// One acme.sh certificate as its `.conf` describes it, before the renewal time is known to be
-/// readable.
+/// One acme.sh certificate as its `.conf` describes it, before the renewal time
+/// is known to be readable.
 #[derive(Debug, Default, Clone)]
 struct RenewalEntry {
     webroot: Option<String>,
     due: Option<DateTime<Utc>>,
 }
 
-/// A certificate whose next renewal time did parse. Splitting these out of `RenewalEntry` is what
-/// keeps the checks below free of "this one has a due date, honest" assertions.
+/// A certificate whose next renewal time did parse. Splitting these out of
+/// `RenewalEntry` keeps the checks below free of "this one has a due date,
+/// honest" assertions.
 #[derive(Debug, Clone)]
 struct DueCert {
     domain: Option<String>,
@@ -384,13 +388,14 @@ struct DueCert {
 }
 
 impl DueCert {
-    /// http-01 needs port 80; with DNS-01 (`Le_Webroot='dns*'`) the port is irrelevant.
+    /// http-01 needs port 80; with DNS-01 (`Le_Webroot='dns*'`) the port is
+    /// irrelevant.
     fn needs_port_80(&self) -> bool {
         !self.webroot.as_deref().unwrap_or("").starts_with("dns")
     }
 }
 
-/// How a certificate whose acme.sh path carried no domain has always been named in an alert.
+/// How a certificate whose acme.sh path carried no domain is named in an alert.
 const UNKNOWN_DOMAIN: &str = "?";
 
 fn domain_label(domain: Option<&str>) -> &str {
@@ -404,14 +409,17 @@ fn quoted_value(line: &str, key: &str) -> Option<String> {
     Some(line[start..].chars().take_while(|c| *c != '\'').collect())
 }
 
-/// Lines look like `/root/.acme.sh/<domain>/<file>.conf:Le_NextRenewTimeStr='2026-09-20T10:00:00Z'`.
-/// The domain comes from the directory: a host can hold several certificates and the alert must
-/// name which one stalled. A line whose path carries no domain — `grep` without `-H`, say — has
-/// no domain at all, which is `None` rather than a name that reads like one.
+/// Lines look like
+/// `/root/.acme.sh/<domain>/<file>.conf:Le_NextRenewTimeStr='...'`.
 ///
-/// Entries whose renewal time didn't parse are kept, with `due: None`, rather than dropped here.
-/// A domain with `Le_*` lines but no readable timestamp is a broken acme.sh config — a signal in
-/// its own right — and the caller must be able to tell that apart from no config existing at all.
+/// The domain comes from the directory: a host can hold several certificates
+/// and the alert must name which one stalled. A path carrying no domain —
+/// `grep` without `-H` — has none, which is `None` rather than a name that
+/// reads like one.
+///
+/// Entries whose renewal time did not parse are kept with `due: None`: `Le_*`
+/// lines without a readable timestamp are a broken acme.sh config, which the
+/// caller must tell apart from no config at all.
 fn parse_renewal(text: &str) -> BTreeMap<Option<String>, RenewalEntry> {
     let mut found: BTreeMap<Option<String>, RenewalEntry> = BTreeMap::new();
     for line in text.lines() {
@@ -437,9 +445,9 @@ fn parse_renewal(text: &str) -> BTreeMap<Option<String>, RenewalEntry> {
 }
 
 impl HostChecks<'_> {
-    /// Health of the renewal *mechanism*, not of the certificate's remaining days.
-    /// This is what catches a broken renewal at the first silent failure — roughly two months
-    /// before the expiry check would notice.
+    /// Health of the renewal *mechanism*, not of the certificate's remaining
+    /// days. This is what catches a broken renewal at the first silent failure
+    /// — roughly two months before the expiry check would notice.
     fn renewal(&self) -> Verdict {
         const GRACE_DAYS: i64 = 1;
         let all = parse_renewal(&self.facts.renewal);
@@ -447,8 +455,7 @@ impl HostChecks<'_> {
             return Verdict::ok("no acme.sh config (managed elsewhere)");
         }
 
-        // Sorted once into the two kinds there are, so nothing below has to re-derive which is
-        // which.
+        // Sorted once into the two kinds there are.
         let mut certs: Vec<DueCert> = Vec::new();
         let mut unreadable: Vec<Option<String>> = Vec::new();
         for (domain, entry) in all {
@@ -462,8 +469,8 @@ impl HostChecks<'_> {
             }
         }
 
-        // `Le_*` lines exist but no domain's renewal time parsed: the acme.sh config itself is
-        // broken, which is a signal, not a reason to stay quiet.
+        // `Le_*` lines but no readable renewal time: the acme.sh config itself
+        // is broken, which is a signal, not a reason to stay quiet.
         let Some(soonest) = certs.iter().min_by_key(|c| c.due) else {
             return Verdict::warn(format!(
                 "acme.sh config found but its renewal time could not be read: {}",
@@ -564,9 +571,9 @@ mod tests {
 
     #[test]
     fn every_check_reports_under_its_own_key_reachable_or_not() {
-        // The suffixes are the tool's memory across runs: renaming one makes the old key look
-        // recovered and the new one look new, in the report and in the Telegram diff alike. A
-        // check never sees its key, so this is the only place the pairing can be got wrong.
+        // The suffixes are the tool's memory across runs, and a check never
+        // sees its key — so this is the only place the pairing can be got
+        // wrong.
         let expected = [
             "node:beta:containers",
             "node:beta:ports",
@@ -630,10 +637,10 @@ mod tests {
 
     #[test]
     fn a_container_that_is_not_running_fails() {
-        // `docker ps` lists a container that keeps dying as `restarting`, and one an operator
-        // stopped mid-debugging as `paused`. The paused case is why the state is read instead of
-        // the status line: that line reads "Up 5 days (Paused)", and anything keyed on "Up"
-        // called it healthy.
+        // A container that keeps dying is `restarting`; one stopped
+        // mid-debugging is `paused`. The paused case is why the state is read
+        // instead of the status line, which says "Up 5 days (Paused)" —
+        // anything keyed on "Up" called it healthy.
         for state in ["restarting", "paused"] {
             let mut facts = healthy_facts();
             facts.docker_ps = format!("remnanode\trunning\ncaddy\t{state}\n");
@@ -710,11 +717,12 @@ mod tests {
 
     #[test]
     fn a_scoped_link_local_listener_is_still_read() {
-        // `fe80::1%eth0` is not address syntax `std` accepts, and dropping the line would have
-        // hidden a listening port rather than reported one.
+        // `fe80::1%eth0` is not syntax `std` accepts, and dropping the line
+        // would hide a listening port rather than report one.
         let listening = "LISTEN 0 4096 [fe80::1%eth0]:9100 [::]:*\n";
         assert!(public_listen_ports(listening).contains(&9100));
-        // A name is not an address: nothing here may call such a port publicly reachable.
+        // A name is not an address: nothing here may call such a port publicly
+        // reachable.
         assert!(public_listen_ports("LISTEN 0 4096 localhost:9100 [::]:*\n")
             .is_empty());
     }
@@ -882,9 +890,9 @@ mod tests {
     #[test]
     fn a_tls_endpoint_that_answered_with_nothing_is_not_the_same_as_having_none(
     ) {
-        // The node has a name, so its certificate was asked for and the answer was empty — the
-        // endpoint is down, or openssl said nothing. That is a certificate this tool looked at
-        // and could not read, not a node with no TLS at all.
+        // The node has a name, so the certificate was asked for and the answer
+        // was empty: one this tool looked at and could not read, not a node
+        // with no TLS.
         let mut facts = healthy_facts();
         facts.cert = Some(String::new());
         let r = check_host(&node(), &facts, now(), 14, 7);

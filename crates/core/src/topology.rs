@@ -12,8 +12,8 @@ pub enum ResolveError {
         inbound_tag: String,
         profile_uuid: String,
     },
-    // The candidates stay a list: joining them into a string at construction time would leave a
-    // caller wanting to name them no way to get them back out.
+    // A list, not a joined string: a caller wanting to name them could not get
+    // them back out.
     #[error("inbound '{inbound_tag}' runs on several nodes ({}) and none has address {address}", candidates.join(", "))]
     AmbiguousEntryNode {
         inbound_tag: String,
@@ -59,11 +59,12 @@ pub enum ResolveError {
     TooDeep { max: usize },
 }
 
-/// The ways a matched routing rule can pick an outbound that this tool cannot follow. Both
+/// The ways a matched rule can pick an outbound this tool cannot follow. Both
 /// spellings are part of `UnsupportedRule`'s message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedSelector {
-    /// The rule routes through a balancer, so the outbound depends on runtime state.
+    /// The rule routes through a balancer, so the outbound depends on runtime
+    /// state.
     BalancerTag,
     /// The rule names no outbound at all.
     NoOutboundTag,
@@ -78,16 +79,16 @@ impl std::fmt::Display for UnsupportedSelector {
     }
 }
 
-/// What an outbound does with the traffic that reaches it. The JSON keeps its protocol strings;
-/// this is the one place that turns them into a decision, so a new protocol is classified once.
+/// What an outbound does with the traffic that reaches it. The one place
+/// protocol strings turn into a decision, so a new protocol is classified once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutboundKind {
     /// Leaves through the node's own address: the chain ends at this node.
     NodeEgress,
     /// Traffic is dropped.
     Blackhole,
-    /// Ends the chain without going out through the node's own address (wireguard such as WARP,
-    /// dns, loopback) — the expected exit IP is not derivable from the topology.
+    /// Ends the chain elsewhere than the node's own address (wireguard such as
+    /// WARP, dns, loopback): the exit IP is not derivable from the topology.
     OpaqueTerminal,
     /// Forwards to another hop, whose address the outbound carries.
     Proxy,
@@ -110,23 +111,23 @@ struct Destination {
     port: u16,
 }
 
-/// How an outbound with no `tag` appears in an error message. Only ever used for reading: the
-/// resolver itself keeps the absence as an `Option`.
+/// How an outbound with no `tag` appears in an error message. The resolver
+/// itself keeps the absence as an `Option`.
 const UNTAGGED: &str = "<untagged>";
 
 /// One config profile's Xray configuration, as the resolver reads it.
 ///
-/// A newtype over the raw JSON rather than a deserialised struct: a profile is an arbitrary Xray
-/// configuration, only four paths of it are ever read here, and a schema would break on
-/// everything else it legitimately contains. What the newtype buys is that a profile config, an
-/// outbound and a routing rule stop being the same type — handing one to something that meant
-/// another no longer compiles — and that every `get("...")` lives here rather than in the middle
-/// of the resolution logic.
+/// A newtype over the raw JSON rather than a deserialised struct: a profile is
+/// an arbitrary Xray configuration and a schema would break on everything else
+/// it legitimately contains. What the newtype buys is that a profile config, an
+/// outbound and a rule stop being the same type, and that every `get("...")`
+/// lives here rather than in the middle of the resolution.
 #[derive(Clone, Copy)]
 struct Config<'a>(&'a Value);
 
 impl<'a> Config<'a> {
-    /// Outbounds in declaration order, or `None` when the profile declares none at all.
+    /// Outbounds in declaration order, or `None` when the profile declares none
+    /// at all.
     fn outbounds(self) -> Option<&'a [Value]> {
         self.0
             .get("outbounds")
@@ -182,17 +183,18 @@ impl<'a> Config<'a> {
     }
 }
 
-/// Where a config routes an inbound's traffic — the three cases that must not be conflated.
+/// Where a config routes an inbound's traffic — three cases that must not be
+/// conflated.
 ///
-/// A rule that matched but names no outbound (it selects by `balancerTag`, say) is a different
-/// thing from no rule matching at all. Reading both as "no tag" would silently fall back to the
-/// first outbound and report a wrong exit instead of failing loudly, which is why the difference
-/// is a variant here rather than a `None` two call sites away.
+/// A rule that matched but names no outbound (it selects by `balancerTag`, say)
+/// is not the same as no rule matching. Reading both as "no tag" would fall
+/// back to the first outbound and report a wrong exit instead of failing
+/// loudly.
 enum Routed<'a> {
     /// A rule matched and named this outbound.
     Tag(&'a str),
-    /// No rule matched. Xray sends such traffic into the first outbound of the list, and
-    /// mirroring that is what keeps rule-less exit profiles working.
+    /// No rule matched. Xray sends such traffic into the first outbound, and
+    /// mirroring that keeps rule-less exit profiles working.
     FirstOutbound,
     /// A rule matched but picks its outbound in a way this tool cannot follow.
     Unsupported(UnsupportedSelector),
@@ -203,8 +205,8 @@ enum Routed<'a> {
 struct Outbound<'a>(&'a Value);
 
 impl<'a> Outbound<'a> {
-    /// How this outbound appears in an error message, and only there: the happy path never needs
-    /// a tag, and an outbound without one is an absence rather than the literal "<untagged>".
+    /// How this outbound appears in an error message, and only there: an
+    /// outbound without a tag is an absence, not the literal "<untagged>".
     fn name(self) -> String {
         self.0
             .get("tag")
@@ -224,8 +226,8 @@ impl<'a> Outbound<'a> {
         OutboundKind::from_protocol(self.protocol())
     }
 
-    /// Destination of a proxying outbound: vless uses `vnext`, trojan and shadowsocks use
-    /// `servers`.
+    /// Destination of a proxying outbound: vless uses `vnext`, trojan and
+    /// shadowsocks use `servers`.
     fn destination(self) -> Option<Destination> {
         let settings = self.0.get("settings")?;
         let first = settings
@@ -252,10 +254,10 @@ fn rule_matches(rule: &Value, inbound_tag: &str) -> bool {
         })
 }
 
-/// Follows one snapshot's routing to the node a channel actually leaves through.
+/// Follows one snapshot's routing to the node a channel leaves through.
 ///
-/// The snapshot is held rather than passed along: every step of a cascade needs it, and threading
-/// it through each of them made it an argument of everything here.
+/// The snapshot is held rather than passed along: every step of a cascade needs
+/// it, and threading it through made it an argument of everything here.
 #[derive(Debug, Clone, Copy)]
 pub struct Resolver<'a> {
     snapshot: &'a Snapshot,
@@ -268,15 +270,16 @@ impl<'a> Resolver<'a> {
 
     /// The node this channel is declared to exit through.
     ///
-    /// The node itself, not its name: what the caller does with it — is it disabled, what is its
-    /// egress address — are questions about a node, and answering them by matching names would
-    /// mean a second list keyed by the same strings.
+    /// The node itself, not its name: what the caller does with it — is it
+    /// disabled, what is its egress address — are questions about a node, and
+    /// answering them by matching names would mean a second list keyed by the
+    /// same strings.
     pub fn exit_of(self, channel: &Channel) -> Result<&'a Node, ResolveError> {
         let nodes = &self.snapshot.nodes;
         let mut node = self.entry_node(channel)?;
         let mut inbound_tag = channel.inbound_tag.clone();
-        // The name is borrowed from the snapshot the resolver already holds: a hop does not have
-        // to be copied to be remembered.
+        // Borrowed from the snapshot the resolver holds: a hop need not be
+        // copied to be remembered.
         let mut visited: HashSet<(&'a str, String)> = HashSet::new();
 
         for _ in 0..MAX_HOPS {
@@ -353,7 +356,8 @@ impl<'a> Resolver<'a> {
                 profile_uuid: profile_uuid.to_string(),
             }),
             [only] => Ok(only),
-            // Several nodes share the profile and the inbound; the channel address decides.
+            // Several nodes share the profile and the inbound; the channel
+            // address decides.
             several => several
                 .iter()
                 .copied()
@@ -391,9 +395,10 @@ fn outbound_for<'a>(
     inbound_tag: &str,
     node: &Node,
 ) -> Result<Outbound<'a>, ResolveError> {
-    // profile_uuid is expected to be Some here (`config_of` already required it to resolve this
-    // config), but the fallback keeps the label legible instead of panicking, and spells out what
-    // it actually contains so an incident read never mistakes a node name for a UUID.
+    // `config_of` already required a profile uuid to resolve this config, but
+    // the fallback keeps the label legible instead of panicking, and spells out
+    // what it contains so an incident read never mistakes a node name for a
+    // UUID.
     let profile_label = node.profile_uuid.clone().unwrap_or_else(|| {
         format!("<node '{}' has no profile uuid>", node.name)
     });
@@ -444,8 +449,8 @@ mod tests {
         }
     }
 
-    /// Profile whose only outbound is freedom and which declares no routing rules —
-    /// the shape of a plain exit node.
+    /// Profile whose only outbound is freedom and which declares no routing
+    /// rules — the shape of a plain exit node.
     fn exit_profile(uuid: &str, inbound_tag: &str, port: u16) -> Profile {
         Profile {
             uuid: uuid.into(),
@@ -457,7 +462,8 @@ mod tests {
         }
     }
 
-    /// Profile that routes its inbound into a vless outbound aimed at another node.
+    /// Profile that routes its inbound into a vless outbound aimed at another
+    /// node.
     fn bridge_profile(
         uuid: &str,
         inbound_tag: &str,
@@ -523,8 +529,8 @@ mod tests {
 
     #[test]
     fn channel_without_a_profile_fails_loudly_instead_of_resolving() {
-        // A host can be unattached to any config profile (legacy host, deleted profile) — this
-        // is a legitimate panel state, and such a channel cannot be resolved, not silently OK'd.
+        // A host unattached to any config profile is a legitimate panel state,
+        // and such a channel cannot be resolved, not silently OK'd.
         let snap = snapshot(
             vec![node("beta", "192.0.2.20", "p-exit", &["in-exit"])],
             vec![exit_profile("p-exit", "in-exit", 443)],

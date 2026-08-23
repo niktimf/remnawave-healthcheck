@@ -68,19 +68,19 @@ impl PanelClient {
     }
 }
 
-/// Whether a request carries the API token. The rendered subscription is the one endpoint fetched
-/// without it — that is what a client does, and the point is to see exactly what a client gets.
+/// Whether a request carries the API token. The rendered subscription is the
+/// one endpoint fetched without it: the point is to see what a client gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Auth {
     WithToken,
     Anonymous,
 }
 
-/// The monitoring user's `shortUuid` is the last path segment of the subscription URL.
+/// The `shortUuid` is the last path segment of the subscription URL.
 pub fn short_uuid_from_url(url: &str) -> Option<&str> {
     let without_query = url.split('?').next()?;
-    // Only look inside the path, not the host: `sub.example.com` in `https://sub.example.com/`
-    // must not be mistaken for a path segment.
+    // Only inside the path: the host of `https://sub.example.com/` must not be
+    // mistaken for a path segment.
     let after_scheme =
         without_query.split("://").nth(1).unwrap_or(without_query);
     let (_host, path) = after_scheme.split_once('/')?;

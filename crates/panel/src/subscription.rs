@@ -10,20 +10,20 @@ fn is_proxy(outbound: &Value) -> bool {
     )
 }
 
-/// One config the subscription rendered: its remark and the first proxy outbound in it.
+/// One config the subscription rendered: its remark and the first proxy
+/// outbound in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedConfig {
-    /// The only thing that joins a served config to the channel the panel resolved
-    /// (see `map::build_snapshot`).
+    /// The only thing that joins a served config to a resolved channel.
     pub remark: String,
     /// Handed to the probe verbatim.
     pub outbound: Value,
 }
 
-/// The remark is mandatory, because the remark is the only thing that joins a served config to
-/// the channel the panel resolved. A config without one cannot be attributed to a channel, and
-/// guessing — keying by an outbound's `tag`, say — would attach some other channel's outbound to
-/// it and probe a channel with evidence that is not its own.
+/// The remark is mandatory: it is the only thing that joins a served config to
+/// the channel the panel resolved. Guessing — keying by an outbound's `tag`,
+/// say — would attach another channel's outbound and probe a channel with
+/// evidence that is not its own.
 fn config_entry(config: &Value) -> Option<RenderedConfig> {
     let remark = config.get("remarks").and_then(Value::as_str)?.to_string();
     let outbound = config
@@ -37,15 +37,16 @@ fn config_entry(config: &Value) -> Option<RenderedConfig> {
     })
 }
 
-/// Ready-made client outbounds keyed by their remark, taken from the panel's JSON subscription.
+/// Ready-made client outbounds keyed by their remark, from the panel's JSON
+/// subscription.
 ///
-/// The panel serves an array of per-host configs, each with `remarks` and its own `outbounds`; a
-/// subscription rendering a single host may come as that one config on its own rather than
-/// wrapped in an array, so both shapes are accepted.
+/// The panel serves an array of per-host configs, each with `remarks` and its
+/// own `outbounds`; a single-host subscription may come as that one config
+/// rather than wrapped in an array, so both shapes are accepted.
 ///
-/// Anything else yields nothing rather than a guess: `subscription:coverage` then reports every
-/// resolved channel as not served, which is loud and points straight at the subscription — far
-/// better than silently pairing channels with the wrong outbounds.
+/// Anything else yields nothing rather than a guess: `subscription:coverage`
+/// then reports every resolved channel as not served, which points straight at
+/// the subscription instead of silently pairing channels with wrong outbounds.
 pub fn parse(raw: &str) -> anyhow::Result<Vec<RenderedConfig>> {
     let value: Value = serde_json::from_str(raw)?;
 
@@ -96,8 +97,9 @@ mod tests {
 
     #[test]
     fn a_config_without_a_remark_yields_nothing_instead_of_a_guess() {
-        // Outbound tags are not remarks: keying by them could only produce channels paired with
-        // some other channel's outbound. Yielding nothing makes subscription:coverage report it.
+        // Outbound tags are not remarks: keying by them could only produce
+        // channels paired with some other channel's outbound. Yielding nothing
+        // makes subscription:coverage report it.
         let raw = json!({
             "outbounds": [
                 {"protocol": "vless", "tag": "alpha direct"},

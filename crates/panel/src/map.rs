@@ -6,17 +6,18 @@ use std::collections::HashMap;
 
 /// Joins the three panel views into one snapshot.
 ///
-/// Channels keep every config the panel resolved, even when the rendered subscription did not
-/// serve it — `served_remarks` carries what the subscription did serve, duplicates included, so
-/// `subscription:coverage` can compare the two sets instead of the gap disappearing.
+/// Channels keep every config the panel resolved, even when the rendered
+/// subscription did not serve it — `served_remarks` carries what the
+/// subscription did serve, duplicates included, so `subscription:coverage` can
+/// compare the two sets instead of the gap disappearing.
 pub fn build_snapshot(
     nodes: &[NodeDto],
     profiles: Vec<ProfileDto>,
     resolved: Vec<ResolvedDto>,
     rendered: Vec<RenderedConfig>,
 ) -> Snapshot {
-    // Recorded before the map collapses duplicates: a remark served twice is exactly what the
-    // coverage check needs to see, and the map would hide it.
+    // Recorded before the map collapses duplicates: a remark served twice is
+    // exactly what the coverage check needs to see, and the map would hide it.
     let served_remarks: Vec<String> =
         rendered.iter().map(|c| c.remark.clone()).collect();
     let served: HashMap<String, Value> = rendered
@@ -102,12 +103,12 @@ mod tests {
     #[test]
     fn snapshot_joins_resolved_configs_with_subscription_outbounds() {
         let nodes = vec![];
-        let profiles = vec![crate::dto::ProfileDto {
+        let profiles = vec![ProfileDto {
             uuid: "p-1".into(),
             name: "main".into(),
             config: json!({"outbounds": [{"tag": "direct", "protocol": "freedom"}]}),
         }];
-        let resolved = vec![crate::dto::ResolvedDto {
+        let resolved = vec![ResolvedDto {
             final_remark: "alpha direct".into(),
             address: "alpha.example.com".into(),
             port: 443,
@@ -132,9 +133,10 @@ mod tests {
 
     #[test]
     fn unmatched_resolved_config_keeps_the_channel_but_drops_its_outbound() {
-        // The subscription served fewer channels than the panel resolved — subscription:coverage
-        // is what reports this, so the counts must stay honest here.
-        let resolved = vec![crate::dto::ResolvedDto {
+        // The subscription served fewer channels than the panel resolved —
+        // subscription:coverage is what reports this, so the counts must stay
+        // honest here.
+        let resolved = vec![ResolvedDto {
             final_remark: "alpha direct".into(),
             address: "alpha.example.com".into(),
             port: 443,

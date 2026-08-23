@@ -2,8 +2,9 @@ use clap::Parser;
 use remnawave_healthcheck_core::model::EchoUrl;
 use std::path::PathBuf;
 
-/// Health checker for a Remnawave installation. Keeps no inventory of its own: nodes, channels,
-/// expected exits and the required Xray version all come from the panel.
+/// Health checker for a Remnawave installation. Keeps no inventory of its own:
+/// nodes, channels, expected exits and the required Xray version all come from
+/// the panel.
 #[derive(Debug, Parser)]
 #[command(name = "remnawave-healthcheck", version)]
 pub struct Args {
@@ -15,7 +16,8 @@ pub struct Args {
     #[arg(long, env = "REMNAWAVE_API_TOKEN")]
     pub api_token: String,
 
-    /// Subscription URL of the monitoring user; its last path segment is the shortUuid
+    /// Subscription URL of the monitoring user; its last path segment is the
+    /// shortUuid
     #[arg(long, env = "REMNAWAVE_SUBSCRIPTION_URL")]
     pub subscription_url: String,
 
@@ -35,8 +37,7 @@ pub struct Args {
     #[arg(long, default_value = ".xray-cache")]
     pub xray_cache: PathBuf,
 
-    /// Warn this many days before a certificate expires. Not signed: a negative number would
-    /// have meant "warn about everything, always", which clap now refuses at the flag itself.
+    /// Warn this many days before a certificate expires
     #[arg(long, default_value_t = 14)]
     pub cert_warn_days: u32,
     /// Warn when the node last took a config this many days ago.
@@ -60,11 +61,9 @@ pub struct Args {
     /// First local SOCKS port; each channel gets the next one
     #[arg(long, default_value_t = 10800)]
     pub socks_base_port: u16,
-    /// Endpoint that echoes back the caller's IP address; used both through each channel's tunnel
-    /// and on the node itself, so that both sides of an exit comparison ask the same service
-    /// Parsed, not merely read: this value is quoted into a shell command line on every node,
-    /// and `EchoUrl` is where a URL that could break out of that quoting is refused — by clap,
-    /// before a run exists.
+    /// Endpoint that echoes back the caller's IP address. Asked through each
+    /// channel's tunnel and on the node itself, so both sides of an exit
+    /// comparison ask the same service.
     #[arg(long, default_value = "https://api.ipify.org")]
     pub echo_url: EchoUrl,
 }

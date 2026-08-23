@@ -2,8 +2,8 @@ use serde_json::{json, Value};
 
 /// Wrap a ready-made subscription outbound into a runnable Xray config.
 ///
-/// The outbound is copied verbatim: this tool checks what the panel handed the client, so
-/// re-deriving transport settings here would defeat the whole point.
+/// The outbound is copied verbatim: this tool checks what the panel handed the
+/// client, so re-deriving transport settings here would defeat the whole point.
 pub fn build(outbound: &Value, socks_port: u16) -> Value {
     json!({
         "log": {"loglevel": "warning"},

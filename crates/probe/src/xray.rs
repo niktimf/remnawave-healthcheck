@@ -6,15 +6,17 @@ fn release_url(version: &str) -> String {
     format!("https://github.com/XTLS/Xray-core/releases/download/v{version}/Xray-linux-64.zip")
 }
 
-/// Path to an Xray binary of exactly `version`, downloading and caching it when missing.
+/// Path to an Xray binary of exactly `version`, downloading and caching it when
+/// missing.
 ///
-/// The cache entry appears only once it is complete: the download is unpacked next to it under a
-/// temporary name and renamed into place afterwards. A process killed halfway through — a CI job
-/// hitting its time limit is the realistic case — would otherwise leave a truncated file that the
-/// next run accepts on sight, and every channel would then fail against a binary that cannot run.
+/// The cache entry appears only once it is complete: the download is unpacked
+/// under a temporary name and renamed into place. A process killed halfway — a
+/// CI job hitting its time limit — would otherwise leave a truncated file that
+/// the next run accepts on sight.
 pub async fn ensure(version: &str, cache_dir: &Path) -> Result<PathBuf> {
-    // The directory first, the binary from it: asking a path built here for its parent could only
-    // be answered with an `expect` for a case that cannot happen.
+    // The directory first, the binary from it: asking a path built here for its
+    // parent could only be answered with an `expect` for a case that cannot
+    // happen.
     let dir = cache_dir.join(version);
     let binary = dir.join("xray");
     if binary.exists() {
@@ -41,11 +43,13 @@ async fn download_into(version: &str, dir: &Path) -> Result<()> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let target = dir.join("xray");
-        // Same directory, so the rename below stays within one filesystem and is atomic. The pid
-        // keeps two runs of the tool from unpacking over each other's partial file.
+        // Same directory, so the rename below stays on one filesystem and is
+        // atomic. The pid keeps two runs from unpacking over each other's
+        // partial file.
         let partial = dir.join(format!("xray.{}.partial", std::process::id()));
-        // A half-written file is worse than none: the next run would rename it into place and
-        // every channel would fail against a binary that cannot run.
+        // A half-written file is worse than none: the next run would rename it
+        // into place and every channel would fail against a binary that cannot
+        // run.
         unpack_into(bytes, &partial).inspect_err(|_| {
             let _ = std::fs::remove_file(&partial);
         })?;
@@ -58,7 +62,8 @@ async fn download_into(version: &str, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unpack the `xray` entry of the release archive to `target` and make it executable.
+/// Unpack the `xray` entry of the release archive to `target` and make it
+/// executable.
 fn unpack_into(bytes: impl AsRef<[u8]>, target: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     let mut entry = archive

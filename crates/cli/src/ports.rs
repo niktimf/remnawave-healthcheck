@@ -1,15 +1,13 @@
 use anyhow::{ensure, Result};
 use std::num::NonZeroU16;
 
-/// The local SOCKS ports one batch of channel probes may use: a base port and a count, proven
-/// when this is built to fit under the last TCP port.
+/// The local SOCKS ports one batch may use: a base and a count, proven here to
+/// fit under the last TCP port.
 ///
-/// The proof has to live in a value, not in a check somewhere earlier. Two channels handed the
-/// same port would have the second xray fail to bind, and that channel would be reported as "no
-/// exit (tunnel dead)" — pointing the reader at the tunnel instead of at the flags that clash.
-/// Since a port can only be had by asking this type for one, nothing downstream has to re-derive
-/// whether `base + n` is still a port, and nothing has to fall back to saturating arithmetic that
-/// would hand out a duplicate rather than admit the sum did not fit.
+/// The proof lives in the value rather than in a check somewhere earlier. Two
+/// channels handed the same port would have the second xray fail to bind, and
+/// that channel would be reported as "no exit (tunnel dead)" — pointing the
+/// reader at the tunnel instead of at the flags that clash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SocksPorts {
     base: u16,
@@ -17,10 +15,10 @@ pub struct SocksPorts {
 }
 
 impl SocksPorts {
-    /// The one place a bad combination of `--socks-base-port` and `--concurrency` is refused.
+    /// The one place a bad base-port / concurrency pair is refused.
     ///
-    /// Zero is not an answer to "how many channels at once": the smallest batch there is holds
-    /// one, and a run that probes nothing is not what the flag asks for.
+    /// Zero is not an answer to "how many at once": the smallest batch holds
+    /// one.
     pub fn new(base: u16, concurrency: usize) -> Result<Self> {
         let count = u16::try_from(concurrency.max(1))
             .ok()
@@ -30,7 +28,7 @@ impl SocksPorts {
                     "--concurrency {concurrency} asks for more channels at once than there are ports"
                 )
             })?;
-        // Both operands are `u16`, so this sum cannot overflow a `u32` and needs no saturating.
+        // Both operands are `u16`, so this cannot overflow a `u32`.
         let highest = u32::from(base) + u32::from(count.get()) - 1;
         ensure!(
             u16::try_from(highest).is_ok(),
@@ -44,8 +42,8 @@ impl SocksPorts {
         usize::from(self.count.get())
     }
 
-    /// One port per slot in a batch, in order. Zipping a batch against this cannot run out of
-    /// either side: the batch is cut to `concurrency()`, which is how many ports there are.
+    /// One port per slot, in order. Zipping a batch against this cannot run out
+    /// of either side: the batch is cut to `concurrency()`.
     pub fn iter(self) -> impl Iterator<Item = u16> {
         let (base, count) = (self.base, self.count.get());
         (0..count).map(move |offset| base + offset)
