@@ -13,7 +13,13 @@ pub struct HostFacts {
     /// Why SSH failed, or `None` when the host answered. This is also what "reachable" means:
     /// one field, so the reason and the verdict cannot drift apart.
     pub unreachable_reason: Option<String>,
+    /// `docker ps` as `name<TAB>state`, where the state is the daemon's own machine value
+    /// (`running`, `restarting`, `paused`) rather than the human "Up 5 days" line.
     pub docker_ps: String,
+    /// Names of the containers the daemon itself considers unhealthy, one per line. Asked for
+    /// separately because a container's health is not one of the fields `docker ps` can format
+    /// on any version this tool can expect to meet: only the daemon's own filter knows.
+    pub unhealthy: String,
     pub listening: String,
     pub node_logs: String,
     /// Output of the TLS probe, or `None` when this node has no name to probe (its address is a
@@ -159,8 +165,9 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
         format!("echo | openssl s_client -connect {d}:443 -servername {d} 2>/dev/null | openssl x509 -noout -enddate")
     });
 
-    let (docker_ps, listening, node_logs, renewal, egress_ip) = tokio::join!(
-        run(&session, "sudo docker ps --format '{{.Names}}\\t{{.Status}}' 2>/dev/null || docker ps --format '{{.Names}}\\t{{.Status}}'"),
+    let (docker_ps, unhealthy, listening, node_logs, renewal, egress_ip) = tokio::join!(
+        run(&session, "sudo docker ps --format '{{.Names}}\\t{{.State}}' 2>/dev/null || docker ps --format '{{.Names}}\\t{{.State}}'"),
+        run(&session, "sudo docker ps --filter health=unhealthy --format '{{.Names}}' 2>/dev/null || docker ps --filter health=unhealthy --format '{{.Names}}'"),
         run(&session, "sudo ss -ltn 2>/dev/null || ss -ltn"),
         run(&session, "sudo docker logs --tail 200 remnanode 2>&1 || docker logs --tail 200 remnanode"),
         run(&session, RENEWAL_CMD),
@@ -181,6 +188,7 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
     HostFacts {
         unreachable_reason: None,
         docker_ps: docker_ps.text(),
+        unhealthy: unhealthy.text(),
         listening: listening.text(),
         node_logs: node_logs.text(),
         cert,

@@ -4,6 +4,7 @@ use remnawave_healthcheck_core::model::{CheckResult, Node, Severity};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// What a check concluded, before it is given the identity that makes it a `CheckResult`.
 ///
@@ -129,21 +130,25 @@ impl HostChecks<'_> {
 /// The one container this tool does expect by name: without it the node runs no Xray at all.
 const NODE_CONTAINER: &str = "remnanode";
 
+/// The only container state that is not a problem. `docker ps` also shows `restarting` and
+/// `paused` containers, and the status line of a paused one still begins with "Up".
+const RUNNING: &str = "running";
+
 impl HostChecks<'_> {
-    /// Any container that is not up — or is up but unhealthy — is a failure. Beyond `remnanode`
-    /// there is no expected list: the node's own container set is the expectation, which keeps
-    /// this free of configuration.
+    /// Any container that is not running — or is running but unhealthy — is a failure. Beyond
+    /// `remnanode` there is no expected list: the node's own container set is the expectation,
+    /// which keeps this free of configuration.
     fn containers(&self) -> Verdict {
-        // `docker ps --format '{{.Names}}\t{{.Status}}'`, split once and read three ways,
-        // instead of three passes each re-splitting the same output.
+        // `name<TAB>state`, split once and read three ways, instead of three passes each
+        // re-splitting the same output.
         let rows: Vec<(&str, &str)> = self
             .facts
             .docker_ps
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| {
-                let (name, status) = l.split_once('\t').unwrap_or((l, ""));
-                (name.trim(), status)
+                let (name, state) = l.split_once('\t').unwrap_or((l, ""));
+                (name.trim(), state.trim())
             })
             .collect();
 
@@ -163,9 +168,20 @@ impl HostChecks<'_> {
                 commas(&running)
             ));
         }
+        // Which containers are unhealthy is the daemon's judgement, taken from its own filter.
+        // Reading it out of a status line would mean matching the substring "(unhealthy)" in
+        // prose written for a human — and would go on quietly matching nothing the day that
+        // prose changes.
+        let unhealthy: BTreeSet<&str> = self
+            .facts
+            .unhealthy
+            .lines()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
         let broken: Vec<&str> = rows
             .iter()
-            .filter(|(_, status)| !status.starts_with("Up") || status.contains("unhealthy"))
+            .filter(|(name, state)| *state != RUNNING || unhealthy.contains(name))
             .map(|(name, _)| *name)
             .collect();
         if broken.is_empty() {
@@ -190,13 +206,10 @@ fn public_listen_ports(ss_output: &str) -> BTreeSet<u16> {
         if fields.len() < 5 || !fields[0].eq_ignore_ascii_case("LISTEN") {
             continue;
         }
-        let Some((address, port)) = fields[3].rsplit_once(':') else {
+        let Some((address, port)) = listener(fields[3]) else {
             continue;
         };
-        let Ok(port) = port.parse::<u16>() else {
-            continue;
-        };
-        if is_loopback(address) {
+        if address.is_loopback() {
             continue;
         }
         ports.insert(port);
@@ -204,16 +217,27 @@ fn public_listen_ports(ss_output: &str) -> BTreeSet<u16> {
     ports
 }
 
-/// `127.0.0.1`, `[::1]`, and anything else that only the node can reach. A wildcard (`*`,
-/// `0.0.0.0`, `[::]`) or a concrete external address is not loopback and counts as public.
-fn is_loopback(address: &str) -> bool {
-    let address = address.trim_matches(|c| c == '[' || c == ']');
-    // ss can append a scope, e.g. `fe80::1%eth0`.
-    let address = address.split('%').next().unwrap_or(address);
-    match address.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => address == "localhost",
+/// The address and port of one `ss` local-address field.
+///
+/// `SocketAddr` does the parsing wherever it can: it already knows `0.0.0.0:443` from `[::]:443`
+/// from `[::1]:9000`, and what it accepts is the same notion of an address the rest of this tool
+/// uses. Two shapes are left over because they are not address syntax at all: `ss` writes a
+/// wildcard as `*`, and it can append an interface scope to a link-local address. Anything else
+/// that does not parse — a resolved hostname, a truncated line — is no address, and a port this
+/// tool cannot place is not one it may call publicly reachable.
+fn listener(field: &str) -> Option<(IpAddr, u16)> {
+    if let Ok(socket) = field.parse::<SocketAddr>() {
+        return Some((socket.ip(), socket.port()));
     }
+    let (address, port) = field.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    // `*:443` — bound to every address, which is as public as it gets.
+    if address == "*" {
+        return Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+    }
+    // `[fe80::1%eth0]:443` — the scope has no place in the address itself.
+    let address = address.trim_matches(|c| c == '[' || c == ']');
+    address.split('%').next()?.parse().ok().map(|ip| (ip, port))
 }
 
 impl HostChecks<'_> {
@@ -502,7 +526,8 @@ mod tests {
     fn healthy_facts() -> HostFacts {
         HostFacts {
             unreachable_reason: None,
-            docker_ps: "remnanode\tUp 5 days\ncaddy\tUp 5 days\n".into(),
+            docker_ps: "remnanode\trunning\ncaddy\trunning\n".into(),
+            unhealthy: String::new(),
             listening: "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\nLISTEN 0 4096 0.0.0.0:8443 0.0.0.0:*\n".into(),
             node_logs: "2026-08-22T09:00:00 inbound in-a has 42 users\n".into(),
             cert: Some("notAfter=Nov 20 10:00:00 2026 GMT\n".into()),
@@ -586,22 +611,39 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_or_unhealthy_container_fails() {
-        let mut facts = healthy_facts();
-        facts.docker_ps = "remnanode\tUp 5 days\ncaddy\tExited (1) 2 hours ago\n".into();
-        let r = check_host(&node(), &facts, now(), 14, 7);
-        assert_eq!(severity_of(&r, ":containers"), Severity::Fail);
+    fn a_container_that_is_not_running_fails() {
+        // `docker ps` lists a container that keeps dying as `restarting`, and one an operator
+        // stopped mid-debugging as `paused`. The paused case is why the state is read instead of
+        // the status line: that line reads "Up 5 days (Paused)", and anything keyed on "Up"
+        // called it healthy.
+        for state in ["restarting", "paused"] {
+            let mut facts = healthy_facts();
+            facts.docker_ps = format!("remnanode\trunning\ncaddy\t{state}\n");
+            let r = check_host(&node(), &facts, now(), 14, 7);
+            let containers = r.iter().find(|c| c.key.ends_with(":containers")).unwrap();
+            assert_eq!(containers.severity, Severity::Fail, "{state}");
+            assert!(containers.detail.contains("caddy"), "{}", containers.detail);
+        }
+    }
 
+    #[test]
+    fn a_container_the_daemon_calls_unhealthy_fails_while_still_running() {
         let mut facts = healthy_facts();
-        facts.docker_ps = "remnanode\tUp 5 days (unhealthy)\n".into();
+        facts.unhealthy = "remnanode\n".into();
         let r = check_host(&node(), &facts, now(), 14, 7);
-        assert_eq!(severity_of(&r, ":containers"), Severity::Fail);
+        let containers = r.iter().find(|c| c.key.ends_with(":containers")).unwrap();
+        assert_eq!(containers.severity, Severity::Fail);
+        assert!(
+            containers.detail.contains("remnanode"),
+            "the reason must name the container: {}",
+            containers.detail
+        );
     }
 
     #[test]
     fn a_missing_node_container_fails_even_when_everything_else_is_up() {
         let mut facts = healthy_facts();
-        facts.docker_ps = "caddy\tUp 5 days\nwatchtower\tUp 5 days\n".into();
+        facts.docker_ps = "caddy\trunning\nwatchtower\trunning\n".into();
         let r = check_host(&node(), &facts, now(), 14, 7);
         let containers = r.iter().find(|c| c.key.ends_with(":containers")).unwrap();
         assert_eq!(containers.severity, Severity::Fail);
@@ -638,6 +680,16 @@ mod tests {
         );
         let public = public_listen_ports(&facts.listening);
         assert!(!public.contains(&9000), "[::1] is loopback");
+    }
+
+    #[test]
+    fn a_scoped_link_local_listener_is_still_read() {
+        // `fe80::1%eth0` is not address syntax `std` accepts, and dropping the line would have
+        // hidden a listening port rather than reported one.
+        let listening = "LISTEN 0 4096 [fe80::1%eth0]:9100 [::]:*\n";
+        assert!(public_listen_ports(listening).contains(&9100));
+        // A name is not an address: nothing here may call such a port publicly reachable.
+        assert!(public_listen_ports("LISTEN 0 4096 localhost:9100 [::]:*\n").is_empty());
     }
 
     #[test]
