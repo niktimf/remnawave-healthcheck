@@ -1,5 +1,10 @@
-use std::process::Stdio;
+use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
 use std::time::Duration;
+
+/// How long the initial connection to a host may take (`ssh -o ConnectTimeout`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one remote command may take before it is abandoned.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Raw command output collected from one host. Parsing happens elsewhere so it can be tested
 /// against recorded samples without touching the network.
@@ -19,6 +24,15 @@ pub struct HostFacts {
     pub egress_ip: String,
 }
 
+impl HostFacts {
+    /// The node's own view of its egress address, used as the expectation for channel exits.
+    /// Shares `core::model::parse_ip` with the probe side so both ends of that comparison agree
+    /// on what an address is — and so that neither can start accepting an error page as one.
+    pub fn egress_address(&self) -> Option<std::net::IpAddr> {
+        remnawave_healthcheck_core::model::parse_ip(&self.egress_ip)
+    }
+}
+
 /// Renewal state of acme.sh plus whether port 80 is open for http-01.
 /// The glob is expanded inside `sudo sh -c`; a non-root shell cannot look into /root.
 /// `-H` forces the `filename:` prefix even when the glob expands to exactly one file (the common
@@ -33,20 +47,20 @@ const RENEWAL_CMD: &str = "sudo sh -c 'grep -HE \"Le_NextRenewTimeStr|Le_Webroot
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandOutcome {
     /// The command ran on the host and returned this status and combined output. `status` is
-    /// `None` when the remote `ssh` process was killed by a signal and reported no code.
+    /// `None` when the remote process was killed by a signal and reported no code.
     Ran { status: Option<i32>, text: String },
     /// The command did not finish within the timeout.
     TimedOut,
-    /// `ssh` itself could not be started.
+    /// The command never ran: the session could not carry it.
     Failed(String),
     /// We refused to build this command line at all.
     Refused(String),
 }
 
 impl CommandOutcome {
-    /// The output to parse, or the reason there is none. Every check but the reachability ping
-    /// only wants this. Consuming: every caller is done with the outcome afterwards, and the
-    /// largest of these texts is a 200-line container log.
+    /// The output to parse, or the reason there is none — which is all any check wants, since a
+    /// host that could not be reached at all never gets this far. Consuming: every caller is done
+    /// with the outcome afterwards, and the largest of these texts is a 200-line container log.
     fn text(self) -> String {
         match self {
             CommandOutcome::Ran { text, .. } => text,
@@ -57,28 +71,55 @@ impl CommandOutcome {
     }
 }
 
-async fn run(target: &str, command: &str) -> CommandOutcome {
-    let child = tokio::process::Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            target,
-            command,
-        ])
-        .stdin(Stdio::null())
-        // If the timeout below fires, the future carrying this child is dropped; without
-        // kill_on_drop the `ssh` process would be orphaned instead of reaped, and on a run
-        // scheduled every few hours against a hung node those orphans accumulate.
-        .kill_on_drop(true)
-        .output();
+/// Open the one session every command on this host will share.
+///
+/// Each command used to be its own `ssh` invocation: a TCP connect, a key exchange and an
+/// authentication apiece, seven of them per node and per run. They are channels of a single
+/// multiplexed session now, so a host is paid for once.
+///
+/// `KnownHosts::Add` is `StrictHostKeyChecking=accept-new`, the same trust-on-first-use policy
+/// this tool has always had. `BatchMode=yes` the builder sets itself, which is what keeps a host
+/// that wants a password from hanging on a prompt nobody is there to answer.
+async fn connect(target: &str) -> Result<Session, openssh::Error> {
+    let mut builder = SessionBuilder::default();
+    builder
+        .known_hosts_check(KnownHosts::Add)
+        .connect_timeout(CONNECT_TIMEOUT);
+    builder.connect(target).await
+}
 
-    match tokio::time::timeout(Duration::from_secs(30), child).await {
+/// What actually went wrong, in ssh's own words.
+///
+/// The crate's own messages are deliberately generic — "failed to connect to the remote host" —
+/// while the line an operator needs (a timeout, a refused key, a host key that changed) sits in
+/// the error's source, so the chain is walked to the end. Capped, so a host that answers with a
+/// wall of text cannot push the reason out of an alert.
+fn error_detail(err: &openssh::Error) -> String {
+    let mut deepest: &dyn std::error::Error = err;
+    while let Some(source) = deepest.source() {
+        deepest = source;
+    }
+    let text = deepest.to_string();
+    let reason = last_non_empty_line(&text);
+    let reason = if reason.is_empty() {
+        err.to_string()
+    } else {
+        reason.to_string()
+    };
+    reason.chars().take(120).collect()
+}
+
+/// Run one command as a channel of an already-open session. The remote end still runs it through
+/// a shell, which is what the pipes and `||` fallbacks in these command lines rely on.
+async fn run(session: &Session, command: &str) -> CommandOutcome {
+    let mut cmd = session.raw_command(command);
+    cmd.stdin(Stdio::null());
+
+    // If this timeout fires, the future holding the channel is dropped and the channel closes;
+    // nothing is left running locally, and the remote end sees its connection go away.
+    match tokio::time::timeout(COMMAND_TIMEOUT, cmd.output()).await {
         Err(_) => CommandOutcome::TimedOut,
-        Ok(Err(e)) => CommandOutcome::Failed(e.to_string()),
+        Ok(Err(e)) => CommandOutcome::Failed(error_detail(&e)),
         Ok(Ok(out)) => {
             let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -98,13 +139,17 @@ async fn run(target: &str, command: &str) -> CommandOutcome {
 /// different endpoints could disagree about the address of a multi-homed host and turn a healthy
 /// channel red.
 pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostFacts {
-    let ping = run(target, "true").await;
-    if let Some(detail) = unreachable_detail(ping) {
-        return HostFacts {
-            unreachable_reason: Some(format!("ssh unreachable: {detail}")),
-            ..HostFacts::default()
-        };
-    }
+    // Opening the session is the reachability check: there is nothing to ask a host that could
+    // not be reached, and why it could not be reached is the reason to report.
+    let session = match connect(target).await {
+        Ok(session) => session,
+        Err(e) => {
+            return HostFacts {
+                unreachable_reason: Some(format!("ssh unreachable: {}", error_detail(&e))),
+                ..HostFacts::default()
+            }
+        }
+    };
 
     // Single-quoted for the remote shell; a URL carrying a quote of its own is refused rather
     // than pasted into a command line.
@@ -115,13 +160,13 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
     });
 
     let (docker_ps, listening, node_logs, renewal, egress_ip) = tokio::join!(
-        run(target, "sudo docker ps --format '{{.Names}}\\t{{.Status}}' 2>/dev/null || docker ps --format '{{.Names}}\\t{{.Status}}'"),
-        run(target, "sudo ss -ltn 2>/dev/null || ss -ltn"),
-        run(target, "sudo docker logs --tail 200 remnanode 2>&1 || docker logs --tail 200 remnanode"),
-        run(target, RENEWAL_CMD),
+        run(&session, "sudo docker ps --format '{{.Names}}\\t{{.Status}}' 2>/dev/null || docker ps --format '{{.Names}}\\t{{.Status}}'"),
+        run(&session, "sudo ss -ltn 2>/dev/null || ss -ltn"),
+        run(&session, "sudo docker logs --tail 200 remnanode 2>&1 || docker logs --tail 200 remnanode"),
+        run(&session, RENEWAL_CMD),
         async {
             match &egress_cmd {
-                Some(cmd) => run(target, cmd).await,
+                Some(cmd) => run(&session, cmd).await,
                 None => CommandOutcome::Refused(format!(
                     "refusing to run an echo URL containing a quote: {echo_url}"
                 )),
@@ -129,7 +174,7 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
         },
     );
     let cert = match cert_cmd {
-        Some(cmd) => Some(run(target, &cmd).await.text()),
+        Some(cmd) => Some(run(&session, &cmd).await.text()),
         None => None,
     };
 
@@ -141,30 +186,6 @@ pub async fn gather(target: &str, domain: Option<&str>, echo_url: &str) -> HostF
         cert,
         renewal: renewal.text(),
         egress_ip: egress_ip.text(),
-    }
-}
-
-/// Why the reachability ping says the host is not reachable, or `None` when it is.
-///
-/// This is the one place in the tool that looks at an exit status: `true` returning anything but
-/// 0 means the remote end never ran it. The detail is capped so a host that answers with a wall
-/// of text cannot push the real reason out of the alert.
-fn unreachable_detail(ping: CommandOutcome) -> Option<String> {
-    match ping {
-        CommandOutcome::Ran {
-            status: Some(0), ..
-        } => None,
-        CommandOutcome::Ran { status, text } => Some(match last_non_empty_line(&text) {
-            // Nothing was said about why, so the status is all there is to report. `-1` stands
-            // for "killed by a signal, no code" and is what this line has always printed.
-            "" => format!("rc={}", status.unwrap_or(-1)),
-            reason => reason.chars().take(120).collect(),
-        }),
-        // Nothing ran, so there is no status: the outcome's own text is the whole reason.
-        other => {
-            let text = other.text();
-            Some(last_non_empty_line(&text).chars().take(120).collect())
-        }
     }
 }
 
@@ -180,6 +201,23 @@ fn last_non_empty_line(text: &str) -> &str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_egress_address_is_trimmed_and_validated() {
+        let facts = |egress: &str| HostFacts {
+            egress_ip: egress.into(),
+            ..HostFacts::default()
+        };
+        assert_eq!(
+            facts("192.0.2.20\n").egress_address(),
+            Some("192.0.2.20".parse().unwrap())
+        );
+        // Not an address: a curl error line must never be reported as one.
+        assert_eq!(
+            facts("curl: (7) Failed to connect\n").egress_address(),
+            None
+        );
+    }
+
     fn ran(status: Option<i32>, text: &str) -> CommandOutcome {
         CommandOutcome::Ran {
             status,
@@ -187,52 +225,64 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_ping_that_returned_zero_means_the_host_is_reachable() {
-        assert_eq!(unreachable_detail(ran(Some(0), "")), None);
-        assert_eq!(unreachable_detail(ran(Some(0), "some banner\n")), None);
+    /// A connection failure as the crate reports one: a generic message of its own, with ssh's
+    /// actual line kept as the source.
+    fn connect_error(ssh_said: &str) -> openssh::Error {
+        openssh::Error::Connect(std::io::Error::other(ssh_said.to_string()))
     }
 
     #[test]
-    fn a_failing_ping_reports_the_last_line_ssh_printed() {
-        let detail = unreachable_detail(ran(
-            Some(255),
-            "warming up\nssh: connect to host beta.example.com port 22: Connection refused\n",
-        ))
-        .expect("a non-zero ping is unreachable");
+    fn a_failed_connection_is_reported_in_sshs_own_words() {
+        // Not the crate's "failed to connect to the remote host", which says nothing an operator
+        // can act on.
         assert_eq!(
-            detail,
-            "ssh: connect to host beta.example.com port 22: Connection refused"
+            error_detail(&connect_error(
+                "connect to host beta.example.com port 22: Connection refused"
+            )),
+            "connect to host beta.example.com port 22: Connection refused"
         );
     }
 
     #[test]
-    fn a_silent_failure_falls_back_to_the_status() {
+    fn a_multi_line_reason_keeps_the_line_that_says_why() {
         assert_eq!(
-            unreachable_detail(ran(Some(255), "")).as_deref(),
-            Some("rc=255")
+            error_detail(&connect_error(
+                "warming up\nPermission denied (publickey).\n"
+            )),
+            "Permission denied (publickey)."
         );
-        // Killed by a signal: no exit code at all.
-        assert_eq!(unreachable_detail(ran(None, "")).as_deref(), Some("rc=-1"));
     }
 
     #[test]
-    fn a_timeout_and_a_spawn_failure_explain_themselves() {
+    fn an_error_with_nothing_underneath_it_still_explains_itself() {
+        // No source to walk to: the crate's own message is all there is, and it is still a
+        // reason rather than an empty line.
         assert_eq!(
-            unreachable_detail(CommandOutcome::TimedOut).as_deref(),
-            Some("ssh timeout")
-        );
-        assert_eq!(
-            unreachable_detail(CommandOutcome::Failed("No such file or directory".into()))
-                .as_deref(),
-            Some("ssh error: No such file or directory")
+            error_detail(&openssh::Error::Disconnected),
+            "the connection was terminated"
         );
     }
 
     #[test]
     fn an_overlong_reason_is_capped() {
-        let detail = unreachable_detail(ran(Some(255), &"x".repeat(500))).unwrap();
+        let detail = error_detail(&connect_error(&"x".repeat(500)));
         assert_eq!(detail.chars().count(), 120);
+    }
+
+    /// Exercises the real transport: the session builder, the `ssh` binary, and the reason a
+    /// failure carries. Ignored by default because it needs `ssh` installed and a host that
+    /// refuses port 22 — run it with `cargo test -- --ignored` when the transport changes.
+    #[tokio::test]
+    #[ignore]
+    async fn an_unreachable_host_yields_a_reason_from_the_real_transport() {
+        let facts = gather("127.0.0.1", None, "https://example.invalid").await;
+        let reason = facts
+            .unreachable_reason
+            .expect("a host with no sshd is unreachable");
+        assert!(reason.starts_with("ssh unreachable: "), "{reason}");
+        assert!(reason.len() > "ssh unreachable: ".len(), "{reason}");
+        // Nothing was asked of the host, so nothing was collected.
+        assert_eq!(facts.docker_ps, "");
     }
 
     #[test]

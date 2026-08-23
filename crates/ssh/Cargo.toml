@@ -9,4 +9,5 @@ description = "Node-side checks over SSH for remnawave-healthcheck"
 [dependencies]
 remnawave-healthcheck-core = { path = "../core" }
 chrono.workspace = true
+openssh.workspace = true
 tokio.workspace = true

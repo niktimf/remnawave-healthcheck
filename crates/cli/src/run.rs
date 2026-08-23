@@ -196,7 +196,7 @@ async fn node_checks(
     let mut results = Vec::new();
     let mut egress = HashMap::new();
     while let Some((node, facts)) = pending.next().await {
-        if let Some(ip) = node_ssh::egress_ip(&facts) {
+        if let Some(ip) = facts.egress_address() {
             egress.insert(node.name.clone(), ip);
         }
         results.extend(node_ssh::check_host(

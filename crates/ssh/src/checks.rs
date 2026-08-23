@@ -1,13 +1,68 @@
 use crate::facts::HostFacts;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use remnawave_healthcheck_core::model::{parse_ip, CheckResult, Node, Severity};
+use remnawave_healthcheck_core::model::{CheckResult, Node, Severity};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
-use std::net::IpAddr;
 
-/// One node-side check, ready to run: it is handed the key and the title built from its suffix.
-type NodeCheck<'a> = &'a dyn Fn(&str, &str) -> CheckResult;
+/// What a check concluded, before it is given the identity that makes it a `CheckResult`.
+///
+/// Verdict and identity are kept apart so that no check ever sees a key. A key is this tool's
+/// memory across runs: one handed to the wrong check would make the old key look recovered and
+/// the new one look new, and nothing about the report would look wrong while it happened.
+struct Verdict {
+    severity: Severity,
+    detail: String,
+}
+
+impl Verdict {
+    fn new(severity: Severity, detail: impl Into<String>) -> Self {
+        Self {
+            severity,
+            detail: detail.into(),
+        }
+    }
+
+    fn ok(detail: impl Into<String>) -> Self {
+        Self::new(Severity::Ok, detail)
+    }
+
+    fn warn(detail: impl Into<String>) -> Self {
+        Self::new(Severity::Warn, detail)
+    }
+
+    fn fail(detail: impl Into<String>) -> Self {
+        Self::new(Severity::Fail, detail)
+    }
+}
+
+/// Everything the node-side checks are allowed to look at, gathered once so that no check has to
+/// be handed it a piece at a time.
+struct HostChecks<'a> {
+    node: &'a Node,
+    facts: &'a HostFacts,
+    now: DateTime<Utc>,
+    cert_warn_days: i64,
+    config_warn_days: i64,
+}
+
+/// One node-side check: it reads the host and answers with a verdict, never with a key.
+type Check = fn(&HostChecks) -> Verdict;
+
+/// Every node-side check there is, in report order.
+///
+/// One list, so an unreachable host cannot report a different set of checks than a reachable one.
+/// A suffix is part of a check's key and therefore of the tool's memory across runs: renaming one
+/// makes the old key look recovered and the new one look new.
+const CHECKS: [(&str, Check); 7] = [
+    ("containers", |h| h.containers()),
+    ("ports", |h| h.ports()),
+    ("users", |h| h.users()),
+    ("config-age", |h| h.config_age()),
+    ("cert", |h| h.cert()),
+    ("cert-renewal", |h| h.renewal()),
+    ("egress-ip", |h| h.egress()),
+];
 
 pub fn check_host(
     node: &Node,
@@ -16,36 +71,30 @@ pub fn check_host(
     cert_warn_days: i64,
     config_warn_days: i64,
 ) -> Vec<CheckResult> {
-    let key = |suffix: &str| format!("node:{}:{}", node.name, suffix);
-    let title = |suffix: &str| format!("{} {}", node.name, suffix);
+    let host = HostChecks {
+        node,
+        facts,
+        now,
+        cert_warn_days,
+        config_warn_days,
+    };
 
-    // One list, so an unreachable host cannot report a different set of checks than a reachable
-    // one. A suffix is part of a check's key and therefore of the tool's memory across runs:
-    // renaming one makes the old key look recovered and the new one look new.
-    let checks: [(&str, NodeCheck); 7] = [
-        ("containers", &|k, t| containers(k, t, facts)),
-        ("ports", &|k, t| ports(k, t, node, facts)),
-        ("users", &|k, t| users(k, t, facts)),
-        ("config-age", &|k, t| {
-            config_age(k, t, facts, now, config_warn_days)
-        }),
-        ("cert", &|k, t| cert(k, t, facts, now, cert_warn_days)),
-        ("cert-renewal", &|k, t| renewal(k, t, facts, now)),
-        ("egress-ip", &|k, t| egress(k, t, facts)),
-    ];
-
-    if let Some(reason) = &facts.unreachable_reason {
-        return checks
-            .iter()
-            .map(|(suffix, _)| {
-                CheckResult::new(key(suffix), title(suffix), Severity::Fail, reason.clone())
-            })
-            .collect();
-    }
-
-    checks
+    CHECKS
         .iter()
-        .map(|(suffix, check)| check(&key(suffix), &title(suffix)))
+        .map(|(suffix, check)| {
+            // An unreachable host answers every check with the one reason none of them could run,
+            // rather than with a shorter list that would read as "nothing else was wrong".
+            let verdict = match &facts.unreachable_reason {
+                Some(reason) => Verdict::fail(reason.clone()),
+                None => check(&host),
+            };
+            CheckResult::new(
+                format!("node:{}:{}", node.name, suffix),
+                format!("{} {}", node.name, suffix),
+                verdict.severity,
+                verdict.detail,
+            )
+        })
         .collect()
 }
 
@@ -61,76 +110,69 @@ fn commas(items: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
     out
 }
 
-/// The node's own external address, reported as a fact in its own right. It is also the yardstick
-/// every channel expected to exit here is measured against, so when it is unknown the report says
-/// so out loud: those channel verdicts are then unverified rather than merely uninteresting.
-fn egress(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
-    match egress_ip(facts) {
-        Some(ip) => CheckResult::new(key, title, Severity::Ok, format!("egress {ip}")),
-        None => CheckResult::new(
-            key,
-            title,
-            Severity::Warn,
-            "the node could not report its external address, so exits of channels expected to \
-             leave through it cannot be verified",
-        ),
+impl HostChecks<'_> {
+    /// The node's own external address, reported as a fact in its own right. It is also the
+    /// yardstick every channel expected to exit here is measured against, so when it is unknown
+    /// the report says so out loud: those channel verdicts are then unverified rather than
+    /// merely uninteresting.
+    fn egress(&self) -> Verdict {
+        match self.facts.egress_address() {
+            Some(ip) => Verdict::ok(format!("egress {ip}")),
+            None => Verdict::warn(
+                "the node could not report its external address, so exits of channels expected \
+                 to leave through it cannot be verified",
+            ),
+        }
     }
 }
 
 /// The one container this tool does expect by name: without it the node runs no Xray at all.
 const NODE_CONTAINER: &str = "remnanode";
 
-/// Any container that is not up — or is up but unhealthy — is a failure. Beyond `remnanode` there
-/// is no expected list: the node's own container set is the expectation, which keeps this free of
-/// configuration.
-fn containers(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
-    // `docker ps --format '{{.Names}}\t{{.Status}}'`, split once and read three ways, instead of
-    // three passes each re-splitting the same output.
-    let rows: Vec<(&str, &str)> = facts
-        .docker_ps
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let (name, status) = l.split_once('\t').unwrap_or((l, ""));
-            (name.trim(), status)
-        })
-        .collect();
+impl HostChecks<'_> {
+    /// Any container that is not up — or is up but unhealthy — is a failure. Beyond `remnanode`
+    /// there is no expected list: the node's own container set is the expectation, which keeps
+    /// this free of configuration.
+    fn containers(&self) -> Verdict {
+        // `docker ps --format '{{.Names}}\t{{.Status}}'`, split once and read three ways,
+        // instead of three passes each re-splitting the same output.
+        let rows: Vec<(&str, &str)> = self
+            .facts
+            .docker_ps
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let (name, status) = l.split_once('\t').unwrap_or((l, ""));
+                (name.trim(), status)
+            })
+            .collect();
 
-    if rows.is_empty() {
-        return CheckResult::new(key, title, Severity::Fail, "no containers running");
-    }
-    // A node whose container set looks perfectly healthy but does not include the node container
-    // is not serving anything. Nothing else in this tool would notice on its own.
-    let running: Vec<&str> = rows
-        .iter()
-        .map(|(name, _)| *name)
-        .filter(|name| !name.is_empty())
-        .collect();
-    if !running.contains(&NODE_CONTAINER) {
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Fail,
-            format!(
+        if rows.is_empty() {
+            return Verdict::fail("no containers running");
+        }
+        // A node whose container set looks perfectly healthy but does not include the node
+        // container is not serving anything. Nothing else in this tool would notice on its own.
+        let running: Vec<&str> = rows
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !name.is_empty())
+            .collect();
+        if !running.contains(&NODE_CONTAINER) {
+            return Verdict::fail(format!(
                 "the node container '{NODE_CONTAINER}' is not running (running: {})",
                 commas(&running)
-            ),
-        );
-    }
-    let broken: Vec<&str> = rows
-        .iter()
-        .filter(|(_, status)| !status.starts_with("Up") || status.contains("unhealthy"))
-        .map(|(name, _)| *name)
-        .collect();
-    if broken.is_empty() {
-        CheckResult::new(key, title, Severity::Ok, format!("{} up", rows.len()))
-    } else {
-        CheckResult::new(
-            key,
-            title,
-            Severity::Fail,
-            format!("not healthy: {}", commas(&broken)),
-        )
+            ));
+        }
+        let broken: Vec<&str> = rows
+            .iter()
+            .filter(|(_, status)| !status.starts_with("Up") || status.contains("unhealthy"))
+            .map(|(name, _)| *name)
+            .collect();
+        if broken.is_empty() {
+            Verdict::ok(format!("{} up", rows.len()))
+        } else {
+            Verdict::fail(format!("not healthy: {}", commas(&broken)))
+        }
     }
 }
 
@@ -174,37 +216,25 @@ fn is_loopback(address: &str) -> bool {
     }
 }
 
-/// Expected ports come from the inbounds the panel says are active on this node.
-fn ports(key: &str, title: &str, node: &Node, facts: &HostFacts) -> CheckResult {
-    if node.inbound_ports.is_empty() {
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Ok,
-            "no inbound ports declared by the panel",
-        );
-    }
-    let public = public_listen_ports(&facts.listening);
-    let silent: Vec<u16> = node
-        .inbound_ports
-        .iter()
-        .copied()
-        .filter(|p| !public.contains(p))
-        .collect();
-    if silent.is_empty() {
-        CheckResult::new(
-            key,
-            title,
-            Severity::Ok,
-            format!("listening on {:?}", node.inbound_ports),
-        )
-    } else {
-        CheckResult::new(
-            key,
-            title,
-            Severity::Fail,
-            format!("not listening: {}", commas(&silent)),
-        )
+impl HostChecks<'_> {
+    /// Expected ports come from the inbounds the panel says are active on this self.node.
+    fn ports(&self) -> Verdict {
+        if self.node.inbound_ports.is_empty() {
+            return Verdict::ok("no inbound ports declared by the panel");
+        }
+        let public = public_listen_ports(&self.facts.listening);
+        let silent: Vec<u16> = self
+            .node
+            .inbound_ports
+            .iter()
+            .copied()
+            .filter(|p| !public.contains(p))
+            .collect();
+        if silent.is_empty() {
+            Verdict::ok(format!("listening on {:?}", self.node.inbound_ports))
+        } else {
+            Verdict::fail(format!("not listening: {}", commas(&silent)))
+        }
     }
 }
 
@@ -222,21 +252,13 @@ fn min_user_count(logs: &str) -> Option<u64> {
         .min()
 }
 
-fn users(key: &str, title: &str, facts: &HostFacts) -> CheckResult {
-    match min_user_count(&facts.node_logs) {
-        None => CheckResult::new(
-            key,
-            title,
-            Severity::Fail,
-            "no 'has N users' lines in node logs",
-        ),
-        Some(0) => CheckResult::new(
-            key,
-            title,
-            Severity::Fail,
-            "an inbound has 0 users provisioned",
-        ),
-        Some(min) => CheckResult::new(key, title, Severity::Ok, format!("min={min}")),
+impl HostChecks<'_> {
+    fn users(&self) -> Verdict {
+        match min_user_count(&self.facts.node_logs) {
+            None => Verdict::fail("no 'has N users' lines in node logs"),
+            Some(0) => Verdict::fail("an inbound has 0 users provisioned"),
+            Some(min) => Verdict::ok(format!("min={min}")),
+        }
     }
 }
 
@@ -257,82 +279,52 @@ fn last_config_push(logs: &str) -> Option<DateTime<Utc>> {
         .next_back()
 }
 
-fn config_age(
-    key: &str,
-    title: &str,
-    facts: &HostFacts,
-    now: DateTime<Utc>,
-    warn_days: i64,
-) -> CheckResult {
-    match last_config_push(&facts.node_logs) {
-        None => CheckResult::new(
-            key,
-            title,
-            Severity::Warn,
-            "no config-push line in node logs",
-        ),
-        Some(when) => {
-            let age = (now - when).num_days();
-            let severity = if age > warn_days {
-                Severity::Warn
-            } else {
-                Severity::Ok
-            };
-            CheckResult::new(
-                key,
-                title,
-                severity,
-                format!("{age}d old (last {})", when.date_naive()),
-            )
+impl HostChecks<'_> {
+    fn config_age(&self) -> Verdict {
+        match last_config_push(&self.facts.node_logs) {
+            None => Verdict::warn("no config-push line in node logs"),
+            Some(when) => {
+                let age = (self.now - when).num_days();
+                let severity = if age > self.config_warn_days {
+                    Severity::Warn
+                } else {
+                    Severity::Ok
+                };
+                Verdict::new(severity, format!("{age}d old (last {})", when.date_naive()))
+            }
         }
     }
 }
 
-fn cert(
-    key: &str,
-    title: &str,
-    facts: &HostFacts,
-    now: DateTime<Utc>,
-    warn_days: i64,
-) -> CheckResult {
-    // No TLS endpoint to ask (the node's address is a bare IP) and an endpoint that answered
-    // with nothing are different situations: the first is nothing to report, the second is a
-    // certificate this tool looked at and could not read.
-    let Some(probed) = facts.cert.as_deref() else {
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Ok,
-            "no TLS endpoint known for this node",
-        );
-    };
-    let Some(raw) = probed.split("notAfter=").nth(1) else {
-        return CheckResult::new(key, title, Severity::Warn, "certificate not parsed");
-    };
-    let raw = raw.lines().next().unwrap_or("").trim();
-    let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%b %e %H:%M:%S %Y GMT") else {
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Warn,
-            format!("unparsable notAfter: {raw}"),
-        );
-    };
-    let not_after = Utc.from_utc_datetime(&parsed);
-    let days = (not_after - now).num_days();
-    let severity = if days < 0 {
-        Severity::Fail
-    } else if days < warn_days {
-        Severity::Warn
-    } else {
-        Severity::Ok
-    };
-    CheckResult::new(
-        key,
-        title,
-        severity,
-        format!("{days}d left ({})", not_after.date_naive()),
-    )
+impl HostChecks<'_> {
+    fn cert(&self) -> Verdict {
+        // No TLS endpoint to ask (the node's address is a bare IP) and an endpoint that answered
+        // with nothing are different situations: the first is nothing to report, the second is a
+        // certificate this tool looked at and could not read.
+        let Some(probed) = self.facts.cert.as_deref() else {
+            return Verdict::ok("no TLS endpoint known for this node");
+        };
+        let Some(raw) = probed.split("notAfter=").nth(1) else {
+            return Verdict::warn("certificate not parsed");
+        };
+        let raw = raw.lines().next().unwrap_or("").trim();
+        let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%b %e %H:%M:%S %Y GMT") else {
+            return Verdict::warn(format!("unparsable notAfter: {raw}"));
+        };
+        let not_after = Utc.from_utc_datetime(&parsed);
+        let days = (not_after - self.now).num_days();
+        let severity = if days < 0 {
+            Severity::Fail
+        } else if days < self.cert_warn_days {
+            Severity::Warn
+        } else {
+            Severity::Ok
+        };
+        Verdict::new(
+            severity,
+            format!("{days}d left ({})", not_after.date_naive()),
+        )
+    }
 }
 
 /// One acme.sh certificate as its `.conf` describes it, before the renewal time is known to be
@@ -403,112 +395,83 @@ fn parse_renewal(text: &str) -> BTreeMap<Option<String>, RenewalEntry> {
     found
 }
 
-/// Health of the renewal *mechanism*, not of the certificate's remaining days.
-/// This is what catches a broken renewal at the first silent failure — roughly two months before
-/// the expiry check would notice.
-fn renewal(key: &str, title: &str, facts: &HostFacts, now: DateTime<Utc>) -> CheckResult {
-    const GRACE_DAYS: i64 = 1;
-    let all = parse_renewal(&facts.renewal);
-    if all.is_empty() {
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Ok,
-            "no acme.sh config (managed elsewhere)",
-        );
-    }
-
-    // Sorted once into the two kinds there are, so nothing below has to re-derive which is which.
-    let mut certs: Vec<DueCert> = Vec::new();
-    let mut unreadable: Vec<Option<String>> = Vec::new();
-    for (domain, entry) in all {
-        match entry.due {
-            Some(due) => certs.push(DueCert {
-                domain,
-                webroot: entry.webroot,
-                due,
-            }),
-            None => unreadable.push(domain),
+impl HostChecks<'_> {
+    /// Health of the renewal *mechanism*, not of the certificate's remaining days.
+    /// This is what catches a broken renewal at the first silent failure — roughly two months
+    /// before the expiry check would notice.
+    fn renewal(&self) -> Verdict {
+        const GRACE_DAYS: i64 = 1;
+        let all = parse_renewal(&self.facts.renewal);
+        if all.is_empty() {
+            return Verdict::ok("no acme.sh config (managed elsewhere)");
         }
-    }
 
-    // `Le_*` lines exist but no domain's renewal time parsed: the acme.sh config itself is
-    // broken, which is a signal, not a reason to stay quiet.
-    let Some(soonest) = certs.iter().min_by_key(|c| c.due) else {
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Warn,
-            format!(
+        // Sorted once into the two kinds there are, so nothing below has to re-derive which is
+        // which.
+        let mut certs: Vec<DueCert> = Vec::new();
+        let mut unreadable: Vec<Option<String>> = Vec::new();
+        for (domain, entry) in all {
+            match entry.due {
+                Some(due) => certs.push(DueCert {
+                    domain,
+                    webroot: entry.webroot,
+                    due,
+                }),
+                None => unreadable.push(domain),
+            }
+        }
+
+        // `Le_*` lines exist but no domain's renewal time parsed: the acme.sh config itself is
+        // broken, which is a signal, not a reason to stay quiet.
+        let Some(soonest) = certs.iter().min_by_key(|c| c.due) else {
+            return Verdict::warn(format!(
                 "acme.sh config found but its renewal time could not be read: {}",
                 commas(unreadable.iter().map(domain_label))
-            ),
-        );
-    };
-
-    let port80_closed = facts.renewal.contains("PORT80=closed");
-    let http01: BTreeSet<&Option<String>> = certs
-        .iter()
-        .filter(|c| c.needs_port_80())
-        .map(|c| &c.domain)
-        .collect();
-
-    let mut overdue: Vec<(&DueCert, i64)> = certs
-        .iter()
-        .filter_map(|c| {
-            let days = (now - c.due).num_days();
-            (days > GRACE_DAYS).then_some((c, days))
-        })
-        .collect();
-    overdue.sort_by_key(|(_, days)| Reverse(*days));
-
-    if !overdue.is_empty() {
-        let listed = commas(
-            overdue
-                .iter()
-                .map(|(c, days)| format!("{} {days}d", domain_label(&c.domain))),
-        );
-        let blocked = port80_closed && overdue.iter().any(|(c, _)| http01.contains(&c.domain));
-        let reason = if blocked {
-            " — port 80 is closed, http-01 cannot pass"
-        } else {
-            ""
+            ));
         };
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Fail,
-            format!("renewal overdue: {listed}{reason}"),
-        );
-    }
-    if port80_closed && !http01.is_empty() {
-        return CheckResult::new(
-            key,
-            title,
-            Severity::Warn,
-            format!(
+
+        let port80_closed = self.facts.renewal.contains("PORT80=closed");
+        let http01: BTreeSet<&Option<String>> = certs
+            .iter()
+            .filter(|c| c.needs_port_80())
+            .map(|c| &c.domain)
+            .collect();
+
+        let mut overdue: Vec<(&DueCert, i64)> = certs
+            .iter()
+            .filter_map(|c| {
+                let days = (self.now - c.due).num_days();
+                (days > GRACE_DAYS).then_some((c, days))
+            })
+            .collect();
+        overdue.sort_by_key(|(_, days)| Reverse(*days));
+
+        if !overdue.is_empty() {
+            let listed = commas(
+                overdue
+                    .iter()
+                    .map(|(c, days)| format!("{} {days}d", domain_label(&c.domain))),
+            );
+            let blocked = port80_closed && overdue.iter().any(|(c, _)| http01.contains(&c.domain));
+            let reason = if blocked {
+                " — port 80 is closed, http-01 cannot pass"
+            } else {
+                ""
+            };
+            return Verdict::fail(format!("renewal overdue: {listed}{reason}"));
+        }
+        if port80_closed && !http01.is_empty() {
+            return Verdict::warn(format!(
                 "port 80 is closed — http-01 renewal will fail: {}",
                 commas(http01.into_iter().map(domain_label))
-            ),
-        );
-    }
-    CheckResult::new(
-        key,
-        title,
-        Severity::Ok,
-        format!(
+            ));
+        }
+        Verdict::ok(format!(
             "next {} {}",
             domain_label(&soonest.domain),
             soonest.due.date_naive()
-        ),
-    )
-}
-
-/// Node's own view of its egress address, used as the expectation for channel exits. Shares
-/// `core::model::parse_ip` with the probe side so both ends of the comparison agree on what an
-/// address is.
-pub fn egress_ip(facts: &HostFacts) -> Option<IpAddr> {
-    parse_ip(&facts.egress_ip)
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +519,43 @@ mod tests {
             .find(|r| r.key.ends_with(suffix))
             .unwrap_or_else(|| panic!("no check {suffix}"))
             .severity
+    }
+
+    #[test]
+    fn every_check_reports_under_its_own_key_reachable_or_not() {
+        // The suffixes are the tool's memory across runs: renaming one makes the old key look
+        // recovered and the new one look new, in the report and in the Telegram diff alike. A
+        // check never sees its key, so this is the only place the pairing can be got wrong.
+        let expected = [
+            "node:beta:containers",
+            "node:beta:ports",
+            "node:beta:users",
+            "node:beta:config-age",
+            "node:beta:cert",
+            "node:beta:cert-renewal",
+            "node:beta:egress-ip",
+        ];
+        let keys = |results: &[CheckResult]| {
+            results
+                .iter()
+                .map(|r| r.key.clone())
+                .collect::<Vec<String>>()
+        };
+
+        let reachable = check_host(&node(), &healthy_facts(), now(), 14, 7);
+        assert_eq!(keys(&reachable), expected);
+
+        let unreachable = check_host(
+            &node(),
+            &HostFacts {
+                unreachable_reason: Some("ssh unreachable".into()),
+                ..HostFacts::default()
+            },
+            now(),
+            14,
+            7,
+        );
+        assert_eq!(keys(&unreachable), expected);
     }
 
     #[test]
@@ -793,16 +793,5 @@ mod tests {
         let cert = r.iter().find(|c| c.key.ends_with(":cert")).unwrap();
         assert_eq!(cert.severity, Severity::Warn);
         assert_eq!(cert.detail, "certificate not parsed");
-    }
-
-    #[test]
-    fn egress_ip_is_trimmed_and_validated() {
-        assert_eq!(
-            egress_ip(&healthy_facts()),
-            Some("192.0.2.20".parse::<IpAddr>().unwrap())
-        );
-        let mut facts = healthy_facts();
-        facts.egress_ip = "curl: (7) Failed to connect\n".into();
-        assert_eq!(egress_ip(&facts), None);
     }
 }

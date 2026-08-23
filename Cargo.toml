@@ -13,6 +13,7 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+openssh = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
