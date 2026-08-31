@@ -11,7 +11,8 @@ use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone)]
 pub struct SshConfig {
-    pub user: String,
+    /// `None`: no `-o User` is passed and ssh's own config decides.
+    pub user: Option<String>,
     pub port: u16,
     /// Private key text; `None` leaves key selection to ssh-agent / `~/.ssh`.
     pub private_key: Option<String>,
@@ -76,8 +77,10 @@ impl SshRunner {
 
     async fn connect(&self, address: &str) -> Result<Session, openssh::Error> {
         let mut b = SessionBuilder::default();
-        b.user(self.config.user.clone())
-            .port(self.config.port)
+        if let Some(user) = &self.config.user {
+            b.user(user.clone());
+        }
+        b.port(self.config.port)
             .connect_timeout(self.config.connect_timeout);
         match &self.known_hosts_file {
             Some(f) => {
@@ -294,7 +297,7 @@ mod tests {
     #[ignore = "needs the ssh binary and a host that refuses port 22"]
     async fn an_unreachable_host_yields_a_reason_from_the_real_transport() {
         let runner = SshRunner::new(SshConfig {
-            user: "root".into(),
+            user: Some("root".into()),
             port: 22,
             private_key: None,
             known_hosts: None,

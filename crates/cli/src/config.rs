@@ -37,8 +37,10 @@ pub struct Args {
     /// Private key text; empty → ssh-agent / ~/.ssh decide
     #[arg(long, env = "SSH_PRIVATE_KEY", hide_env_values = true)]
     pub ssh_private_key: Option<String>,
-    #[arg(long, env = "SSH_USER", default_value = "root")]
-    pub ssh_user: String,
+    /// User on the nodes; unset -> root when a private key is given,
+    /// otherwise ssh decides (config or the current user)
+    #[arg(long, env = "SSH_USER")]
+    pub ssh_user: Option<String>,
     #[arg(long, env = "SSH_PORT", default_value_t = 22)]
     pub ssh_port: u16,
     /// `known_hosts` text; set → StrictHostKeyChecking=yes, empty → accept-new
@@ -180,15 +182,20 @@ impl Config {
             os_version: args.device_os_version.clone(),
             model: args.device_model.clone(),
         });
+        let ssh_private_key = non_empty(args.ssh_private_key);
+        // An explicit key without a user means a bare CI runner: root is the
+        // only sensible login. Neither set -> ssh's own config decides.
+        let ssh_user = non_empty(args.ssh_user)
+            .or_else(|| ssh_private_key.is_some().then(|| "root".to_string()));
         Ok(Self {
             panel_url: args.panel_url,
             api_token: args.api_token,
             user_id: args.user_id,
             telegram,
             ssh: SshConfig {
-                user: args.ssh_user,
+                user: ssh_user,
                 port: args.ssh_port,
-                private_key: non_empty(args.ssh_private_key),
+                private_key: ssh_private_key,
                 known_hosts: non_empty(args.ssh_known_hosts),
                 connect_timeout: Duration::from_secs(
                     args.ssh_connect_timeout_secs,
@@ -280,7 +287,12 @@ mod tests {
             (c.concurrency, c.probe_timeout.as_secs(), c.cert_warn_days),
             (8, 22, 14)
         );
-        assert_eq!((c.ssh.user.as_str(), c.ssh.port), ("root", 22));
+        assert_eq!((c.ssh.user.clone(), c.ssh.port), (None, 22));
+        let with_key =
+            Config::from_args(args(&["--ssh-private-key", "KEY"])).unwrap();
+        assert_eq!(with_key.ssh.user.as_deref(), Some("root"));
+        let named = Config::from_args(args(&["--ssh-user", "deploy"])).unwrap();
+        assert_eq!(named.ssh.user.as_deref(), Some("deploy"));
         assert_eq!(c.ssh_thresholds.container, "remnanode");
         assert!(c.hwid.is_none());
         assert_eq!(

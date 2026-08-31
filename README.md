@@ -49,7 +49,7 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
   per user, register one device for it (`POST /api/hwid/devices {hwid, userId}`) and pass its id as
   `REMNAWAVE_HWID`; otherwise the subscription answers with a placeholder and the tool says so.
 - `ssh` in `PATH`. Give the key as `SSH_PRIVATE_KEY` (the tool writes it to a `0600` temp file for the
-  run) or leave it to `ssh-agent`. `SSH_USER` defaults to `root`, `SSH_PORT` to `22`; set
+  run) or leave it to `ssh-agent`. `SSH_USER` defaults to `root` when a key is given and to your ssh config otherwise; `SSH_PORT` defaults to `22`; set
   `SSH_KNOWN_HOSTS` for strict host-key checking.
 
 ## Operational notes
