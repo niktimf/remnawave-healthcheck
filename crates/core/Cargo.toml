@@ -2,16 +2,19 @@
 name = "remnawave-healthcheck-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Domain model, routing-graph resolution and reporting for remnawave-healthcheck"
+description = "Domain model, routing-graph resolution, checks and reporting for remnawave-healthcheck"
 
 [dependencies]
-serde.workspace = true
+chrono.workspace = true
 serde_json.workspace = true
-shlex.workspace = true
-strum.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+rstest.workspace = true
 
 [lints]
 workspace = true

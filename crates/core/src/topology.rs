@@ -12,8 +12,6 @@ pub enum ResolveError {
         inbound_tag: String,
         profile_uuid: String,
     },
-    // A list, not a joined string: a caller wanting to name them could not get
-    // them back out.
     #[error("inbound '{inbound_tag}' runs on several nodes ({}) and none has address {address}", candidates.join(", "))]
     AmbiguousEntryNode {
         inbound_tag: String,
@@ -115,13 +113,7 @@ struct Destination {
 /// itself keeps the absence as an `Option`.
 const UNTAGGED: &str = "<untagged>";
 
-/// One config profile's Xray configuration, as the resolver reads it.
-///
-/// A newtype over the raw JSON rather than a deserialised struct: a profile is
-/// an arbitrary Xray configuration and a schema would break on everything else
-/// it legitimately contains. What the newtype buys is that a profile config, an
-/// outbound and a rule stop being the same type, and that every `get("...")`
-/// lives here rather than in the middle of the resolution.
+/// One profile's Xray config, read as raw JSON: a profile is an arbitrary Xray configuration and a schema would break on everything else it legitimately contains.
 #[derive(Clone, Copy)]
 struct Config<'a>(&'a Value);
 
@@ -185,11 +177,6 @@ impl<'a> Config<'a> {
 
 /// Where a config routes an inbound's traffic — three cases that must not be
 /// conflated.
-///
-/// A rule that matched but names no outbound (it selects by `balancerTag`, say)
-/// is not the same as no rule matching. Reading both as "no tag" would fall
-/// back to the first outbound and report a wrong exit instead of failing
-/// loudly.
 enum Routed<'a> {
     /// A rule matched and named this outbound.
     Tag(&'a str),
@@ -205,8 +192,7 @@ enum Routed<'a> {
 struct Outbound<'a>(&'a Value);
 
 impl<'a> Outbound<'a> {
-    /// How this outbound appears in an error message, and only there: an
-    /// outbound without a tag is an absence, not the literal "<untagged>".
+    /// The tag, or `<untagged>` in messages.
     fn name(self) -> String {
         self.0
             .get("tag")
@@ -255,9 +241,6 @@ fn rule_matches(rule: &Value, inbound_tag: &str) -> bool {
 }
 
 /// Follows one snapshot's routing to the node a channel leaves through.
-///
-/// The snapshot is held rather than passed along: every step of a cascade needs
-/// it, and threading it through made it an argument of everything here.
 #[derive(Debug, Clone, Copy)]
 pub struct Resolver<'a> {
     snapshot: &'a Snapshot,
@@ -269,11 +252,6 @@ impl<'a> Resolver<'a> {
     }
 
     /// The node this channel is declared to exit through.
-    ///
-    /// The node itself, not its name: what the caller does with it — is it
-    /// disabled, what is its egress address — are questions about a node, and
-    /// answering them by matching names would mean a second list keyed by the
-    /// same strings.
     pub fn exit_of(self, channel: &Channel) -> Result<&'a Node, ResolveError> {
         let nodes = &self.snapshot.nodes;
         let mut node = self.entry_node(channel)?;
@@ -298,13 +276,13 @@ impl<'a> Resolver<'a> {
                     return Err(ResolveError::Blackhole {
                         inbound_tag,
                         tag: outbound.name(),
-                    })
+                    });
                 }
                 OutboundKind::OpaqueTerminal => {
                     return Err(ResolveError::OpaqueTerminal {
                         tag: outbound.name(),
                         protocol: outbound.protocol().to_string(),
-                    })
+                    });
                 }
                 OutboundKind::Proxy => {}
             }
@@ -395,10 +373,6 @@ fn outbound_for<'a>(
     inbound_tag: &str,
     node: &Node,
 ) -> Result<Outbound<'a>, ResolveError> {
-    // `config_of` already required a profile uuid to resolve this config, but
-    // the fallback keeps the label legible instead of panicking, and spells out
-    // what it contains so an incident read never mistakes a node name for a
-    // UUID.
     let profile_label = node.profile_uuid.clone().unwrap_or_else(|| {
         format!("<node '{}' has no profile uuid>", node.name)
     });
@@ -429,7 +403,6 @@ mod tests {
     use super::*;
     use crate::model::{Channel, Node, Profile, Snapshot};
     use serde_json::json;
-    use std::collections::HashMap;
 
     fn node(name: &str, address: &str, profile: &str, tags: &[&str]) -> Node {
         Node {
@@ -440,12 +413,9 @@ mod tests {
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect(),
-            inbound_ports: vec![],
-            is_disabled: false,
             is_connected: true,
-            is_connecting: false,
-            last_status_message: None,
             xray_version: Some("26.6.27".into()),
+            ..Default::default()
         }
     }
 
@@ -494,9 +464,8 @@ mod tests {
             profiles: profiles
                 .into_iter()
                 .map(|p| (p.uuid.clone(), p))
-                .collect::<HashMap<_, _>>(),
-            channels: vec![],
-            served_remarks: Vec::new(),
+                .collect(),
+            ..Default::default()
         }
     }
 
@@ -512,7 +481,7 @@ mod tests {
             profile_uuid: Some(profile.into()),
             address: address.into(),
             port: 443,
-            outbound: json!({}),
+            ..Default::default()
         }
     }
 
@@ -541,7 +510,7 @@ mod tests {
             profile_uuid: None,
             address: "beta.example.com".into(),
             port: 443,
-            outbound: json!({}),
+            ..Default::default()
         };
         assert!(matches!(
             Resolver::new(&snap).exit_of(&ch),

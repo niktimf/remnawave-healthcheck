@@ -1,56 +1,63 @@
 # remnawave-healthcheck
 
-Health checker for a [Remnawave](https://remna.st) installation that keeps **no inventory of its own**.
-Nodes, channels, expected exits and the required Xray version are all derived from the panel API.
-
-Give it a panel URL, an API token and the subscription URL of a monitoring user — it figures out the rest.
+Health checker for a [Remnawave](https://remna.st) **3.3+** installation that keeps no inventory of its
+own: nodes, channels, expected exits and the Xray version all come from the panel API. Made to run from
+CI on a schedule and report to Telegram after every run.
 
 ## Usage
 
 ```sh
-remnawave-healthcheck \
-  --panel-url https://panel.example.com \
-  --api-token "$REMNAWAVE_API_TOKEN" \
-  --subscription-url https://sub.example.com/abc123
+REMNAWAVE_PANEL_URL=https://panel.example.com \
+REMNAWAVE_API_TOKEN=... \
+REMNAWAVE_USER_ID=42 \
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+SSH_PRIVATE_KEY="$(cat ~/.ssh/id_ed25519)" \
+remnawave-healthcheck
 ```
 
-The same three values can be given as environment variables instead of flags — `REMNAWAVE_PANEL_URL`,
-`REMNAWAVE_API_TOKEN`, `REMNAWAVE_SUBSCRIPTION_URL` — which is how a CI job would normally run it. Add
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` (optionally `TELEGRAM_THREAD_ID` for a supergroup topic) to
-get alerted when something changes. Run `remnawave-healthcheck --help` for the full flag list, including
-`--no-ssh`, `--no-channels`, `--test-alert`, and the tuning knobs (`--concurrency`, `--probe-timeout-secs`,
-`--cert-warn-days`, `--config-warn-days`, `--echo-url`).
+Every setting is an environment variable and a flag; `remnawave-healthcheck --help` prints the whole
+table with defaults. Three are required: the panel URL, an API token, and the numeric id of a monitoring
+user whose subscription covers every squad you want checked. `examples/healthcheck.yml` is a
+ready-made GitHub Actions workflow that downloads a release binary and runs it every six hours.
+
+Exit code `0`: no FAIL (warnings do not break the build). `1`: at least one FAIL. `2`: the run could not
+do its job (bad configuration, unreadable panel, undelivered Telegram message).
 
 ## What it checks
 
-- **Every client-facing channel** the monitoring user can see: an Xray tunnel is actually run through
-  each one and the traffic's real exit IP is compared against what the expected node reports as its own
-  egress address.
-- **Node state as the panel itself reports it** — connected, disabled, last status message.
-- **Subscription coverage** — whether the rendered subscription serves as many channels as the panel
-  resolved for the monitoring user.
-- **Inbounds not covered by monitoring** — an inbound that is live on a node but never reaches the
-  monitoring user's subscription, typically because the user was never added to that squad.
-- **Xray version drift** across nodes — client and node must agree on protocol features to talk to each
-  other at all.
-- **Node-side facts over SSH** — the node container running, containers up and healthy, expected ports
-  listening publicly, provisioned users present in the logs, config-push freshness, the node's own
-  external address, TLS certificate expiry, and the acme.sh renewal mechanism itself (not just the
-  certificate's remaining days).
+- **From the panel API** — node status with the panel's own reason, users online, config age
+  (`xrayUptime`), host load and memory, Xray and remnanode version drift across nodes, subscription
+  coverage (the rendered subscription serves exactly the channels the panel resolved), inbounds the
+  monitoring user cannot see.
+- **From geocheck** (a job the panel runs on each node) — the node's real egress address and ASN,
+  which country the world sees it in versus what the panel says, IP reputation, connectivity to
+  external services.
+- **From the runner** — TLS certificates of the panel and of the subscription host; both path forms of
+  every xhttp inbound answer `400` (guards xray #6307).
+- **Over SSH** (only what the API cannot tell) — containers running and healthy, inbound ports actually
+  listening on a public address, node certificate expiry, and whether acme.sh renewal still works. A node
+  that refuses SSH is one warning, not a wall of red.
+- **Through a real Xray tunnel** — every channel of the monitoring user's subscription, run with the
+  exact outbound the panel served, its exit compared with the expected node's egress address by
+  following the routing graph of the config profiles (cascades included).
 
 ## What it needs
 
-- A panel API token with the `nodes`, `config-profiles`, and `subscription` scopes. A regular admin
-  login JWT will not work here — the panel requires a token created for API access.
-- A monitoring user whose subscription includes every squad you want checked. A channel the monitoring
-  user cannot see is a channel this tool cannot check.
-- `ssh` in `PATH` and a key already loaded in `ssh-agent` (or otherwise usable non-interactively) for
-  the node-side checks. Skip them with `--no-ssh` if that access is not available.
+- An API token (not an admin login JWT) with the `nodes`, `config-profiles`, `by-id`, `raw`, `geocheck`
+  and `geocheck-result` scopes.
+- A monitoring user whose subscription includes every squad you want checked. If the panel limits devices
+  per user, register one device for it (`POST /api/hwid/devices {hwid, userId}`) and pass its id as
+  `REMNAWAVE_HWID`; otherwise the subscription answers with a placeholder and the tool says so.
+- `ssh` in `PATH`. Give the key as `SSH_PRIVATE_KEY` (the tool writes it to a `0600` temp file for the
+  run) or leave it to `ssh-agent`. `SSH_USER` defaults to `root`, `SSH_PORT` to `22`; set
+  `SSH_KNOWN_HOSTS` for strict host-key checking.
 
-## What it does not do
+## Operational notes
 
-- It never changes anything in the panel or on a node — every check is read-only.
-- It keeps no inventory file: nothing needs to be told which nodes or channels exist, or updated when
-  they change.
-- It needs no configuration file — panel URL, token, subscription URL and Telegram credentials are the
-  whole setup, via flags or environment variables.
+- GitHub-hosted runners connect from changing IP addresses: a `ufw`/`fail2ban` allowlist for SSH on the
+  nodes turns every node-side check into a warning. Either allow key-only SSH from anywhere or use a
+  self-hosted runner.
+- In a public repository GitHub disables scheduled workflows after 60 days without commits.
+- Requesting the panel API directly at the container, past the reverse proxy, drops the connection
+  unless `X-Forwarded-For` and `X-Forwarded-Proto: https` are set. Use the public URL.
+- The tool never changes anything in the panel or on a node, and keeps no state between runs.

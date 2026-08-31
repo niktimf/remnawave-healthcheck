@@ -1,19 +1,34 @@
-mod args;
-mod ports;
+mod config;
 mod run;
 mod telegram;
 
 use clap::Parser;
 use remnawave_healthcheck_core::report::Outcome;
 use std::process::ExitCode;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = args::Args::parse();
-    match run::run(args).await {
+    // Logs go to stderr; stdout carries only the report table.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+    let config = match config::Config::from_args(config::Args::parse()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("configuration: {e:#}");
+            return Outcome::Aborted.into();
+        }
+    };
+    match run::run(config).await {
         Ok(outcome) => outcome.into(),
-        Err(err) => {
-            eprintln!("healthcheck failed: {err:#}");
+        Err(e) => {
+            tracing::error!("healthcheck failed: {e:#}");
             Outcome::Aborted.into()
         }
     }

@@ -1,57 +1,51 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/panel", "crates/probe", "crates/ssh", "crates/cli"]
+members = ["crates/core", "crates/io", "crates/cli"]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/niktimf/remnawave-healthcheck"
 
 [workspace.dependencies]
 anyhow = "1"
+backon = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
-futures = "0.3"
 openssh = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "2"
-strum = { version = "0.28", features = ["derive"] }
+tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
-zip = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "fs", "net", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+webpki-roots = "1"
+x509-parser = "0.18"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# dev
+pretty_assertions = "1"
+rstest = "0.26"
+wiremock = "0.6"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-cognitive_complexity = "warn"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
-module_inception = "allow"
-# Its rewrite moves the `else` branch into a closure, and every one of these branches either
-# prints something or is several lines long: `map_or_else` reads as a mapping where the code is
-# making a decision. It also fights `single_match_else`, which asks for the opposite shape.
-option_if_let_else = "allow"
-# These crates are internal to this workspace and are not published. An `# Errors` section on
-# each would restate the error type the signature already names.
 missing_errors_doc = "allow"
+missing_panics_doc = "allow"
 
-# Line tables and nothing else: a backtrace keeps its file and line numbers,
-# while the rest of the DWARF — the part that makes a debug build slow to link —
-# is not generated at all.
 [profile.dev]
 debug = "line-tables-only"
 
-# `panic` is deliberately left at "unwind". Two guarantees in this tool are
-# `Drop` implementations, and `abort` does not run destructors: the probe's
-# scratch directory holds an xray config with the monitoring user's VLESS
-# credentials until its guard removes it, and an ssh session's `Drop` is what
-# tells the multiplex master to exit instead of leaving it behind.
+# Thin LTO: most of the win, a fraction of the link time. The tool waits on the
+# network; `panic = "unwind"` stays so `Drop` guards (temp files) always run.
 [profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-# Symbols stay so a panic in CI names its frames; only the DWARF goes.
+lto = "thin"
 strip = "debuginfo"
