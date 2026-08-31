@@ -85,6 +85,23 @@ fn head(body: &str) -> String {
     body.chars().take(300).collect()
 }
 
+/// The whole reason chain of a reqwest error, without the URL: the top-level
+/// Display is a generic "error sending request", while the DNS/TLS/socket
+/// cause an operator can act on sits in the sources.
+pub fn error_chain(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut parts = vec![e.to_string()];
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        let text = s.to_string();
+        if parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        source = s.source();
+    }
+    parts.join(": ")
+}
+
 #[derive(Deserialize)]
 struct Envelope<T> {
     response: T,
@@ -143,13 +160,13 @@ impl PanelClient {
         resp: reqwest::Result<reqwest::Response>,
     ) -> Result<String, RequestError> {
         let resp = resp.map_err(|e| {
-            RequestError::Transient(format!("{url}: {}", e.without_url()))
+            RequestError::Transient(format!("{url}: {}", error_chain(e)))
         })?;
         let status = resp.status();
         let body = resp.text().await.map_err(|e| {
             RequestError::Transient(format!(
                 "{url}: reading body: {}",
-                e.without_url()
+                error_chain(e)
             ))
         })?;
         if status.is_server_error() {

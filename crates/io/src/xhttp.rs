@@ -58,7 +58,7 @@ async fn client_for(
         .redirect(reqwest::redirect::Policy::none())
         .resolve(sni, SocketAddr::new(ip, port))
         .build()
-        .map_err(|e| e.without_url().to_string())
+        .map_err(crate::panel::error_chain)
 }
 
 async fn status(client: &Client, url: &str) -> Result<u16, String> {
@@ -67,7 +67,7 @@ async fn status(client: &Client, url: &str) -> Result<u16, String> {
         .send()
         .await
         .map(|r| r.status().as_u16())
-        .map_err(|e| e.without_url().to_string())
+        .map_err(crate::panel::error_chain)
 }
 
 #[cfg(test)]

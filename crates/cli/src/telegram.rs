@@ -87,7 +87,7 @@ impl Notifier {
                 .map_err(|e| {
                     SendError::Transient(format!(
                         "telegram unreachable: {}",
-                        e.without_url()
+                        remnawave_healthcheck_io::panel::error_chain(e)
                     ))
                 })?;
         let status = resp.status();
