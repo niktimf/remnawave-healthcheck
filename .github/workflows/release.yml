@@ -1,0 +1,24 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl -p remnawave-healthcheck
+      - run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/remnawave-healthcheck dist/remnawave-healthcheck-x86_64-unknown-linux-musl
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

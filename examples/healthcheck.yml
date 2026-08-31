@@ -1,0 +1,40 @@
+# Copy into your own repository as .github/workflows/healthcheck.yml.
+# Secrets: REMNAWAVE_PANEL_URL, REMNAWAVE_API_TOKEN, REMNAWAVE_USER_ID,
+# TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SSH_PRIVATE_KEY, and REMNAWAVE_HWID
+# if the panel limits devices per user.
+name: healthcheck
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: healthcheck
+  cancel-in-progress: false
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      HEALTHCHECK_VERSION: v0.2.0
+    steps:
+      - name: Download the release binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$HEALTHCHECK_VERSION" --repo niktimf/remnawave-healthcheck \
+            --pattern remnawave-healthcheck-x86_64-unknown-linux-musl --pattern SHA256SUMS
+          sha256sum --check --ignore-missing SHA256SUMS
+          chmod +x remnawave-healthcheck-x86_64-unknown-linux-musl
+      - name: Run
+        run: ./remnawave-healthcheck-x86_64-unknown-linux-musl
+        env:
+          RUST_LOG: info
+          REMNAWAVE_PANEL_URL: ${{ secrets.REMNAWAVE_PANEL_URL }}
+          REMNAWAVE_API_TOKEN: ${{ secrets.REMNAWAVE_API_TOKEN }}
+          REMNAWAVE_USER_ID: ${{ secrets.REMNAWAVE_USER_ID }}
+          REMNAWAVE_HWID: ${{ secrets.REMNAWAVE_HWID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}

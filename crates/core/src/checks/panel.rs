@@ -1,0 +1,649 @@
+use super::commas;
+use crate::model::{
+    CheckResult, Node, PanelState, Severity, Snapshot, node_check,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// What the panel itself thinks of each node. Costs no SSH and no tunnels.
+pub fn node_status(nodes: &[Node]) -> Vec<CheckResult> {
+    nodes
+        .iter()
+        .map(|n| {
+            // Which state a node is in is the node's question; what it is worth
+            // in a report is this module's. A reconnecting node warns rather
+            // than fails because the panel retries on its own, and carries no
+            // reason: the message the panel left is about the attempt before.
+            let (severity, detail) = match n.panel_state() {
+                PanelState::Disabled => {
+                    (Severity::Warn, "disabled by an administrator".to_string())
+                }
+                PanelState::Connecting => {
+                    (Severity::Warn, "connecting".to_string())
+                }
+                PanelState::Disconnected { reason } => (
+                    Severity::Fail,
+                    format!(
+                        "not connected: {}",
+                        reason.unwrap_or("no reason given")
+                    ),
+                ),
+                PanelState::Connected => {
+                    (Severity::Ok, "connected".to_string())
+                }
+            };
+            CheckResult::new(
+                node_check(&n.name, "panel status"),
+                severity,
+                detail,
+            )
+        })
+        .collect()
+}
+
+/// Whether the subscription served exactly the channels the panel resolved.
+///
+/// The join by remark is what gives every channel its outbound, so a mismatch
+/// means channels are probed with the wrong config or not at all while the
+/// panel still looks healthy. Sets and not counts: one channel dropped and
+/// another duplicated leaves the counts equal.
+pub fn subscription_coverage(snapshot: &Snapshot) -> CheckResult {
+    if snapshot.hwid_stub {
+        return CheckResult::fail(
+            "subscription coverage",
+            super::HWID_STUB_DETAIL,
+        );
+    }
+    let coverage = Coverage::of(snapshot);
+    // Asked for once and used for both: a run is healthy exactly when there is
+    // nothing to report.
+    let gaps = coverage.gaps();
+    let (severity, detail) = if gaps.is_empty() {
+        (
+            Severity::Ok,
+            format!(
+                "subscription served all {} resolved channels",
+                coverage.resolved
+            ),
+        )
+    } else {
+        (Severity::Fail, gaps.join("; "))
+    };
+    CheckResult::new("subscription coverage", severity, detail)
+}
+
+/// How the channels the panel resolved and the remarks the subscription served
+/// failed to line up.
+///
+/// Ordered sets, not lists: a remark can be missing, unexpected or duplicated
+/// only once, and the order should not depend on how the snapshot was built.
+/// Both hold today because these come out of a `BTree*`; keeping them in the
+/// types stops a rewrite from quietly reporting a name twice.
+struct Coverage<'a> {
+    /// How many channels the panel resolved, for the healthy message.
+    resolved: usize,
+    /// Resolved by the panel, never served by the subscription.
+    missing: BTreeSet<&'a str>,
+    /// Served by the subscription, never resolved by the panel.
+    unexpected: BTreeSet<&'a str>,
+    /// Served more than once, with how many. The count says which mistake this
+    /// is: twice is one duplicated host, a dozen is a remark template
+    /// collapsing that many hosts onto one name.
+    duplicated: BTreeMap<&'a str, usize>,
+}
+
+impl<'a> Coverage<'a> {
+    fn of(snapshot: &'a Snapshot) -> Self {
+        let resolved: BTreeSet<&str> = snapshot
+            .channels
+            .iter()
+            .map(|c| c.remark.as_str())
+            .collect();
+        // One pass: the served set and the ones served more than once come out
+        // of the same tally.
+        let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+        for remark in &snapshot.served_remarks {
+            *tally.entry(remark.as_str()).or_default() += 1;
+        }
+        let served: BTreeSet<&str> = tally.keys().copied().collect();
+
+        Self {
+            resolved: resolved.len(),
+            missing: resolved.difference(&served).copied().collect(),
+            unexpected: served.difference(&resolved).copied().collect(),
+            // A remark served twice makes the join ambiguous: both channels
+            // would be probed with whichever outbound won, so one is reported
+            // on evidence that is not its own.
+            duplicated: tally
+                .into_iter()
+                .filter(|(_, times)| *times > 1)
+                .collect(),
+        }
+    }
+
+    /// Every way the two sides disagree, one description apiece.
+    ///
+    /// The only place that enumerates the kinds of disagreement: a fourth kind
+    /// is a row here and nothing else.
+    fn gaps(&self) -> Vec<String> {
+        let named = |remarks: &BTreeSet<&str>| commas(remarks.iter().copied());
+        let counted = commas(
+            self.duplicated
+                .iter()
+                .map(|(remark, times)| format!("{remark} \u{00d7}{times}")),
+        );
+
+        // An empty rendering is an absent gap.
+        [
+            ("not served", named(&self.missing)),
+            ("served but not resolved by the panel", named(&self.unexpected)),
+            (
+                "served more than once, so their configs cannot be told apart",
+                counted,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, remarks)| !remarks.is_empty())
+        .map(|(what, remarks)| format!("{what}: {remarks}"))
+        .collect()
+    }
+}
+
+/// Inbounds live on a node that never reach the monitoring user — typically the
+/// user was not added to the squad, so the channel drops out of every check.
+pub fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
+    let covered: BTreeSet<&str> = snapshot
+        .channels
+        .iter()
+        .map(|c| c.inbound_tag.as_str())
+        .collect();
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+    for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
+        for tag in &node.inbound_tags {
+            if covered.contains(tag.as_str()) || !seen.insert(tag.as_str()) {
+                continue;
+            }
+            out.push(CheckResult::warn(
+                format!("inbound {tag} monitored"),
+                format!(
+                    "inbound '{tag}' on node '{}' is not in the monitoring user's subscription",
+                    node.name
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// Whether the enabled nodes agree on one version of `what`.
+fn version_drift(
+    name: &str,
+    nodes: &[Node],
+    version: impl Fn(&Node) -> Option<&str>,
+) -> CheckResult {
+    let versions: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.is_enabled())
+        .filter_map(&version)
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect();
+    match versions.as_slice() {
+        [] => CheckResult::ok(name, "no versions reported"),
+        [only] => CheckResult::ok(name, format!("all nodes on {only}")),
+        several => CheckResult::warn(
+            name,
+            format!("nodes disagree: {}", several.join(", ")),
+        ),
+    }
+}
+
+/// Client and node must agree on Xray features; drift has broken channels before.
+pub fn xray_version_drift(nodes: &[Node]) -> CheckResult {
+    version_drift("xray version drift", nodes, |n| n.xray_version.as_deref())
+}
+
+/// The node agent (`remnanode`) drifting is the same signal one layer up.
+pub fn remnanode_version_drift(nodes: &[Node]) -> CheckResult {
+    version_drift("remnanode version drift", nodes, |n| {
+        n.node_version.as_deref()
+    })
+}
+
+/// Thresholds the panel-derived checks read.
+#[derive(Debug, Clone, Copy)]
+pub struct PanelThresholds {
+    pub config_warn_days: u32,
+    /// WARN when the 1-minute load exceeds `factor × cpus`.
+    pub load_warn_factor: f64,
+    pub mem_free_warn_pct: u8,
+}
+
+const DAY_SECS: u64 = 86_400;
+
+/// Nobody online on a node the panel calls connected: the node serves nothing,
+/// whatever the panel status says.
+pub fn users_online(nodes: &[Node]) -> Vec<CheckResult> {
+    nodes
+        .iter()
+        .filter(|n| n.is_active())
+        .map(|n| {
+            let name = node_check(&n.name, "users online");
+            if n.users_online == 0 {
+                CheckResult::fail(name, "0 users online on a connected node")
+            } else {
+                CheckResult::ok(name, format!("{} online", n.users_online))
+            }
+        })
+        .collect()
+}
+
+/// A config push restarts xray, so xray's uptime is the age of the applied config.
+pub fn config_age(nodes: &[Node], warn_days: u32) -> Vec<CheckResult> {
+    nodes
+        .iter()
+        .filter(|n| n.is_active())
+        .map(|n| {
+            let name = node_check(&n.name, "config age");
+            let days = n.xray_uptime_secs / DAY_SECS;
+            if n.xray_uptime_secs == 0 {
+                CheckResult::fail(
+                    name,
+                    "xray uptime is 0 on a connected node: the core did not start",
+                )
+            } else if days > u64::from(warn_days) {
+                CheckResult::warn(
+                    name,
+                    format!("{days}d since the last config push"),
+                )
+            } else {
+                CheckResult::ok(
+                    name,
+                    format!("{days}d since the last config push"),
+                )
+            }
+        })
+        .collect()
+}
+
+/// Load and memory as the agent reports them. Nodes without `system` are skipped.
+#[allow(clippy::cast_precision_loss)]
+pub fn host(nodes: &[Node], t: &PanelThresholds) -> Vec<CheckResult> {
+    nodes
+        .iter()
+        .filter(|n| n.is_active())
+        .filter_map(|n| {
+            let s = n.system.as_ref()?;
+            let name = node_check(&n.name, "host");
+            let load1 = s.load_avg.first().copied().unwrap_or(0.0);
+            let cpus = s.cpus.max(1);
+            let mem_free_pct = if s.memory_total == 0 {
+                100.0
+            } else {
+                s.memory_free as f64 * 100.0 / s.memory_total as f64
+            };
+            let mut problems = Vec::new();
+            if load1 > t.load_warn_factor * f64::from(cpus) {
+                problems.push(format!("load {load1:.2} on {cpus} cpu(s)"));
+            }
+            if mem_free_pct < f64::from(t.mem_free_warn_pct) {
+                problems.push(format!("{mem_free_pct:.0}% memory free"));
+            }
+            let summary = format!(
+                "load {load1:.2}/{cpus} cpu, {mem_free_pct:.0}% mem free, up {}d",
+                s.uptime_secs / DAY_SECS
+            );
+            Some(if problems.is_empty() {
+                CheckResult::ok(name, summary)
+            } else {
+                CheckResult::warn(
+                    name,
+                    format!("{}; {summary}", problems.join(", ")),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Every panel-derived check, in report order.
+pub fn all(snapshot: &Snapshot, t: &PanelThresholds) -> Vec<CheckResult> {
+    let nodes = &snapshot.nodes;
+    let mut out = node_status(nodes);
+    out.extend(users_online(nodes));
+    out.extend(config_age(nodes, t.config_warn_days));
+    out.extend(host(nodes, t));
+    out.push(xray_version_drift(nodes));
+    out.push(remnanode_version_drift(nodes));
+    out.push(subscription_coverage(snapshot));
+    out.extend(monitoring_coverage(snapshot));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Channel;
+
+    fn node(
+        name: &str,
+        disabled: bool,
+        connected: bool,
+        version: &str,
+        tags: &[&str],
+    ) -> Node {
+        Node {
+            name: name.into(),
+            address: format!("192.0.2.{}", name.len()),
+            profile_uuid: Some("p".into()),
+            inbound_tags: tags
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            inbound_ports: vec![443],
+            is_disabled: disabled,
+            is_connected: connected,
+            last_status_message: Some("boom".into()),
+            xray_version: Some(version.into()),
+            node_version: Some("3.3.2".into()),
+            ..Default::default()
+        }
+    }
+
+    fn snap(
+        nodes: Vec<Node>,
+        channel_tags: &[&str],
+        served: &[&str],
+    ) -> Snapshot {
+        Snapshot {
+            nodes,
+            channels: channel_tags
+                .iter()
+                .map(|t| Channel {
+                    remark: format!("ch-{t}"),
+                    inbound_tag: (*t).to_string(),
+                    profile_uuid: Some("p".into()),
+                    address: "edge.example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                })
+                .collect(),
+            served_remarks: served
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disabled_node_warns_and_disconnected_node_fails() {
+        let results = node_status(&[
+            node("alpha", true, true, "26.6.27", &["in-a"]),
+            node("beta", false, false, "26.6.27", &["in-b"]),
+            node("gamma", false, true, "26.6.27", &["in-c"]),
+        ]);
+        let by_name = |name: &str| {
+            results.iter().find(|r| r.name == name).unwrap().severity
+        };
+        assert_eq!(by_name("node alpha / panel status"), Severity::Warn);
+        assert_eq!(by_name("node beta / panel status"), Severity::Fail);
+        assert_eq!(by_name("node gamma / panel status"), Severity::Ok);
+        let beta = results
+            .iter()
+            .find(|r| r.name == "node beta / panel status")
+            .unwrap();
+        assert!(
+            beta.detail.contains("boom"),
+            "panel's own message must reach the report"
+        );
+    }
+
+    #[test]
+    fn a_reconnecting_node_warns_without_repeating_a_stale_reason() {
+        // `node` leaves a "boom" in `last_status_message`, as the panel does:
+        // it sets `isConnecting` without clearing the reason of the attempt
+        // before.
+        let mut reconnecting =
+            node("alpha", false, false, "26.6.27", &["in-a"]);
+        reconnecting.is_connecting = true;
+        let results = node_status(&[reconnecting]);
+        assert_eq!(results[0].severity, Severity::Warn);
+        assert_eq!(results[0].detail, "connecting");
+        assert_eq!(results[0].name, "node alpha / panel status");
+    }
+
+    #[test]
+    fn subscription_coverage_is_ok_only_when_the_two_sets_match() {
+        let ok = subscription_coverage(&snap(
+            vec![],
+            &["in-a", "in-b"],
+            &["ch-in-a", "ch-in-b"],
+        ));
+        assert_eq!(ok.severity, Severity::Ok);
+        let bad = subscription_coverage(&snap(vec![], &["in-a", "in-b"], &[]));
+        assert_eq!(bad.severity, Severity::Fail);
+        assert!(
+            bad.detail.contains("ch-in-a") && bad.detail.contains("ch-in-b")
+        );
+    }
+
+    #[test]
+    fn subscription_coverage_names_the_channel_the_subscription_dropped() {
+        let r = subscription_coverage(&snap(
+            vec![],
+            &["in-a", "in-b"],
+            &["ch-in-a"],
+        ));
+        assert_eq!(r.severity, Severity::Fail);
+        assert!(r.detail.contains("ch-in-b"), "{}", r.detail);
+        assert!(!r.detail.contains("ch-in-a"), "{}", r.detail);
+    }
+
+    #[test]
+    fn one_channel_dropped_and_another_duplicated_no_longer_cancels_out() {
+        // The counts match (two resolved, two served) but the join is broken.
+        let r = subscription_coverage(&snap(
+            vec![],
+            &["in-a", "in-b"],
+            &["ch-in-a", "ch-in-a"],
+        ));
+        assert_eq!(r.severity, Severity::Fail);
+        assert!(r.detail.contains("ch-in-b"), "{}", r.detail);
+        assert!(r.detail.contains("more than once"), "{}", r.detail);
+        // The count is part of the reason: two is a duplicated host, a dozen is
+        // a remark template collapsing that many hosts onto one name.
+        assert!(r.detail.contains("ch-in-a \u{00d7}2"), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_remark_served_but_never_resolved_also_fails() {
+        let r = subscription_coverage(&snap(
+            vec![],
+            &["in-a"],
+            &["ch-in-a", "ch-ghost"],
+        ));
+        assert_eq!(r.severity, Severity::Fail);
+        assert!(r.detail.contains("ch-ghost"), "{}", r.detail);
+    }
+
+    #[test]
+    fn inbound_not_covered_by_the_monitoring_user_warns() {
+        let s = snap(
+            vec![node(
+                "alpha",
+                false,
+                true,
+                "26.6.27",
+                &["in-a", "in-lonely"],
+            )],
+            &["in-a"],
+            &["ch-in-a"],
+        );
+        let results = monitoring_coverage(&s);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].severity, Severity::Warn);
+        assert!(results[0].detail.contains("in-lonely"));
+        assert_eq!(results[0].name, "inbound in-lonely monitored");
+    }
+
+    #[test]
+    fn disabled_nodes_do_not_produce_coverage_warnings() {
+        let s = snap(
+            vec![node("alpha", true, true, "26.6.27", &["in-lonely"])],
+            &[],
+            &[],
+        );
+        assert!(monitoring_coverage(&s).is_empty());
+    }
+
+    #[test]
+    fn xray_version_drift_warns_only_when_versions_differ() {
+        let same = xray_version_drift(&[
+            node("alpha", false, true, "26.6.27", &[]),
+            node("beta", false, true, "26.6.27", &[]),
+        ]);
+        assert_eq!(same.severity, Severity::Ok);
+
+        let drifted = xray_version_drift(&[
+            node("alpha", false, true, "26.6.27", &[]),
+            node("beta", false, true, "26.3.27", &[]),
+        ]);
+        assert_eq!(drifted.severity, Severity::Warn);
+        assert!(
+            drifted.detail.contains("26.3.27")
+                && drifted.detail.contains("26.6.27")
+        );
+    }
+
+    #[test]
+    fn remnanode_version_drift_reads_the_agent_version() {
+        let mut a = node("alpha", false, true, "26.6.27", &[]);
+        let mut b = node("beta", false, true, "26.6.27", &[]);
+        a.node_version = Some("3.3.2".into());
+        b.node_version = Some("3.2.3".into());
+        let r = remnanode_version_drift(&[a, b]);
+        assert_eq!(r.severity, Severity::Warn);
+        assert_eq!(r.name, "remnanode version drift");
+        assert!(
+            r.detail.contains("3.2.3") && r.detail.contains("3.3.2"),
+            "{}",
+            r.detail
+        );
+    }
+
+    use crate::model::HostStats;
+    use rstest::rstest;
+
+    fn thresholds() -> PanelThresholds {
+        PanelThresholds {
+            config_warn_days: 7,
+            load_warn_factor: 2.0,
+            mem_free_warn_pct: 10,
+        }
+    }
+
+    fn active(name: &str) -> Node {
+        Node {
+            name: name.into(),
+            address: "192.0.2.10".into(),
+            is_connected: true,
+            users_online: 12,
+            xray_uptime_secs: 3 * 86_400,
+            ..Default::default()
+        }
+    }
+
+    #[rstest]
+    #[case::connected_with_users(false, true, 12, Some(Severity::Ok))]
+    #[case::connected_with_nobody(false, true, 0, Some(Severity::Fail))]
+    #[case::disconnected_is_skipped(false, false, 0, None)]
+    #[case::disabled_is_skipped(true, true, 0, None)]
+    fn users_online_judges_only_active_nodes(
+        #[case] disabled: bool,
+        #[case] connected: bool,
+        #[case] online: u64,
+        #[case] expected: Option<Severity>,
+    ) {
+        let mut n = active("alpha");
+        n.is_disabled = disabled;
+        n.is_connected = connected;
+        n.users_online = online;
+        let r = users_online(&[n]);
+        assert_eq!(r.first().map(|r| r.severity), expected);
+        if let Some(r) = r.first() {
+            assert_eq!(r.name, "node alpha / users online");
+        }
+    }
+
+    #[rstest]
+    #[case::core_never_started(0, Severity::Fail)]
+    #[case::fresh(3 * 86_400, Severity::Ok)]
+    #[case::stale(9 * 86_400, Severity::Warn)]
+    fn config_age_reads_xray_uptime(
+        #[case] uptime: u64,
+        #[case] expected: Severity,
+    ) {
+        let mut n = active("alpha");
+        n.xray_uptime_secs = uptime;
+        let r = config_age(&[n], 7);
+        assert_eq!(r[0].severity, expected, "{}", r[0].detail);
+        assert_eq!(r[0].name, "node alpha / config age");
+    }
+
+    #[rstest]
+    #[case::calm(0.5, 2, 50, Severity::Ok)]
+    #[case::overloaded(5.0, 2, 50, Severity::Warn)]
+    #[case::out_of_memory(0.5, 2, 5, Severity::Warn)]
+    fn host_warns_on_load_or_memory(
+        #[case] load1: f64,
+        #[case] cpus: u32,
+        #[case] mem_free_pct: u64,
+        #[case] expected: Severity,
+    ) {
+        let mut n = active("alpha");
+        n.system = Some(HostStats {
+            cpus,
+            memory_total: 1_000,
+            memory_free: mem_free_pct * 10,
+            load_avg: vec![load1, load1, load1],
+            uptime_secs: 40 * 86_400,
+        });
+        let r = host(&[n], &thresholds());
+        assert_eq!(r[0].severity, expected, "{}", r[0].detail);
+        assert_eq!(r[0].name, "node alpha / host");
+        assert!(r[0].detail.contains("40d"), "{}", r[0].detail);
+    }
+
+    #[test]
+    fn a_node_without_system_stats_has_no_host_result() {
+        assert!(host(&[active("alpha")], &thresholds()).is_empty());
+    }
+
+    #[test]
+    fn the_hwid_stub_fails_coverage_with_the_fix_in_the_detail() {
+        let mut s = snap(vec![], &["in-a"], &[]);
+        s.hwid_stub = true;
+        let r = subscription_coverage(&s);
+        assert_eq!(r.severity, Severity::Fail);
+        assert!(r.detail.contains("REMNAWAVE_HWID"), "{}", r.detail);
+    }
+
+    #[test]
+    fn all_runs_every_panel_family_in_report_order() {
+        let s = snap(vec![active("alpha")], &["in-a"], &["ch-in-a"]);
+        let names: Vec<String> =
+            all(&s, &thresholds()).into_iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "node alpha / panel status",
+                "node alpha / users online",
+                "node alpha / config age",
+                "xray version drift",
+                "remnanode version drift",
+                "subscription coverage",
+            ]
+        );
+    }
+}
