@@ -213,90 +213,143 @@ fn error_detail(err: &openssh::Error) -> String {
 mod tests {
     use super::*;
 
+    const ACME_WITH_SPACE: &str = "/home/deploy/my acme";
+
     #[test]
-    fn commands_quote_configured_values_and_never_nest_a_shell() {
-        let c = Commands::new("/home/deploy/my acme", Some("beta.example.com"));
+    fn a_configured_path_is_quoted_wherever_it_appears() {
+        let sut = Commands::new(ACME_WITH_SPACE, None);
+
         assert!(
-            c.renewal
+            sut.renewal
                 .starts_with("sudo find '/home/deploy/my acme' -mindepth 2"),
             "{}",
-            c.renewal
+            sut.renewal
         );
         assert!(
-            c.renewal.contains("|| find '/home/deploy/my acme'"),
+            sut.renewal.contains("|| find '/home/deploy/my acme'"),
             "{}",
-            c.renewal
+            sut.renewal
         );
-        assert!(c.renewal.contains("|| ufw status"), "{}", c.renewal);
+    }
+
+    #[test]
+    fn the_renewal_command_reports_whether_port_80_is_reachable() {
+        let sut = Commands::new(ACME_WITH_SPACE, None);
+
+        assert!(sut.renewal.contains("|| ufw status"), "{}", sut.renewal);
         assert!(
-            c.renewal.contains(PORT80_OPEN)
-                && c.renewal.contains(PORT80_CLOSED)
+            sut.renewal.contains(PORT80_OPEN)
+                && sut.renewal.contains(PORT80_CLOSED)
         );
+    }
+
+    /// A nested shell would undo the quoting above, so no command may spawn one.
+    #[test]
+    fn no_command_nests_a_shell() {
+        let sut = Commands::new(ACME_WITH_SPACE, Some("beta.example.com"));
+
+        for cmd in [
+            &sut.docker_ps,
+            &sut.unhealthy,
+            &sut.listening,
+            &sut.renewal,
+            sut.cert.as_ref().unwrap(),
+        ] {
+            assert!(!cmd.contains("sh -c"), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_node_with_a_domain_is_asked_for_its_certificate() {
+        let sut = Commands::new("/root/.acme.sh", Some("beta.example.com"));
+
         assert!(
-            c.cert
+            sut.cert
                 .as_deref()
                 .unwrap()
                 .contains("-servername beta.example.com")
         );
-        for cmd in [
-            &c.docker_ps,
-            &c.unhealthy,
-            &c.listening,
-            &c.renewal,
-            c.cert.as_ref().unwrap(),
-        ] {
-            assert!(!cmd.contains("sh -c"), "{cmd}");
-        }
-        assert!(Commands::new("/root/.acme.sh", None).cert.is_none());
+    }
+
+    #[test]
+    fn a_node_without_a_domain_has_no_certificate_command() {
+        let sut = Commands::new("/root/.acme.sh", None);
+
+        assert!(sut.cert.is_none());
     }
 
     #[test]
     fn a_hostile_domain_cannot_break_out_of_the_command() {
-        let c = Commands::new("/root/.acme.sh", Some("x; id #"));
+        let sut = Commands::new("/root/.acme.sh", Some("x; id #"));
+
         assert!(
-            c.cert
+            sut.cert
                 .as_deref()
                 .unwrap()
                 .contains("-connect 'x; id #':443"),
             "{:?}",
-            c.cert
+            sut.cert
         );
     }
 
     #[test]
-    fn a_secret_file_is_private_and_newline_terminated() {
-        let f =
+    fn a_secret_file_is_readable_only_by_its_owner() {
+        let sut =
             secret_file("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap();
+
         let mode =
-            std::fs::metadata(f.path()).unwrap().permissions().mode() & 0o777;
+            std::fs::metadata(sut.path()).unwrap().permissions().mode() & 0o777;
+
         assert_eq!(mode, 0o600);
-        let text = std::fs::read_to_string(f.path()).unwrap();
+    }
+
+    /// ssh rejects a key whose last line is not terminated.
+    #[test]
+    fn a_secret_file_ends_with_a_newline() {
+        let sut =
+            secret_file("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap();
+
+        let text = std::fs::read_to_string(sut.path()).unwrap();
+
         assert!(text.ends_with("-----END KEY-----\n"));
-        let path = f.path().to_path_buf();
-        drop(f);
+    }
+
+    #[test]
+    fn a_secret_file_vanishes_with_the_runner() {
+        let sut =
+            secret_file("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap();
+        let path = sut.path().to_path_buf();
+
+        drop(sut);
+
         assert!(!path.exists(), "the key file must vanish with the runner");
     }
 
     #[test]
     fn a_failed_connection_is_reported_in_sshs_own_words() {
-        let e = openssh::Error::Connect(std::io::Error::other(
+        let sut = openssh::Error::Connect(std::io::Error::other(
             "warming up\nPermission denied (publickey).\n",
         ));
-        assert_eq!(error_detail(&e), "Permission denied (publickey).");
-        assert_eq!(
-            error_detail(&openssh::Error::Connect(std::io::Error::other(
-                "x".repeat(500)
-            )))
-            .chars()
-            .count(),
-            120
-        );
+
+        let detail = error_detail(&sut);
+
+        assert_eq!(detail, "Permission denied (publickey).");
+    }
+
+    #[test]
+    fn a_long_connection_error_is_cut_to_a_readable_length() {
+        let sut =
+            openssh::Error::Connect(std::io::Error::other("x".repeat(500)));
+
+        let detail = error_detail(&sut);
+
+        assert_eq!(detail.chars().count(), 120);
     }
 
     #[tokio::test]
     #[ignore = "needs the ssh binary and a host that refuses port 22"]
     async fn an_unreachable_host_yields_a_reason_from_the_real_transport() {
-        let runner = SshRunner::new(SshConfig {
+        let sut = SshRunner::new(SshConfig {
             user: Some("root".into()),
             port: 22,
             private_key: None,
@@ -306,7 +359,10 @@ mod tests {
             acme_dir: "/root/.acme.sh".into(),
         })
         .unwrap();
-        match runner.gather("127.0.0.1", None).await {
+
+        let outcome = sut.gather("127.0.0.1", None).await;
+
+        match outcome {
             SshOutcome::Unreachable(reason) => assert!(!reason.is_empty()),
             SshOutcome::Reached(_) => {
                 panic!("a host with no sshd is unreachable")

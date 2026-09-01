@@ -123,19 +123,12 @@ impl PanelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{client, envelope};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const NODE: &str = "11111111-1111-4111-8111-111111111111";
-
-    fn envelope(v: &Value) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({ "response": v }))
-    }
-
-    fn client(server: &MockServer) -> PanelClient {
-        PanelClient::new(&server.uri(), "tok", Duration::from_secs(5), None)
-            .unwrap()
-    }
+    const POLL: Duration = Duration::from_millis(10);
 
     async fn mount_start(server: &MockServer) {
         Mock::given(method("POST"))
@@ -148,36 +141,45 @@ mod tests {
             .await;
     }
 
+    /// Answers every poll with `job` from here on.
+    async fn mount_poll(server: &MockServer, job: &Value) {
+        Mock::given(method("GET"))
+            .and(path("/api/connections/geocheck/job-1"))
+            .respond_with(envelope(job))
+            .mount(server)
+            .await;
+    }
+
+    fn pending() -> Value {
+        json!({"isCompleted": false, "isFailed": false, "result": null})
+    }
+
     #[tokio::test]
     async fn a_job_is_polled_until_it_completes() {
         let server = MockServer::start().await;
         mount_start(&server).await;
         Mock::given(method("GET"))
             .and(path("/api/connections/geocheck/job-1"))
-            .respond_with(envelope(
-                &json!({"isCompleted": false, "isFailed": false, "result": null}),
-            ))
+            .respond_with(envelope(&pending()))
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/api/connections/geocheck/job-1"))
-            .respond_with(envelope(&json!({"isCompleted": true, "isFailed": false,
+        mount_poll(
+            &server,
+            &json!({"isCompleted": true, "isFailed": false,
                 "result": {"success": true, "nodeUuid": NODE, "image": null, "message": null,
-                           "rawReport": {"identity": {"ipv4": "192.0.2.20", "asn": 64500}}}})))
-            .mount(&server)
-            .await;
-        let out = client(&server)
-            .geocheck_with(
-                NODE,
-                Duration::from_secs(5),
-                Duration::from_millis(10),
-            )
-            .await;
-        match out {
-            GeoOutcome::Done(f) => {
-                assert_eq!(f.egress, parse_ip("192.0.2.20"));
-                assert_eq!(f.report["identity"]["asn"], 64500);
+                           "rawReport": {"identity": {"ipv4": "192.0.2.20", "asn": 64500}}}}),
+        )
+        .await;
+        let sut = client(&server);
+
+        let outcome =
+            sut.geocheck_with(NODE, Duration::from_secs(5), POLL).await;
+
+        match outcome {
+            GeoOutcome::Done(facts) => {
+                assert_eq!(facts.egress, parse_ip("192.0.2.20"));
+                assert_eq!(facts.report["identity"]["asn"], 64500);
             }
             GeoOutcome::Failed(e) => panic!("{e}"),
         }
@@ -187,43 +189,34 @@ mod tests {
     async fn a_failed_job_carries_the_nodes_message() {
         let server = MockServer::start().await;
         mount_start(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/api/connections/geocheck/job-1"))
-            .respond_with(envelope(&json!({"isCompleted": true, "isFailed": true,
-                "result": {"success": false, "message": "node too old", "rawReport": null}})))
-            .mount(&server)
-            .await;
-        let out = client(&server)
-            .geocheck_with(
-                NODE,
-                Duration::from_secs(5),
-                Duration::from_millis(10),
-            )
-            .await;
-        assert_eq!(out, GeoOutcome::Failed("node too old".into()));
+        mount_poll(
+            &server,
+            &json!({"isCompleted": true, "isFailed": true,
+                "result": {"success": false, "message": "node too old", "rawReport": null}}),
+        )
+        .await;
+        let sut = client(&server);
+
+        let outcome =
+            sut.geocheck_with(NODE, Duration::from_secs(5), POLL).await;
+
+        assert_eq!(outcome, GeoOutcome::Failed("node too old".into()));
     }
 
     #[tokio::test]
     async fn a_job_that_never_completes_times_out() {
         let server = MockServer::start().await;
         mount_start(&server).await;
-        Mock::given(method("GET"))
-            .and(path("/api/connections/geocheck/job-1"))
-            .respond_with(envelope(
-                &json!({"isCompleted": false, "isFailed": false, "result": null}),
-            ))
-            .mount(&server)
+        mount_poll(&server, &pending()).await;
+        let sut = client(&server);
+
+        let outcome = sut
+            .geocheck_with(NODE, Duration::from_millis(50), POLL)
             .await;
-        let out = client(&server)
-            .geocheck_with(
-                NODE,
-                Duration::from_millis(50),
-                Duration::from_millis(10),
-            )
-            .await;
+
         assert!(
-            matches!(out, GeoOutcome::Failed(ref e) if e.starts_with("timeout")),
-            "{out:?}"
+            matches!(outcome, GeoOutcome::Failed(ref e) if e.starts_with("timeout")),
+            "{outcome:?}"
         );
     }
 
@@ -237,16 +230,14 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let out = client(&server)
-            .geocheck_with(
-                NODE,
-                Duration::from_secs(1),
-                Duration::from_millis(10),
-            )
-            .await;
+        let sut = client(&server);
+
+        let outcome =
+            sut.geocheck_with(NODE, Duration::from_secs(1), POLL).await;
+
         assert!(
-            matches!(out, GeoOutcome::Failed(ref e) if e.contains("403")),
-            "{out:?}"
+            matches!(outcome, GeoOutcome::Failed(ref e) if e.contains("403")),
+            "{outcome:?}"
         );
     }
 }

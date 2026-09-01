@@ -7,5 +7,8 @@ pub mod probe;
 pub mod ssh;
 pub mod tls;
 pub mod xhttp;
+
+#[cfg(test)]
+mod test_util;
 pub use panel::{Hwid, PanelClient};
 pub use ssh::{SshConfig, SshRunner};

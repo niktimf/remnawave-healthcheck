@@ -78,13 +78,20 @@ mod tests {
 
     #[test]
     fn both_url_forms_are_built_from_one_path() {
-        let (a, b) = urls("cdn.example.com", 443, "/api/v1/traces/submit/");
-        assert_eq!(a, "https://cdn.example.com:443/api/v1/traces/submit?v=0");
-        assert_eq!(b, "https://cdn.example.com:443/api/v1/traces/submit/?v=0");
+        let sut = urls("cdn.example.com", 443, "/api/v1/traces/submit/");
+
+        assert_eq!(
+            sut.0,
+            "https://cdn.example.com:443/api/v1/traces/submit?v=0"
+        );
+        assert_eq!(
+            sut.1,
+            "https://cdn.example.com:443/api/v1/traces/submit/?v=0"
+        );
     }
 
     #[tokio::test]
-    async fn statuses_are_read_as_numbers_and_errors_as_text() {
+    async fn a_served_status_is_read_as_a_number_for_either_path_form() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/p"))
@@ -92,29 +99,36 @@ mod tests {
             .respond_with(ResponseTemplate::new(400))
             .mount(&server)
             .await;
-        let client = Client::new();
-        assert_eq!(
-            status(&client, &format!("{}/p?v=0", server.uri())).await,
-            Ok(400)
-        );
-        assert_eq!(
-            status(&client, &format!("{}/p/?v=0", server.uri())).await,
-            Ok(404)
-        );
-        assert!(status(&client, "http://127.0.0.1:9/p").await.is_err());
+        let sut = Client::new();
+
+        let without_slash =
+            status(&sut, &format!("{}/p?v=0", server.uri())).await;
+        let with_slash =
+            status(&sut, &format!("{}/p/?v=0", server.uri())).await;
+
+        assert_eq!(without_slash, Ok(400));
+        assert_eq!(with_slash, Ok(404));
+    }
+
+    #[tokio::test]
+    async fn a_host_that_refuses_the_connection_is_an_error() {
+        let sut = Client::new();
+
+        let outcome = status(&sut, "http://127.0.0.1:9/p").await;
+
+        assert!(outcome.is_err(), "{outcome:?}");
     }
 
     #[tokio::test]
     async fn a_channel_without_a_path_is_two_errors() {
-        let facts = probe(
-            &Channel {
-                address: "192.0.2.1".into(),
-                port: 443,
-                ..Default::default()
-            },
-            Duration::from_secs(1),
-        )
-        .await;
-        assert!(facts.without_slash.is_err() && facts.with_slash.is_err());
+        let channel = Channel {
+            address: "192.0.2.1".into(),
+            port: 443,
+            ..Default::default()
+        };
+
+        let sut = probe(&channel, Duration::from_secs(1)).await;
+
+        assert!(sut.without_slash.is_err() && sut.with_slash.is_err());
     }
 }

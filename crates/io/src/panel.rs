@@ -620,6 +620,7 @@ fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{client, client_with, envelope, hwid};
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use wiremock::matchers::{header, method, path, query_param};
@@ -631,19 +632,6 @@ mod tests {
         fn matches(&self, request: &wiremock::Request) -> bool {
             !request.headers.contains_key(self.0)
         }
-    }
-
-    fn hwid() -> Hwid {
-        Hwid {
-            hwid: "dev-1".into(),
-            os: "linux".into(),
-            os_version: "1".into(),
-            model: "hc".into(),
-        }
-    }
-
-    fn envelope(v: &Value) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({ "response": v }))
     }
 
     fn node_fixture() -> Value {
@@ -698,44 +686,45 @@ mod tests {
     async fn a_snapshot_is_built_from_five_requests() {
         let server = MockServer::start().await;
         mount_all(&server, rendered_fixture()).await;
-        let client = PanelClient::new(
-            &server.uri(),
-            "tok",
-            Duration::from_secs(5),
-            Some(hwid()),
-        )
-        .unwrap();
-        let s = client.snapshot(42).await.unwrap();
+        let sut = client_with(&server, Some(hwid()));
 
-        let n = &s.nodes[0];
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        let node = &snapshot.nodes[0];
         assert_eq!(
             (
-                n.name.as_str(),
-                n.country_code.as_str(),
-                n.users_online,
-                n.xray_uptime_secs
+                node.name.as_str(),
+                node.country_code.as_str(),
+                node.users_online,
+                node.xray_uptime_secs
             ),
             ("alpha", "DE", 12, 172_800)
         );
-        assert_eq!(n.node_version.as_deref(), Some("3.3.2"));
+        assert_eq!(node.node_version.as_deref(), Some("3.3.2"));
         assert_eq!(
-            n.system
-                .as_ref()
-                .map(|s| (s.cpus, s.memory_free, s.uptime_secs)),
+            node.system.as_ref().map(|s| (
+                s.cpus,
+                s.memory_free,
+                s.uptime_secs
+            )),
             Some((2, 1000, 864_000))
         );
-        assert_eq!(n.inbound_ports, vec![443]);
-        let c = &s.channels[0];
+        assert_eq!(node.inbound_ports, vec![443]);
+        let channel = &snapshot.channels[0];
         assert_eq!(
-            (c.transport.as_deref(), c.path.as_deref(), c.sni.as_deref()),
+            (
+                channel.transport.as_deref(),
+                channel.path.as_deref(),
+                channel.sni.as_deref()
+            ),
             (Some("xhttp"), Some("/p"), Some("cdn.example.com"))
         );
-        assert_eq!(c.outbound["protocol"], "vless");
-        assert_eq!(s.served_remarks, vec!["alpha direct".to_string()]);
-        assert!(s.profiles.contains_key("p-1"));
-        assert!(!s.hwid_stub);
-        assert_eq!(s.sub_host.as_deref(), Some("sub.example.com"));
-        assert_eq!(s.panel_host, "127.0.0.1");
+        assert_eq!(channel.outbound["protocol"], "vless");
+        assert_eq!(snapshot.served_remarks, vec!["alpha direct".to_string()]);
+        assert!(snapshot.profiles.contains_key("p-1"));
+        assert!(!snapshot.hwid_stub);
+        assert_eq!(snapshot.sub_host.as_deref(), Some("sub.example.com"));
+        assert_eq!(snapshot.panel_host, "127.0.0.1");
     }
 
     #[tokio::test]
@@ -743,20 +732,16 @@ mod tests {
         let server = MockServer::start().await;
         let stub = json!([{"remarks": "📱 unsupported", "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "0.0.0.0", "port": 1}]}}]}]);
         mount_all(&server, stub).await;
-        let client = PanelClient::new(
-            &server.uri(),
-            "tok",
-            Duration::from_secs(5),
-            Some(hwid()),
-        )
-        .unwrap();
-        let s = client.snapshot(42).await.unwrap();
-        assert!(s.hwid_stub);
-        assert!(s.channels[0].outbound.is_null());
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert!(snapshot.hwid_stub);
+        assert!(snapshot.channels[0].outbound.is_null());
     }
 
     #[tokio::test]
-    async fn a_5xx_is_retried_and_a_4xx_is_final() {
+    async fn a_5xx_is_retried() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/nodes"))
@@ -769,6 +754,17 @@ mod tests {
             .respond_with(envelope(&json!([])))
             .mount(&server)
             .await;
+        let sut = client(&server);
+
+        let nodes: Vec<NodeDto> =
+            sut.get_json("/api/nodes", Auth::Token).await.unwrap();
+
+        assert!(nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_4xx_is_final_and_tried_once() {
+        let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/config-profiles"))
             .respond_with(
@@ -777,52 +773,71 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = PanelClient::new(
-            &server.uri(),
-            "tok",
-            Duration::from_secs(5),
-            None,
-        )
-        .unwrap();
-        let nodes: Vec<NodeDto> =
-            client.get_json("/api/nodes", Auth::Token).await.unwrap();
-        assert!(nodes.is_empty());
-        let err = client
+        let sut = client(&server);
+
+        let err = sut
             .get_json::<Vec<ProfileDto>>("/api/config-profiles", Auth::Token)
             .await
             .unwrap_err();
+
         assert!(err.to_string().contains("401"), "{err:#}");
     }
 
     #[test]
-    fn rendered_subscription_shapes() {
-        let list = json!([{"remarks": "a", "outbounds": [{"protocol": "vless"}]}, {"remarks": "b", "outbounds": [{"protocol": "trojan"}]}]).to_string();
-        assert_eq!(parse_rendered(&list).unwrap().len(), 2);
-        let lone = json!({"remarks": "a", "outbounds": [{"protocol": "freedom"}, {"protocol": "vless"}]}).to_string();
-        let got = parse_rendered(&lone).unwrap();
-        assert_eq!(got[0].outbound["protocol"], "vless");
-        let no_remark =
-            json!({"outbounds": [{"protocol": "vless"}]}).to_string();
-        assert!(parse_rendered(&no_remark).unwrap().is_empty());
-        assert!(parse_rendered("nonsense").is_err());
+    fn a_list_of_configs_yields_one_channel_each() {
+        let body = json!([{"remarks": "a", "outbounds": [{"protocol": "vless"}]},
+                          {"remarks": "b", "outbounds": [{"protocol": "trojan"}]}])
+        .to_string();
+
+        let sut = parse_rendered(&body).unwrap();
+
+        assert_eq!(sut.len(), 2);
+    }
+
+    #[test]
+    fn a_lone_config_is_read_as_one_channel_with_its_proxy_outbound() {
+        let body = json!({"remarks": "a", "outbounds": [{"protocol": "freedom"}, {"protocol": "vless"}]})
+            .to_string();
+
+        let sut = parse_rendered(&body).unwrap();
+
+        assert_eq!(sut[0].outbound["protocol"], "vless");
+    }
+
+    #[test]
+    fn a_config_without_a_remark_is_dropped() {
+        let body = json!({"outbounds": [{"protocol": "vless"}]}).to_string();
+
+        let sut = parse_rendered(&body).unwrap();
+
+        assert!(sut.is_empty());
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_an_error() {
+        let sut = parse_rendered("nonsense");
+
+        assert!(sut.is_err());
     }
 
     #[test]
     fn a_panel_url_without_a_host_is_refused() {
-        assert!(
-            PanelClient::new("not a url", "t", Duration::from_secs(1), None)
-                .is_err()
-        );
-        assert_eq!(
-            PanelClient::new(
-                "https://panel.example.com/",
-                "t",
-                Duration::from_secs(1),
-                None
-            )
-            .unwrap()
-            .host(),
-            "panel.example.com"
-        );
+        let sut =
+            PanelClient::new("not a url", "t", Duration::from_secs(1), None);
+
+        assert!(sut.is_err());
+    }
+
+    #[test]
+    fn the_host_comes_from_the_panel_url() {
+        let sut = PanelClient::new(
+            "https://panel.example.com/",
+            "t",
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(sut.host(), "panel.example.com");
     }
 }

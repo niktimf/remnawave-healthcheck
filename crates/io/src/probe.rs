@@ -227,15 +227,19 @@ mod tests {
     #[test]
     fn the_outbound_is_used_verbatim_behind_a_local_socks_inbound() {
         let outbound = json!({"protocol": "vless", "settings": {"vnext": [{"address": "edge.example.com", "port": 443}]}});
-        let cfg = build_config(&outbound, 10842);
-        assert_eq!(cfg["outbounds"][0], outbound);
-        assert_eq!(cfg["inbounds"][0]["listen"], "127.0.0.1");
-        assert_eq!(cfg["inbounds"][0]["port"], 10842);
+
+        let sut = build_config(&outbound, 10842);
+
+        assert_eq!(sut["outbounds"][0], outbound);
+        assert_eq!(sut["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(sut["inbounds"][0]["port"], 10842);
     }
 
     #[test]
     fn a_free_port_is_handed_out() {
-        assert!(free_port().unwrap() > 0);
+        let sut = free_port().unwrap();
+
+        assert!(sut > 0);
     }
 
     /// The guarantee this module makes: a failed spawn must not leave the
@@ -243,7 +247,8 @@ mod tests {
     #[tokio::test]
     async fn a_dead_spawn_leaves_no_scratch_dir_behind() {
         let base = tempfile::tempdir().unwrap();
-        let outcome = attempt(
+
+        let sut = attempt(
             Some(base.path()),
             Path::new("/nonexistent/xray-binary"),
             &json!({"protocol": "vless"}),
@@ -251,7 +256,8 @@ mod tests {
             "https://echo.example.com",
         )
         .await;
-        assert!(outcome.is_err(), "{outcome:?}");
+
+        assert!(sut.is_err(), "{sut:?}");
         let leftovers: Vec<_> =
             std::fs::read_dir(base.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
@@ -259,7 +265,15 @@ mod tests {
 
     #[test]
     fn the_stderr_tail_keeps_the_last_lines_only() {
-        assert_eq!(tail("a\n\nb\nc\nd\n", 3, 200), "b / c / d");
-        assert_eq!(tail("x".repeat(500).as_str(), 3, 10).chars().count(), 10);
+        let sut = tail("a\n\nb\nc\nd\n", 3, 200);
+
+        assert_eq!(sut, "b / c / d");
+    }
+
+    #[test]
+    fn the_stderr_tail_is_cut_to_its_character_budget() {
+        let sut = tail("x".repeat(500).as_str(), 3, 10);
+
+        assert_eq!(sut.chars().count(), 10);
     }
 }
