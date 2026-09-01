@@ -1,0 +1,7 @@
+# Tighter than the defaults (25 and 100): this codebase is a pipeline of small
+# pure verdict functions, and anything past these numbers is a function doing
+# two jobs. `excessive-nesting-threshold` has no useful default — 0 disables
+# the lint outright — so it must be spelled out to have any effect.
+cognitive-complexity-threshold = 15
+excessive-nesting-threshold = 4
+too-many-lines-threshold = 100

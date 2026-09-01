@@ -38,6 +38,28 @@ struct ResultDto {
     raw_report: Option<Value>,
 }
 
+/// What a completed job actually yielded. Completion is not success: the job
+/// can finish without a result at all, or with one the node marked failed.
+fn completed(node_uuid: &str, result: Option<ResultDto>) -> GeoOutcome {
+    let Some(result) = result else {
+        return GeoOutcome::Failed("completed without a result".to_string());
+    };
+    if !result.success {
+        return GeoOutcome::Failed(
+            result
+                .message
+                .unwrap_or_else(|| "node reported failure".to_string()),
+        );
+    }
+    let report = result.raw_report.unwrap_or(Value::Null);
+    tracing::debug!(node_uuid, report = %report, "geocheck report");
+    let egress = report
+        .pointer("/identity/ipv4")
+        .and_then(Value::as_str)
+        .and_then(parse_ip);
+    GeoOutcome::Done(GeoFacts { egress, report })
+}
+
 impl PanelClient {
     pub async fn geocheck(
         &self,
@@ -85,23 +107,7 @@ impl PanelClient {
                 );
             }
             if job.is_completed {
-                let Some(result) = job.result else {
-                    return GeoOutcome::Failed(
-                        "completed without a result".to_string(),
-                    );
-                };
-                if !result.success {
-                    return GeoOutcome::Failed(result.message.unwrap_or_else(
-                        || "node reported failure".to_string(),
-                    ));
-                }
-                let report = result.raw_report.unwrap_or(Value::Null);
-                tracing::debug!(node_uuid, report = %report, "geocheck report");
-                let egress = report
-                    .pointer("/identity/ipv4")
-                    .and_then(Value::as_str)
-                    .and_then(parse_ip);
-                return GeoOutcome::Done(GeoFacts { egress, report });
+                return completed(node_uuid, job.result);
             }
             if Instant::now() >= deadline {
                 return GeoOutcome::Failed(format!(

@@ -113,6 +113,15 @@ enum ProbeResult {
     },
 }
 
+/// The address a completed geocheck saw the node leave from. A job that never
+/// completed contributes nothing rather than an absent address.
+fn done_egress(outcome: &GeoOutcome) -> Option<IpAddr> {
+    match outcome {
+        GeoOutcome::Done(facts) => facts.egress,
+        GeoOutcome::Failed(_) => None,
+    }
+}
+
 /// Pure: turn the snapshot and the collected facts into results.
 fn judge(
     snapshot: &Snapshot,
@@ -124,10 +133,8 @@ fn judge(
     let mut egress: HashMap<&str, IpAddr> = HashMap::new();
     for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
         if let Some(out) = c.geo.get(&node.name) {
-            if let GeoOutcome::Done(f) = out {
-                if let Some(ip) = f.egress {
-                    egress.insert(node.name.as_str(), ip);
-                }
+            if let Some(ip) = done_egress(out) {
+                egress.insert(node.name.as_str(), ip);
             }
             results.extend(checks::geo::check_node(
                 node,
@@ -346,14 +353,9 @@ async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
                         .acquire_owned()
                         .await
                         .expect("the semaphore is never closed");
-                    let mut outcome =
-                        probe::probe(&binary, &outbound, timeout, &echo).await;
-                    // Retry only a dead tunnel; a wrong exit is deterministic.
-                    if outcome.exit_ip.is_none() {
-                        outcome =
-                            probe::probe(&binary, &outbound, timeout, &echo)
-                                .await;
-                    }
+                    let outcome =
+                        probe_retrying(&binary, &outbound, timeout, &echo)
+                            .await;
                     (idx, ProbeResult::Probed { expect, outcome })
                 });
             }
@@ -362,6 +364,22 @@ async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
     list.extend(collect(set).await);
     info!(channels = list.len(), "probe: done");
     ProbeStage::Done(list)
+}
+
+/// One tunnel, retried once when it came up dead. A wrong exit is
+/// deterministic and re-running would only report the same address, so a
+/// missing one is the only outcome worth a second attempt.
+async fn probe_retrying(
+    binary: &std::path::Path,
+    outbound: &serde_json::Value,
+    timeout: std::time::Duration,
+    echo: &str,
+) -> ProbeOutcome {
+    let outcome = probe::probe(binary, outbound, timeout, echo).await;
+    if outcome.exit_ip.is_some() {
+        return outcome;
+    }
+    probe::probe(binary, outbound, timeout, echo).await
 }
 
 /// The panel is the only source of truth: failing to read it means nothing
@@ -498,7 +516,7 @@ mod tests {
                 "beta".to_string(),
                 GeoOutcome::Done(GeoFacts {
                     egress: parse_ip("192.0.2.20"),
-                    report: json!({"identity": {"ipv4": "192.0.2.20"}}),
+                    report: json!({"schema": 1, "identity": {"ipv4": "192.0.2.20"}}),
                 }),
             )]),
             ssh: HashMap::from([("beta".to_string(), healthy_ssh())]),

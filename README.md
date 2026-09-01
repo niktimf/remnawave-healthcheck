@@ -31,7 +31,11 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
   monitoring user cannot see.
 - **From geocheck** (a job the panel runs on each node) — the node's real egress address and ASN,
   which country the world sees it in versus what the panel says, IP reputation, connectivity to
-  external services.
+  external services, geocheck's own findings, and how directly the node reaches the internet.
+  The panel stores that report untyped, so its shape comes from the `geocheck` binary rather than
+  from the panel; these checks read the `schema: 1` of
+  [remnawave/geocheck](https://github.com/remnawave/geocheck) v0.3.0 and say so when a node
+  answers with anything else.
 - **From the runner** — TLS certificates of the panel and of the subscription host; both path forms of
   every xhttp inbound answer `400` (guards xray #6307).
 - **Over SSH** (only what the API cannot tell) — containers running and healthy, inbound ports actually
