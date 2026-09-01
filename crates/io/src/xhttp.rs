@@ -76,22 +76,8 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[test]
-    fn both_url_forms_are_built_from_one_path() {
-        let sut = urls("cdn.example.com", 443, "/api/v1/traces/submit/");
-
-        assert_eq!(
-            sut.0,
-            "https://cdn.example.com:443/api/v1/traces/submit?v=0"
-        );
-        assert_eq!(
-            sut.1,
-            "https://cdn.example.com:443/api/v1/traces/submit/?v=0"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_served_status_is_read_as_a_number_for_either_path_form() {
+    /// A server that answers `400` for `/p` and nothing at all for `/p/`.
+    async fn server_answering_the_bare_path() -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/p"))
@@ -99,24 +85,51 @@ mod tests {
             .respond_with(ResponseTemplate::new(400))
             .mount(&server)
             .await;
-        let sut = Client::new();
+        server
+    }
 
-        let without_slash =
-            status(&sut, &format!("{}/p?v=0", server.uri())).await;
-        let with_slash =
-            status(&sut, &format!("{}/p/?v=0", server.uri())).await;
+    #[test]
+    fn both_url_forms_are_built_from_one_path() {
+        let (without_slash, with_slash) =
+            urls("cdn.example.com", 443, "/api/v1/traces/submit/");
 
-        assert_eq!(without_slash, Ok(400));
-        assert_eq!(with_slash, Ok(404));
+        assert_eq!(
+            without_slash,
+            "https://cdn.example.com:443/api/v1/traces/submit?v=0"
+        );
+        assert_eq!(
+            with_slash,
+            "https://cdn.example.com:443/api/v1/traces/submit/?v=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_path_is_read_as_its_status() {
+        let server = server_answering_the_bare_path().await;
+        let client = Client::new();
+
+        let result = status(&client, &format!("{}/p?v=0", server.uri())).await;
+
+        assert_eq!(result, Ok(400));
+    }
+
+    #[tokio::test]
+    async fn a_path_form_the_server_does_not_serve_is_read_as_404() {
+        let server = server_answering_the_bare_path().await;
+        let client = Client::new();
+
+        let result = status(&client, &format!("{}/p/?v=0", server.uri())).await;
+
+        assert_eq!(result, Ok(404));
     }
 
     #[tokio::test]
     async fn a_host_that_refuses_the_connection_is_an_error() {
-        let sut = Client::new();
+        let client = Client::new();
 
-        let outcome = status(&sut, "http://127.0.0.1:9/p").await;
+        let result = status(&client, "http://127.0.0.1:9/p").await;
 
-        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[tokio::test]
@@ -127,8 +140,8 @@ mod tests {
             ..Default::default()
         };
 
-        let sut = probe(&channel, Duration::from_secs(1)).await;
+        let facts = probe(&channel, Duration::from_secs(1)).await;
 
-        assert!(sut.without_slash.is_err() && sut.with_slash.is_err());
+        assert!(facts.without_slash.is_err() && facts.with_slash.is_err());
     }
 }

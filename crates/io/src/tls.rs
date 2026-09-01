@@ -90,18 +90,18 @@ mod tests {
             .unwrap()
             .port();
 
-        let sut = inspect("127.0.0.1", port, Duration::from_secs(2)).await;
+        let facts = inspect("127.0.0.1", port, Duration::from_secs(2)).await;
 
-        assert!(sut.not_after.is_none());
-        assert!(sut.error.is_some(), "{sut:?}");
+        assert!(facts.not_after.is_none());
+        assert!(facts.error.is_some(), "{facts:?}");
     }
 
     #[tokio::test]
     #[ignore = "needs the network"]
     async fn a_public_host_presents_a_certificate_with_an_expiry() {
-        let sut = inspect("example.com", 443, Duration::from_secs(10)).await;
+        let facts = inspect("example.com", 443, Duration::from_secs(10)).await;
 
-        assert!(sut.error.is_none(), "{sut:?}");
-        assert!(sut.not_after.unwrap() > Utc::now());
+        assert!(facts.error.is_none(), "{facts:?}");
+        assert!(facts.not_after.unwrap() > Utc::now());
     }
 }

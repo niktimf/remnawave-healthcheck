@@ -7,40 +7,72 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-#[derive(Debug, Clone, Copy)]
-pub struct GeoThresholds {
-    /// WARN at or above this `reputation.risk`.
-    pub reputation_warn_risk: u32,
-}
-
 /// The `schema` of `remnawave/geocheck` v0.3.0, the release remnanode pins in
 /// its `Dockerfile`. geocheck bumps it whenever the JSON shape changes
 /// incompatibly.
 const GEOCHECK_SCHEMA: u64 = 1;
 
-pub fn check_node(
-    node: &Node,
-    outcome: &GeoOutcome,
-    t: &GeoThresholds,
-) -> Vec<CheckResult> {
-    match outcome {
-        GeoOutcome::Failed(reason) => vec![CheckResult::warn(
-            node_check(&node.name, "geocheck"),
-            format!("no geocheck result: {reason}"),
-        )],
-        GeoOutcome::Done(facts) => {
-            let report = &facts.report;
-            let mut results: Vec<CheckResult> =
-                schema_guard(node, report).into_iter().collect();
-            results.extend([
-                egress(node, facts),
-                geo_consensus(node, report),
-                reputation(node, report, *t),
-                connectivity(node, report),
-                findings(node, report),
-                routing(node, report),
-            ]);
-            results
+/// Reads a geocheck report and says what it means. Holds the one judgement
+/// call the caller gets to make, so the thresholds stop travelling as an
+/// argument through every verdict.
+#[derive(Debug, Clone, Copy)]
+pub struct GeoChecker {
+    /// WARN at or above this `reputation.risk`.
+    pub reputation_warn_risk: u32,
+}
+
+impl GeoChecker {
+    pub fn check_node(
+        &self,
+        node: &Node,
+        outcome: &GeoOutcome,
+    ) -> Vec<CheckResult> {
+        match outcome {
+            GeoOutcome::Failed(reason) => vec![CheckResult::warn(
+                node_check(&node.name, "geocheck"),
+                format!("no geocheck result: {reason}"),
+            )],
+            GeoOutcome::Done(facts) => {
+                let report = &facts.report;
+                let mut results: Vec<CheckResult> =
+                    schema_guard(node, report).into_iter().collect();
+                results.extend([
+                    egress(node, facts),
+                    geo_consensus(node, report),
+                    self.reputation(node, report),
+                    connectivity(node, report),
+                    findings(node, report),
+                    routing(node, report),
+                ]);
+                results
+            }
+        }
+    }
+
+    fn reputation(self, node: &Node, report: &Value) -> CheckResult {
+        let name = node_check(&node.name, "reputation");
+        let rep = &report["reputation"];
+        if !rep.is_object() {
+            return CheckResult::ok(name, "no reputation data");
+        }
+        // geocheck spends one proxycheck.io query per address per run against
+        // an allowance of 100 a day without an API key. Exhausting it answers
+        // with an error and nothing else, which must not read as a clean
+        // address.
+        if let Some(error) = rep.get("error").and_then(Value::as_str) {
+            return CheckResult::warn(
+                name,
+                format!("reputation unavailable: {error}"),
+            );
+        }
+        let risk = rep.get("risk").and_then(Value::as_f64);
+        let detail = reputation_detail(rep, risk);
+        let over =
+            risk.is_some_and(|r| r >= f64::from(self.reputation_warn_risk));
+        if over || compromising(rep) {
+            CheckResult::warn(name, detail)
+        } else {
+            CheckResult::ok(name, detail)
         }
     }
 }
@@ -168,31 +200,6 @@ fn geo_consensus(node: &Node, report: &Value) -> CheckResult {
             name,
             format!("seen as {seen}; panel says {expected}"),
         )
-    }
-}
-
-fn reputation(node: &Node, report: &Value, t: GeoThresholds) -> CheckResult {
-    let name = node_check(&node.name, "reputation");
-    let rep = &report["reputation"];
-    if !rep.is_object() {
-        return CheckResult::ok(name, "no reputation data");
-    }
-    // geocheck spends one proxycheck.io query per address per run against an
-    // allowance of 100 a day without an API key. Exhausting it answers with an
-    // error and nothing else, which must not read as a clean address.
-    if let Some(error) = rep.get("error").and_then(Value::as_str) {
-        return CheckResult::warn(
-            name,
-            format!("reputation unavailable: {error}"),
-        );
-    }
-    let risk = rep.get("risk").and_then(Value::as_f64);
-    let detail = reputation_detail(rep, risk);
-    let over = risk.is_some_and(|r| r >= f64::from(t.reputation_warn_risk));
-    if over || compromising(rep) {
-        CheckResult::warn(name, detail)
-    } else {
-        CheckResult::ok(name, detail)
     }
 }
 
@@ -376,8 +383,8 @@ mod tests {
         })
     }
 
-    fn thresholds() -> GeoThresholds {
-        GeoThresholds {
+    fn checker() -> GeoChecker {
+        GeoChecker {
             reputation_warn_risk: 75,
         }
     }
@@ -405,10 +412,12 @@ mod tests {
     #[test]
     fn a_healthy_report_is_six_ok_results_in_order() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let names: Vec<&str> = sut.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> =
+            results.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
             [
@@ -420,17 +429,21 @@ mod tests {
                 "node beta / routing"
             ]
         );
-        assert!(sut.iter().all(|r| r.severity == Severity::Ok), "{sut:?}");
+        assert!(
+            results.iter().all(|r| r.severity == Severity::Ok),
+            "{results:?}"
+        );
     }
 
     #[test]
     fn a_healthy_report_names_the_egress_with_its_network() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
         assert_eq!(
-            by_aspect(&sut, "egress address").detail,
+            by_aspect(&results, "egress address").detail,
             "egress 192.0.2.20 AS64500 (Example Hosting)"
         );
     }
@@ -441,10 +454,11 @@ mod tests {
             egress: None,
             report: geocheck_report(),
         });
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let egress = by_aspect(&sut, "egress address");
+        let egress = by_aspect(&results, "egress address");
         assert_eq!(egress.severity, Severity::Warn);
         assert!(
             egress.detail.contains("cannot be verified"),
@@ -456,22 +470,24 @@ mod tests {
     #[test]
     fn a_failed_job_is_one_warning() {
         let outcome = GeoOutcome::Failed("timeout after 90s".into());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        assert_eq!(sut.len(), 1);
-        assert_eq!(sut[0].name, "node beta / geocheck");
-        assert_eq!(sut[0].severity, Severity::Warn);
-        assert!(sut[0].detail.contains("timeout"), "{}", sut[0].detail);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "node beta / geocheck");
+        assert_eq!(results[0].severity, Severity::Warn);
+        assert!(results[0].detail.contains("timeout"), "{}", results[0].detail);
     }
 
     #[test]
     fn a_schema_these_checks_were_written_for_adds_no_result() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let guards: Vec<&str> = sut
+        let guards: Vec<&str> = results
             .iter()
             .map(|r| r.name.as_str())
             .filter(|n| n.ends_with("/ geocheck"))
@@ -482,10 +498,11 @@ mod tests {
     #[test]
     fn a_bumped_schema_warns_that_fields_may_be_misread() {
         let outcome = done(report_with("schema", json!(2)));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let guard = by_aspect(&sut, "geocheck");
+        let guard = by_aspect(&results, "geocheck");
         assert_eq!(guard.severity, Severity::Warn);
         assert_eq!(
             guard.detail,
@@ -496,19 +513,21 @@ mod tests {
     #[test]
     fn a_report_without_a_schema_field_warns_too() {
         let outcome = done(json!({"identity": {"ipv4": "192.0.2.20"}}));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        assert_eq!(by_aspect(&sut, "geocheck").severity, Severity::Warn);
+        assert_eq!(by_aspect(&results, "geocheck").severity, Severity::Warn);
     }
 
     #[test]
     fn geo_consensus_reads_the_code_out_of_the_ipv4_array() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let consensus = by_aspect(&sut, "geo consensus");
+        let consensus = by_aspect(&results, "geo consensus");
         assert_eq!(consensus.severity, Severity::Ok);
         assert_eq!(consensus.detail, "seen as DE 61%, US 33%, RU 6%");
     }
@@ -521,10 +540,11 @@ mod tests {
                 {"code": "DE", "country": "Germany", "count": 4, "total": 4, "percent": 100.0}
             ]}),
         ));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let consensus = by_aspect(&sut, "geo consensus");
+        let consensus = by_aspect(&results, "geo consensus");
         assert_eq!(consensus.severity, Severity::Ok);
         assert_eq!(consensus.detail, "seen as DE 100% (IPv6)");
     }
@@ -532,10 +552,11 @@ mod tests {
     #[test]
     fn a_consensus_disagreeing_with_the_panel_warns() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "US"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "US"), &outcome);
 
-        let consensus = by_aspect(&sut, "geo consensus");
+        let consensus = by_aspect(&results, "geo consensus");
         assert_eq!(consensus.severity, Severity::Warn);
         assert_eq!(
             consensus.detail,
@@ -552,10 +573,11 @@ mod tests {
         #[case] detail: &str,
     ) {
         let outcome = done(json!({"identity": {"ipv4": "192.0.2.20"}}));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let result = by_aspect(&sut, aspect);
+        let result = by_aspect(&results, aspect);
         assert_eq!(result.severity, Severity::Ok);
         assert_eq!(result.detail, detail);
     }
@@ -563,10 +585,11 @@ mod tests {
     #[test]
     fn a_hosting_address_at_its_resting_risk_is_not_a_warning() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let reputation = by_aspect(&sut, "reputation");
+        let reputation = by_aspect(&results, "reputation");
         assert_eq!(reputation.severity, Severity::Ok);
         assert_eq!(reputation.detail, "risk 50, flags: VPN, hosting");
     }
@@ -580,10 +603,11 @@ mod tests {
         #[case] expected: Severity,
     ) {
         let outcome = done(reputation_with("risk", risk));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let reputation = by_aspect(&sut, "reputation");
+        let reputation = by_aspect(&results, "reputation");
         assert_eq!(reputation.severity, expected);
         assert!(
             reputation.detail.starts_with("risk "),
@@ -598,10 +622,11 @@ mod tests {
             "reputation",
             json!({"error": "proxycheck.io daily query allowance exhausted"}),
         ));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let reputation = by_aspect(&sut, "reputation");
+        let reputation = by_aspect(&results, "reputation");
         assert_eq!(reputation.severity, Severity::Warn);
         assert_eq!(
             reputation.detail,
@@ -620,19 +645,21 @@ mod tests {
         reputation["risk"] = json!(5);
         reputation[flag] = json!(true);
         let outcome = done(report_with("reputation", reputation));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        assert_eq!(by_aspect(&sut, "reputation").severity, Severity::Warn);
+        assert_eq!(by_aspect(&results, "reputation").severity, Severity::Warn);
     }
 
     #[test]
     fn a_report_with_nothing_flagged_says_so() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let findings = by_aspect(&sut, "geocheck findings");
+        let findings = by_aspect(&results, "geocheck findings");
         assert_eq!(findings.severity, Severity::Ok);
         assert_eq!(findings.detail, "nothing flagged");
     }
@@ -647,10 +674,11 @@ mod tests {
                 {"id": "clock-skew", "title": "Clock skew", "severity": "warn", "detail": "12s"}
             ]),
         ));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let findings = by_aspect(&sut, "geocheck findings");
+        let findings = by_aspect(&results, "geocheck findings");
         assert_eq!(findings.severity, Severity::Warn);
         assert_eq!(
             findings.detail,
@@ -666,10 +694,11 @@ mod tests {
                 {"id": "no-ipv6", "title": "No IPv6", "severity": "info", "detail": "v4 only"}
             ]),
         ));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let findings = by_aspect(&sut, "geocheck findings");
+        let findings = by_aspect(&results, "geocheck findings");
         assert_eq!(findings.severity, Severity::Ok);
         assert_eq!(findings.detail, "No IPv6 (info)");
     }
@@ -677,10 +706,11 @@ mod tests {
     #[test]
     fn routing_reports_the_score_and_the_latency_floor() {
         let outcome = done(geocheck_report());
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let routing = by_aspect(&sut, "routing");
+        let routing = by_aspect(&results, "routing");
         assert_eq!(routing.severity, Severity::Ok);
         assert_eq!(routing.detail, "score 82/100, floor 8.1 ms");
     }
@@ -691,10 +721,11 @@ mod tests {
         routing["breakdown"]["intercepted"] = json!(1);
         routing["targets"][0]["verdict"] = json!("intercepted");
         let outcome = done(report_with("connectivity", routing));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let result = by_aspect(&sut, "routing");
+        let result = by_aspect(&results, "routing");
         assert_eq!(result.severity, Severity::Warn);
         assert_eq!(result.detail, "intercepted: Cloudflare DNS");
     }
@@ -706,10 +737,11 @@ mod tests {
     #[case::unprivileged("privileged")]
     fn routing_without_a_usable_trace_is_no_data(#[case] field: &str) {
         let outcome = done(routing_with(field, json!(false)));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let routing = by_aspect(&sut, "routing");
+        let routing = by_aspect(&results, "routing");
         assert_eq!(routing.severity, Severity::Ok);
         assert_eq!(routing.detail, "no routing data");
     }
@@ -727,10 +759,11 @@ mod tests {
                 ]
             }),
         ));
+        let sut = checker();
 
-        let sut = check_node(&node("beta", "DE"), &outcome, &thresholds());
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
 
-        let result = by_aspect(&sut, "connectivity");
+        let result = by_aspect(&results, "connectivity");
         assert_eq!(result.severity, Severity::Warn);
         assert_eq!(result.detail, "youtube: altered, plain http blocked");
     }

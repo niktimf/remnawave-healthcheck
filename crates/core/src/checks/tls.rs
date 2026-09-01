@@ -72,9 +72,12 @@ mod tests {
         #[case] expected: Severity,
         #[case] mentions: &str,
     ) {
-        let r = check("panel.example.com", &facts(days, error), now(), 14);
-        assert_eq!(r.name, "tls panel.example.com");
-        assert_eq!(r.severity, expected, "{}", r.detail);
-        assert!(r.detail.contains(mentions), "{}", r.detail);
+        let facts = facts(days, error);
+
+        let result = check("panel.example.com", &facts, now(), 14);
+
+        assert_eq!(result.name, "tls panel.example.com");
+        assert_eq!(result.severity, expected, "{}", result.detail);
+        assert!(result.detail.contains(mentions), "{}", result.detail);
     }
 }

@@ -170,6 +170,22 @@ mod tests {
         }
     }
 
+    /// A snapshot whose nodes carry the given xray versions, the first one
+    /// being the channel's exit.
+    fn fleet(versions: &[(&str, &str, bool)]) -> Snapshot {
+        let mut s = snapshot(json!({}));
+        let template = s.nodes[0].clone();
+        s.nodes.clear();
+        for (name, version, disabled) in versions {
+            let mut node = template.clone();
+            node.name = (*name).to_string();
+            node.xray_version = Some((*version).to_string());
+            node.is_disabled = *disabled;
+            s.nodes.push(node);
+        }
+        s
+    }
+
     fn decided(p: Precheck<'_>) -> CheckResult {
         match p {
             Precheck::Decided(r) => r,
@@ -182,8 +198,11 @@ mod tests {
     #[test]
     fn a_probeable_channel_yields_its_expected_exit() {
         let s = snapshot(json!({"protocol": "vless"}));
-        match precheck(&s.channels[0], &s) {
-            Precheck::Probe(n) => assert_eq!(n.name, "beta"),
+
+        let precheck = precheck(&s.channels[0], &s);
+
+        match precheck {
+            Precheck::Probe(node) => assert_eq!(node.name, "beta"),
             Precheck::Decided(r) => panic!("unexpected {r:?}"),
         }
     }
@@ -191,13 +210,16 @@ mod tests {
     #[test]
     fn a_channel_the_subscription_never_served_fails_without_a_probe() {
         let s = snapshot(Value::Null);
-        let r = decided(precheck(&s.channels[0], &s));
-        assert_eq!(r.severity, Severity::Fail);
-        assert_eq!(r.name, "channel beta direct (beta.example.com:443)");
+
+        let result = decided(precheck(&s.channels[0], &s));
+
+        assert_eq!(result.name, "channel beta direct (beta.example.com:443)");
+        assert_eq!(result.severity, Severity::Fail);
         assert!(
-            r.detail.contains("subscription") && !r.detail.contains("tunnel"),
+            result.detail.contains("subscription")
+                && !result.detail.contains("tunnel"),
             "{}",
-            r.detail
+            result.detail
         );
     }
 
@@ -205,18 +227,26 @@ mod tests {
     fn a_channel_whose_exit_is_disabled_only_warns() {
         let mut s = snapshot(json!({"protocol": "vless"}));
         s.nodes[0].is_disabled = true;
-        let r = decided(precheck(&s.channels[0], &s));
-        assert_eq!(r.severity, Severity::Warn);
-        assert!(r.detail.contains("beta"), "{}", r.detail);
+
+        let result = decided(precheck(&s.channels[0], &s));
+
+        assert_eq!(result.severity, Severity::Warn);
+        assert!(result.detail.contains("beta"), "{}", result.detail);
     }
 
     #[test]
     fn an_unresolvable_route_fails_with_the_resolver_reason() {
         let mut s = snapshot(json!({"protocol": "vless"}));
         s.channels[0].profile_uuid = None;
-        let r = decided(precheck(&s.channels[0], &s));
-        assert_eq!(r.severity, Severity::Fail);
-        assert!(r.detail.contains("cannot tell where"), "{}", r.detail);
+
+        let result = decided(precheck(&s.channels[0], &s));
+
+        assert_eq!(result.severity, Severity::Fail);
+        assert!(
+            result.detail.contains("cannot tell where"),
+            "{}",
+            result.detail
+        );
     }
 
     #[rstest]
@@ -260,15 +290,17 @@ mod tests {
             exit_ip: got.and_then(parse_ip),
             stderr_tail: stderr.into(),
         };
-        let r = classify(
+
+        let result = classify(
             &s.channels[0],
             &s.nodes[0],
             want.and_then(parse_ip),
             &outcome,
         );
-        assert_eq!(r.severity, expected);
-        assert_eq!(r.detail, detail);
-        assert_eq!(r.name, "channel beta direct (beta.example.com:443)");
+
+        assert_eq!(result.name, "channel beta direct (beta.example.com:443)");
+        assert_eq!(result.severity, expected);
+        assert_eq!(result.detail, detail);
     }
 
     #[rstest]
@@ -299,58 +331,64 @@ mod tests {
         #[case] mentions: &str,
     ) {
         let s = snapshot(json!({"protocol": "vless"}));
-        let r = xhttp(
-            &s.channels[0],
-            &XhttpFacts {
-                without_slash,
-                with_slash,
-            },
-        );
-        assert_eq!(r.severity, expected, "{}", r.detail);
+        let facts = XhttpFacts {
+            without_slash,
+            with_slash,
+        };
+
+        let result = xhttp(&s.channels[0], &facts);
+
+        assert_eq!(result.name, "channel beta direct / xhttp path");
+        assert_eq!(result.severity, expected, "{}", result.detail);
         assert!(
-            r.detail.contains(mentions),
+            result.detail.contains(mentions),
             "detail missing '{}': {}",
             mentions,
-            r.detail
+            result.detail
         );
-        assert_eq!(r.name, "channel beta direct / xhttp path");
     }
 
     #[test]
-    fn the_most_common_xray_version_wins_and_disabled_nodes_do_not_vote() {
-        let mut s = snapshot(json!({}));
-        let mut b = s.nodes[0].clone();
-        b.name = "gamma".into();
-        b.xray_version = Some("26.3.27".into());
-        let mut c = b.clone();
-        c.name = "delta".into();
-        c.is_disabled = true;
-        s.nodes.push(b);
-        s.nodes.push(c);
-        assert_eq!(required_xray_version(&s).as_deref(), Some("26.6.27"));
-        s.nodes.iter_mut().for_each(|n| n.xray_version = None);
-        assert_eq!(required_xray_version(&s), None);
+    fn a_disabled_node_does_not_vote_on_the_xray_version() {
+        let s = fleet(&[
+            ("beta", "26.6.27", false),
+            ("gamma", "26.3.27", false),
+            ("delta", "26.3.27", true),
+        ]);
+
+        let version = required_xray_version(&s);
+
+        assert_eq!(version.as_deref(), Some("26.6.27"));
     }
 
     #[test]
     fn a_true_majority_beats_a_lexicographically_larger_minority() {
-        let mut s = snapshot(json!({}));
-        s.nodes[0].xray_version = Some("24.0.0".into());
-        let mut b = s.nodes[0].clone();
-        b.name = "gamma".into();
-        b.xray_version = Some("24.0.0".into());
-        let mut c = b.clone();
-        c.name = "delta".into();
-        c.xray_version = Some("30.0.0".into());
-        s.nodes.push(b);
-        s.nodes.push(c);
-        assert_eq!(required_xray_version(&s).as_deref(), Some("24.0.0"));
+        let s = fleet(&[
+            ("beta", "24.0.0", false),
+            ("gamma", "24.0.0", false),
+            ("delta", "30.0.0", false),
+        ]);
+
+        let version = required_xray_version(&s);
+
+        assert_eq!(version.as_deref(), Some("24.0.0"));
+    }
+
+    #[test]
+    fn a_fleet_that_reports_no_version_pins_nothing() {
+        let mut s = fleet(&[("beta", "26.6.27", false)]);
+        s.nodes.iter_mut().for_each(|n| n.xray_version = None);
+
+        let version = required_xray_version(&s);
+
+        assert_eq!(version, None);
     }
 
     #[test]
     fn setup_failure_is_the_channels_setup_result() {
-        let r = setup_failed("obtaining xray: connection refused");
-        assert_eq!(r.name, "channels setup");
-        assert_eq!(r.severity, Severity::Fail);
+        let result = setup_failed("obtaining xray: connection refused");
+
+        assert_eq!(result.name, "channels setup");
+        assert_eq!(result.severity, Severity::Fail);
     }
 }

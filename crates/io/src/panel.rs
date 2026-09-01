@@ -789,9 +789,9 @@ mod tests {
                           {"remarks": "b", "outbounds": [{"protocol": "trojan"}]}])
         .to_string();
 
-        let sut = parse_rendered(&body).unwrap();
+        let channels = parse_rendered(&body).unwrap();
 
-        assert_eq!(sut.len(), 2);
+        assert_eq!(channels.len(), 2);
     }
 
     #[test]
@@ -799,33 +799,33 @@ mod tests {
         let body = json!({"remarks": "a", "outbounds": [{"protocol": "freedom"}, {"protocol": "vless"}]})
             .to_string();
 
-        let sut = parse_rendered(&body).unwrap();
+        let channels = parse_rendered(&body).unwrap();
 
-        assert_eq!(sut[0].outbound["protocol"], "vless");
+        assert_eq!(channels[0].outbound["protocol"], "vless");
     }
 
     #[test]
     fn a_config_without_a_remark_is_dropped() {
         let body = json!({"outbounds": [{"protocol": "vless"}]}).to_string();
 
-        let sut = parse_rendered(&body).unwrap();
+        let channels = parse_rendered(&body).unwrap();
 
-        assert!(sut.is_empty());
+        assert!(channels.is_empty());
     }
 
     #[test]
     fn a_body_that_is_not_json_is_an_error() {
-        let sut = parse_rendered("nonsense");
+        let result = parse_rendered("nonsense");
 
-        assert!(sut.is_err());
+        assert!(result.is_err());
     }
 
     #[test]
     fn a_panel_url_without_a_host_is_refused() {
-        let sut =
+        let result =
             PanelClient::new("not a url", "t", Duration::from_secs(1), None);
 
-        assert!(sut.is_err());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -838,6 +838,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(sut.host(), "panel.example.com");
+        let host = sut.host();
+
+        assert_eq!(host, "panel.example.com");
     }
 }

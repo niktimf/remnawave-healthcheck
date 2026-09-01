@@ -134,8 +134,11 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SEND: &str = "/bot123:secret/sendMessage";
 
     fn notifier(server: &MockServer) -> Notifier {
         Notifier::new("123:secret", "-100", Some(7))
@@ -143,21 +146,29 @@ mod tests {
             .with_api_base(&server.uri())
     }
 
+    fn ok_response() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"ok": true}))
+    }
+
     #[tokio::test]
     async fn a_message_carries_chat_thread_and_html_mode() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/bot123:secret/sendMessage"))
+        Mock::given(method("POST")).and(path(SEND))
             .and(body_partial_json(json!({"chat_id": "-100", "parse_mode": "HTML", "message_thread_id": 7, "link_preview_options": {"is_disabled": true}})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .respond_with(ok_response())
             .expect(1).mount(&server).await;
-        assert_eq!(notifier(&server).send("<b>hi</b>").await, Ok(()));
+        let sut = notifier(&server);
+
+        let result = sut.send("<b>hi</b>").await;
+
+        assert_eq!(result, Ok(()));
     }
 
     #[tokio::test]
     async fn a_rate_limit_is_waited_out_once() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/bot123:secret/sendMessage"))
+            .and(path(SEND))
             .respond_with(ResponseTemplate::new(429).set_body_json(
                 json!({"ok": false, "parameters": {"retry_after": 0}}),
             ))
@@ -165,39 +176,50 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/bot123:secret/sendMessage"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"ok": true})),
-            )
+            .and(path(SEND))
+            .respond_with(ok_response())
             .expect(1)
             .mount(&server)
             .await;
-        assert_eq!(notifier(&server).send("x").await, Ok(()));
+        let sut = notifier(&server);
+
+        let result = sut.send("x").await;
+
+        assert_eq!(result, Ok(()));
     }
 
     #[tokio::test]
     async fn a_refusal_is_final_and_names_the_status_without_the_token() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/bot123:secret/sendMessage"))
+            .and(path(SEND))
             .respond_with(ResponseTemplate::new(400).set_body_string(
                 r#"{"ok":false,"description":"Bad Request: chat not found"}"#,
             ))
             .expect(1)
             .mount(&server)
             .await;
-        let err = notifier(&server).send("x").await.unwrap_err();
+        let sut = notifier(&server);
+
+        let err = sut.send("x").await.unwrap_err();
+
         assert!(err.contains("400") && err.contains("chat not found"), "{err}");
         assert!(!err.contains("secret"), "{err}");
     }
 
-    #[test]
-    fn retry_after_is_read_from_the_body() {
-        assert_eq!(
-            retry_after(r#"{"ok":false,"parameters":{"retry_after":37}}"#),
-            Some(37)
-        );
-        assert_eq!(retry_after(r#"{"ok":false}"#), None);
-        assert_eq!(retry_after("<html>502</html>"), None);
+    #[rstest]
+    #[case::present(
+        r#"{"ok":false,"parameters":{"retry_after":37}}"#,
+        Some(37)
+    )]
+    #[case::absent(r#"{"ok":false}"#, None)]
+    #[case::not_even_json("<html>502</html>", None)]
+    fn retry_after_is_read_from_the_body(
+        #[case] body: &str,
+        #[case] expected: Option<u64>,
+    ) {
+        let seconds = retry_after(body);
+
+        assert_eq!(seconds, expected);
     }
 }

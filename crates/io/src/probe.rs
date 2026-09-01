@@ -228,18 +228,18 @@ mod tests {
     fn the_outbound_is_used_verbatim_behind_a_local_socks_inbound() {
         let outbound = json!({"protocol": "vless", "settings": {"vnext": [{"address": "edge.example.com", "port": 443}]}});
 
-        let sut = build_config(&outbound, 10842);
+        let config = build_config(&outbound, 10842);
 
-        assert_eq!(sut["outbounds"][0], outbound);
-        assert_eq!(sut["inbounds"][0]["listen"], "127.0.0.1");
-        assert_eq!(sut["inbounds"][0]["port"], 10842);
+        assert_eq!(config["outbounds"][0], outbound);
+        assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(config["inbounds"][0]["port"], 10842);
     }
 
     #[test]
     fn a_free_port_is_handed_out() {
-        let sut = free_port().unwrap();
+        let port = free_port().unwrap();
 
-        assert!(sut > 0);
+        assert!(port > 0);
     }
 
     /// The guarantee this module makes: a failed spawn must not leave the
@@ -248,7 +248,7 @@ mod tests {
     async fn a_dead_spawn_leaves_no_scratch_dir_behind() {
         let base = tempfile::tempdir().unwrap();
 
-        let sut = attempt(
+        let outcome = attempt(
             Some(base.path()),
             Path::new("/nonexistent/xray-binary"),
             &json!({"protocol": "vless"}),
@@ -257,7 +257,7 @@ mod tests {
         )
         .await;
 
-        assert!(sut.is_err(), "{sut:?}");
+        assert!(outcome.is_err(), "{outcome:?}");
         let leftovers: Vec<_> =
             std::fs::read_dir(base.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
@@ -265,15 +265,19 @@ mod tests {
 
     #[test]
     fn the_stderr_tail_keeps_the_last_lines_only() {
-        let sut = tail("a\n\nb\nc\nd\n", 3, 200);
+        let stderr = "a\n\nb\nc\nd\n";
 
-        assert_eq!(sut, "b / c / d");
+        let result = tail(stderr, 3, 200);
+
+        assert_eq!(result, "b / c / d");
     }
 
     #[test]
     fn the_stderr_tail_is_cut_to_its_character_budget() {
-        let sut = tail("x".repeat(500).as_str(), 3, 10);
+        let stderr = "x".repeat(500);
 
-        assert_eq!(sut.chars().count(), 10);
+        let result = tail(&stderr, 3, 10);
+
+        assert_eq!(result.chars().count(), 10);
     }
 }

@@ -493,7 +493,12 @@ mod tests {
         );
         let ch =
             channel("beta direct", "in-exit", "p-exit", "beta.example.com");
-        assert_eq!(Resolver::new(&snap).exit_of(&ch).unwrap().name, "beta");
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch).unwrap();
+
+        assert_eq!(exit.name, "beta");
     }
 
     #[test]
@@ -512,8 +517,13 @@ mod tests {
             port: 443,
             ..Default::default()
         };
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
         assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
+            exit,
             Err(ResolveError::ChannelWithoutProfile { remark }) if remark == "orphaned host"
         ));
     }
@@ -539,7 +549,12 @@ mod tests {
         );
         let ch =
             channel("cdn front", "in-bridge", "p-bridge", "cdn.example.com");
-        assert_eq!(Resolver::new(&snap).exit_of(&ch).unwrap().name, "gamma");
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch).unwrap();
+
+        assert_eq!(exit.name, "gamma");
     }
 
     #[test]
@@ -549,10 +564,12 @@ mod tests {
             vec![exit_profile("p-exit", "in-exit", 443)],
         );
         let ch = channel("orphan", "in-exit", "p-exit", "beta.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::NoEntryNode { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::NoEntryNode { .. })));
     }
 
     #[test]
@@ -571,10 +588,12 @@ mod tests {
             vec![profile],
         );
         let ch = channel("blocked", "in", "p", "beta.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::Blackhole { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::Blackhole { .. })));
     }
 
     #[test]
@@ -593,10 +612,12 @@ mod tests {
             vec![profile],
         );
         let ch = channel("typo", "in", "p", "beta.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::UnknownOutbound { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::UnknownOutbound { .. })));
     }
 
     #[test]
@@ -614,10 +635,12 @@ mod tests {
         );
         let ch =
             channel("dangling", "in-bridge", "p-bridge", "cdn.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::UnknownNextHop { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::UnknownNextHop { .. })));
     }
 
     #[test]
@@ -641,10 +664,12 @@ mod tests {
         );
         let ch =
             channel("wrong port", "in-bridge", "p-bridge", "cdn.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::NoInboundOnPort { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::NoInboundOnPort { .. })));
     }
 
     #[test]
@@ -663,7 +688,11 @@ mod tests {
             vec![profile],
         );
         let ch = channel("balancer", "in", "p", "beta.example.com");
-        let err = Resolver::new(&snap).exit_of(&ch).unwrap_err();
+
+        let sut = Resolver::new(&snap);
+
+        let err = sut.exit_of(&ch).unwrap_err();
+
         assert!(matches!(err, ResolveError::UnsupportedRule { .. }));
         assert_eq!(
             err.to_string(),
@@ -687,10 +716,12 @@ mod tests {
             vec![profile],
         );
         let ch = channel("warp", "in", "p", "beta.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::OpaqueTerminal { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::OpaqueTerminal { .. })));
     }
 
     #[test]
@@ -709,10 +740,12 @@ mod tests {
             vec![profile],
         );
         let ch = channel("broken", "in", "p", "beta.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::NoDestination { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::NoDestination { .. })));
     }
 
     #[test]
@@ -725,7 +758,11 @@ mod tests {
             vec![exit_profile("p-exit", "in-exit", 443)],
         );
         let ch = channel("neither", "in-exit", "p-exit", "gamma.example.com");
-        let err = Resolver::new(&snap).exit_of(&ch).unwrap_err();
+
+        let sut = Resolver::new(&snap);
+
+        let err = sut.exit_of(&ch).unwrap_err();
+
         // The candidates are kept as a list and named in the message, in order.
         assert!(matches!(
             &err,
@@ -751,9 +788,11 @@ mod tests {
             ],
         );
         let ch = channel("loop", "in-a", "p-a", "alpha.example.com");
-        assert!(matches!(
-            Resolver::new(&snap).exit_of(&ch),
-            Err(ResolveError::Cycle { .. })
-        ));
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::Cycle { .. })));
     }
 }

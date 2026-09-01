@@ -214,46 +214,52 @@ mod tests {
     use super::*;
 
     const ACME_WITH_SPACE: &str = "/home/deploy/my acme";
+    const KEY: &str = "-----BEGIN KEY-----\nabc\n-----END KEY-----";
 
     #[test]
     fn a_configured_path_is_quoted_wherever_it_appears() {
-        let sut = Commands::new(ACME_WITH_SPACE, None);
+        let commands = Commands::new(ACME_WITH_SPACE, None);
 
         assert!(
-            sut.renewal
+            commands
+                .renewal
                 .starts_with("sudo find '/home/deploy/my acme' -mindepth 2"),
             "{}",
-            sut.renewal
+            commands.renewal
         );
         assert!(
-            sut.renewal.contains("|| find '/home/deploy/my acme'"),
+            commands.renewal.contains("|| find '/home/deploy/my acme'"),
             "{}",
-            sut.renewal
+            commands.renewal
         );
     }
 
     #[test]
     fn the_renewal_command_reports_whether_port_80_is_reachable() {
-        let sut = Commands::new(ACME_WITH_SPACE, None);
+        let commands = Commands::new(ACME_WITH_SPACE, None);
 
-        assert!(sut.renewal.contains("|| ufw status"), "{}", sut.renewal);
         assert!(
-            sut.renewal.contains(PORT80_OPEN)
-                && sut.renewal.contains(PORT80_CLOSED)
+            commands.renewal.contains("|| ufw status"),
+            "{}",
+            commands.renewal
+        );
+        assert!(
+            commands.renewal.contains(PORT80_OPEN)
+                && commands.renewal.contains(PORT80_CLOSED)
         );
     }
 
     /// A nested shell would undo the quoting above, so no command may spawn one.
     #[test]
     fn no_command_nests_a_shell() {
-        let sut = Commands::new(ACME_WITH_SPACE, Some("beta.example.com"));
+        let commands = Commands::new(ACME_WITH_SPACE, Some("beta.example.com"));
 
         for cmd in [
-            &sut.docker_ps,
-            &sut.unhealthy,
-            &sut.listening,
-            &sut.renewal,
-            sut.cert.as_ref().unwrap(),
+            &commands.docker_ps,
+            &commands.unhealthy,
+            &commands.listening,
+            &commands.renewal,
+            commands.cert.as_ref().unwrap(),
         ] {
             assert!(!cmd.contains("sh -c"), "{cmd}");
         }
@@ -261,10 +267,12 @@ mod tests {
 
     #[test]
     fn a_node_with_a_domain_is_asked_for_its_certificate() {
-        let sut = Commands::new("/root/.acme.sh", Some("beta.example.com"));
+        let commands =
+            Commands::new("/root/.acme.sh", Some("beta.example.com"));
 
         assert!(
-            sut.cert
+            commands
+                .cert
                 .as_deref()
                 .unwrap()
                 .contains("-servername beta.example.com")
@@ -273,32 +281,32 @@ mod tests {
 
     #[test]
     fn a_node_without_a_domain_has_no_certificate_command() {
-        let sut = Commands::new("/root/.acme.sh", None);
+        let commands = Commands::new("/root/.acme.sh", None);
 
-        assert!(sut.cert.is_none());
+        assert!(commands.cert.is_none());
     }
 
     #[test]
     fn a_hostile_domain_cannot_break_out_of_the_command() {
-        let sut = Commands::new("/root/.acme.sh", Some("x; id #"));
+        let commands = Commands::new("/root/.acme.sh", Some("x; id #"));
 
         assert!(
-            sut.cert
+            commands
+                .cert
                 .as_deref()
                 .unwrap()
                 .contains("-connect 'x; id #':443"),
             "{:?}",
-            sut.cert
+            commands.cert
         );
     }
 
     #[test]
     fn a_secret_file_is_readable_only_by_its_owner() {
-        let sut =
-            secret_file("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap();
+        let file = secret_file(KEY).unwrap();
 
-        let mode =
-            std::fs::metadata(sut.path()).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(file.path()).unwrap().permissions().mode()
+            & 0o777;
 
         assert_eq!(mode, 0o600);
     }
@@ -306,42 +314,40 @@ mod tests {
     /// ssh rejects a key whose last line is not terminated.
     #[test]
     fn a_secret_file_ends_with_a_newline() {
-        let sut =
-            secret_file("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap();
+        let file = secret_file(KEY).unwrap();
 
-        let text = std::fs::read_to_string(sut.path()).unwrap();
+        let text = std::fs::read_to_string(file.path()).unwrap();
 
         assert!(text.ends_with("-----END KEY-----\n"));
     }
 
     #[test]
     fn a_secret_file_vanishes_with_the_runner() {
-        let sut =
-            secret_file("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap();
-        let path = sut.path().to_path_buf();
+        let file = secret_file(KEY).unwrap();
+        let path = file.path().to_path_buf();
 
-        drop(sut);
+        drop(file);
 
         assert!(!path.exists(), "the key file must vanish with the runner");
     }
 
     #[test]
     fn a_failed_connection_is_reported_in_sshs_own_words() {
-        let sut = openssh::Error::Connect(std::io::Error::other(
+        let error = openssh::Error::Connect(std::io::Error::other(
             "warming up\nPermission denied (publickey).\n",
         ));
 
-        let detail = error_detail(&sut);
+        let detail = error_detail(&error);
 
         assert_eq!(detail, "Permission denied (publickey).");
     }
 
     #[test]
     fn a_long_connection_error_is_cut_to_a_readable_length() {
-        let sut =
+        let error =
             openssh::Error::Connect(std::io::Error::other("x".repeat(500)));
 
-        let detail = error_detail(&sut);
+        let detail = error_detail(&error);
 
         assert_eq!(detail.chars().count(), 120);
     }

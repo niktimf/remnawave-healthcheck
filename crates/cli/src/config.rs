@@ -3,9 +3,9 @@
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use remnawave_healthcheck_core::checks::geo::GeoThresholds;
-use remnawave_healthcheck_core::checks::panel::PanelThresholds;
-use remnawave_healthcheck_core::checks::ssh::SshThresholds;
+use remnawave_healthcheck_core::checks::geo::GeoChecker;
+use remnawave_healthcheck_core::checks::panel::PanelChecker;
+use remnawave_healthcheck_core::checks::ssh::SshChecker;
 use remnawave_healthcheck_io::{Hwid, SshConfig};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -143,9 +143,9 @@ pub struct Config {
     pub tls_timeout: Duration,
     pub xhttp_timeout: Duration,
     pub cert_warn_days: u32,
-    pub panel_thresholds: PanelThresholds,
-    pub geo_thresholds: GeoThresholds,
-    pub ssh_thresholds: SshThresholds,
+    pub panel_checker: PanelChecker,
+    pub geo_checker: GeoChecker,
+    pub ssh_checker: SshChecker,
     pub no_ssh: bool,
     pub no_channels: bool,
     pub no_geocheck: bool,
@@ -215,15 +215,15 @@ impl Config {
             tls_timeout: Duration::from_secs(10),
             xhttp_timeout: Duration::from_secs(6),
             cert_warn_days: args.cert_warn_days,
-            panel_thresholds: PanelThresholds {
+            panel_checker: PanelChecker {
                 config_warn_days: args.config_warn_days,
                 load_warn_factor: args.load_warn_factor,
                 mem_free_warn_pct: args.mem_free_warn_pct,
             },
-            geo_thresholds: GeoThresholds {
+            geo_checker: GeoChecker {
                 reputation_warn_risk: args.reputation_warn_risk,
             },
-            ssh_thresholds: SshThresholds {
+            ssh_checker: SshChecker {
                 cert_warn_days: args.cert_warn_days,
                 container: args.node_container,
                 acme_dir: args.acme_dir,
@@ -249,22 +249,10 @@ pub fn github_run_url(get: impl Fn(&str) -> Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::args;
     use rstest::rstest;
 
-    fn args(extra: &[&str]) -> Args {
-        let mut argv = vec![
-            "remnawave-healthcheck",
-            "--panel-url",
-            "https://panel.example.com",
-            "--api-token",
-            "t",
-            "--user-id",
-            "42",
-        ];
-        argv.extend_from_slice(extra);
-        Args::parse_from(argv)
-    }
-
+    /// Half a Telegram configuration is a mistake, not a request to stay quiet.
     #[rstest]
     #[case::both(&["--telegram-bot-token", "tok", "--telegram-chat-id", "-100"], Ok(true))]
     #[case::neither(&[], Ok(false))]
@@ -274,70 +262,106 @@ mod tests {
         #[case] extra: &[&str],
         #[case] expected: Result<bool, ()>,
     ) {
-        let got = Config::from_args(args(extra))
-            .map(|c| c.telegram.is_some())
-            .map_err(|_| ());
+        let args = args(extra);
+
+        let config = Config::from_args(args);
+
+        let got = config.map(|c| c.telegram.is_some()).map_err(|_| ());
         assert_eq!(got, expected);
     }
 
     #[test]
-    fn defaults_are_the_documented_ones() {
-        let c = Config::from_args(args(&[])).unwrap();
+    fn the_documented_defaults_are_what_a_bare_run_gets() {
+        let args = args(&[]);
+
+        let config = Config::from_args(args).unwrap();
+
         assert_eq!(
-            (c.concurrency, c.probe_timeout.as_secs(), c.cert_warn_days),
+            (
+                config.concurrency,
+                config.probe_timeout.as_secs(),
+                config.cert_warn_days
+            ),
             (8, 22, 14)
         );
-        assert_eq!((c.ssh.user.clone(), c.ssh.port), (None, 22));
-        let with_key =
-            Config::from_args(args(&["--ssh-private-key", "KEY"])).unwrap();
-        assert_eq!(with_key.ssh.user.as_deref(), Some("root"));
-        let named = Config::from_args(args(&["--ssh-user", "deploy"])).unwrap();
-        assert_eq!(named.ssh.user.as_deref(), Some("deploy"));
-        assert_eq!(c.ssh_thresholds.container, "remnanode");
-        assert!(c.hwid.is_none());
-        assert_eq!(
-            Config::from_args(args(&["--concurrency", "0"]))
-                .unwrap_err()
-                .to_string(),
-            "REMNAWAVE_CONCURRENCY must be at least 1"
-        );
+        assert_eq!((config.ssh.user.clone(), config.ssh.port), (None, 22));
+        assert_eq!(config.ssh_checker.container, "remnanode");
+        assert!(config.hwid.is_none());
+    }
+
+    /// A key with no user names a bare CI runner, where root is the only
+    /// account that exists.
+    #[test]
+    fn an_ssh_key_without_a_user_means_root() {
+        let args = args(&["--ssh-private-key", "KEY"]);
+
+        let config = Config::from_args(args).unwrap();
+
+        assert_eq!(config.ssh.user.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn a_named_ssh_user_is_kept_as_given() {
+        let args = args(&["--ssh-user", "deploy"]);
+
+        let config = Config::from_args(args).unwrap();
+
+        assert_eq!(config.ssh.user.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn a_concurrency_of_zero_is_refused_by_name() {
+        let args = args(&["--concurrency", "0"]);
+
+        let err = Config::from_args(args).unwrap_err();
+
+        assert_eq!(err.to_string(), "REMNAWAVE_CONCURRENCY must be at least 1");
     }
 
     #[test]
     fn an_hwid_becomes_device_headers() {
-        let c = Config::from_args(args(&[
-            "--hwid",
-            "dev-1",
-            "--device-model",
-            "phone",
-        ]))
-        .unwrap();
-        let h = c.hwid.unwrap();
+        let args = args(&["--hwid", "dev-1", "--device-model", "phone"]);
+
+        let config = Config::from_args(args).unwrap();
+
+        let hwid = config.hwid.unwrap();
         assert_eq!(
-            (h.hwid.as_str(), h.os.as_str(), h.model.as_str()),
+            (hwid.hwid.as_str(), hwid.os.as_str(), hwid.model.as_str()),
             ("dev-1", "linux", "phone")
         );
     }
 
-    #[test]
-    fn the_run_url_needs_all_three_github_variables() {
-        let env = |k: &str| match k {
+    fn github_env(k: &str) -> Option<String> {
+        match k {
             "GITHUB_SERVER_URL" => Some("https://github.com".to_string()),
             "GITHUB_REPOSITORY" => Some("acme/infra".to_string()),
             "GITHUB_RUN_ID" => Some("123".to_string()),
             _ => None,
-        };
+        }
+    }
+
+    #[test]
+    fn a_run_on_actions_links_back_to_its_own_run() {
+        let url = github_run_url(github_env);
+
         assert_eq!(
-            github_run_url(env).as_deref(),
+            url.as_deref(),
             Some("https://github.com/acme/infra/actions/runs/123")
         );
-        assert_eq!(
-            github_run_url(|k| if k == "GITHUB_RUN_ID" {
+    }
+
+    /// Off Actions the variables are simply absent, and a partial set is not
+    /// enough to build a link that would 404.
+    #[test]
+    fn a_missing_run_id_yields_no_link_at_all() {
+        let url = github_run_url(|k| {
+            if k == "GITHUB_RUN_ID" {
                 None
             } else {
-                env(k)
-            }),
-            None
-        );
+                github_env(k)
+            }
+        });
+
+        assert_eq!(url, None);
     }
 }

@@ -15,8 +15,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub const PORT80_OPEN: &str = "PORT80=open";
 pub const PORT80_CLOSED: &str = "PORT80=closed";
 
+/// Reads what ssh gathered from a node and says what it means. Carries the
+/// settings every verdict needs, so they stop travelling as an argument.
 #[derive(Debug, Clone)]
-pub struct SshThresholds {
+pub struct SshChecker {
     pub cert_warn_days: u32,
     /// Container the node's Xray runs in.
     pub container: String,
@@ -51,7 +53,7 @@ struct Host<'a> {
     node: &'a Node,
     facts: &'a HostFacts,
     now: DateTime<Utc>,
-    t: &'a SshThresholds,
+    t: &'a SshChecker,
 }
 
 type Check = fn(&Host) -> Verdict;
@@ -64,40 +66,42 @@ const CHECKS: [(&str, Check); 4] = [
     ("certificate renewal", |h| h.renewal()),
 ];
 
-/// An unreachable host is one WARN, not four FAILs: some nodes admit only the
-/// CI runners, and the API-side checks still cover them.
-pub fn check_node(
-    node: &Node,
-    outcome: &SshOutcome,
-    now: DateTime<Utc>,
-    t: &SshThresholds,
-) -> Vec<CheckResult> {
-    let facts = match outcome {
-        SshOutcome::Unreachable(reason) => {
-            return vec![CheckResult::warn(
-                node_check(&node.name, "ssh"),
-                format!("unreachable: {reason}; node-side checks skipped"),
-            )];
-        }
-        SshOutcome::Reached(facts) => facts,
-    };
-    let host = Host {
-        node,
-        facts,
-        now,
-        t,
-    };
-    CHECKS
-        .iter()
-        .map(|(aspect, check)| {
-            let v = check(&host);
-            CheckResult::new(
-                node_check(&node.name, aspect),
-                v.severity,
-                v.detail,
-            )
-        })
-        .collect()
+impl SshChecker {
+    /// An unreachable host is one WARN, not four FAILs: some nodes admit only
+    /// the CI runners, and the API-side checks still cover them.
+    pub fn check_node(
+        &self,
+        node: &Node,
+        outcome: &SshOutcome,
+        now: DateTime<Utc>,
+    ) -> Vec<CheckResult> {
+        let facts = match outcome {
+            SshOutcome::Unreachable(reason) => {
+                return vec![CheckResult::warn(
+                    node_check(&node.name, "ssh"),
+                    format!("unreachable: {reason}; node-side checks skipped"),
+                )];
+            }
+            SshOutcome::Reached(facts) => facts,
+        };
+        let host = Host {
+            node,
+            facts,
+            now,
+            t: self,
+        };
+        CHECKS
+            .iter()
+            .map(|(aspect, check)| {
+                let v = check(&host);
+                CheckResult::new(
+                    node_check(&node.name, aspect),
+                    v.severity,
+                    v.detail,
+                )
+            })
+            .collect()
+    }
 }
 
 /// The only container state that is not a problem; `paused` still says "Up".
@@ -370,10 +374,11 @@ fn parse_renewal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::by_aspect;
     use rstest::rstest;
 
-    fn thresholds() -> SshThresholds {
-        SshThresholds {
+    fn checker() -> SshChecker {
+        SshChecker {
             cert_warn_days: 14,
             container: "remnanode".into(),
             acme_dir: "/root/.acme.sh".into(),
@@ -406,23 +411,22 @@ mod tests {
         }
     }
 
-    fn run(facts: HostFacts) -> Vec<CheckResult> {
-        check_node(&node(), &SshOutcome::Reached(facts), now(), &thresholds())
-    }
-
-    fn by_aspect(results: &[CheckResult], aspect: &str) -> CheckResult {
-        let name = node_check("beta", aspect);
-        results
-            .iter()
-            .find(|r| r.name == name)
-            .unwrap_or_else(|| panic!("no {name}"))
-            .clone()
+    /// The healthy host with one gathered fact replaced.
+    fn reached(mutate: impl FnOnce(&mut HostFacts)) -> SshOutcome {
+        let mut facts = healthy();
+        mutate(&mut facts);
+        SshOutcome::Reached(facts)
     }
 
     #[test]
     fn a_healthy_host_is_four_ok_results_in_order() {
-        let r = run(healthy());
-        let names: Vec<&str> = r.iter().map(|r| r.name.as_str()).collect();
+        let outcome = SshOutcome::Reached(healthy());
+        let sut = checker();
+
+        let results = sut.check_node(&node(), &outcome, now());
+
+        let names: Vec<&str> =
+            results.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
             [
@@ -432,26 +436,27 @@ mod tests {
                 "node beta / certificate renewal"
             ]
         );
-        for c in &r {
+        for c in &results {
             assert_eq!(c.severity, Severity::Ok, "{}: {}", c.name, c.detail);
         }
     }
 
+    /// A node that refuses ssh is one warning, not a wall of red: the API-side
+    /// checks still cover it.
     #[test]
     fn an_unreachable_host_is_one_warning_and_nothing_else() {
-        let r = check_node(
-            &node(),
-            &SshOutcome::Unreachable("Connection timed out".into()),
-            now(),
-            &thresholds(),
-        );
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].name, "node beta / ssh");
-        assert_eq!(r[0].severity, Severity::Warn);
+        let outcome = SshOutcome::Unreachable("Connection timed out".into());
+        let sut = checker();
+
+        let results = sut.check_node(&node(), &outcome, now());
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "node beta / ssh");
+        assert_eq!(results[0].severity, Severity::Warn);
         assert!(
-            r[0].detail.contains("Connection timed out"),
+            results[0].detail.contains("Connection timed out"),
             "{}",
-            r[0].detail
+            results[0].detail
         );
     }
 
@@ -493,12 +498,17 @@ mod tests {
         #[case] expected: Severity,
         #[case] mentions: &str,
     ) {
-        let mut facts = healthy();
-        facts.docker_ps = docker_ps.into();
-        facts.unhealthy = unhealthy.into();
-        let c = by_aspect(&run(facts), "containers");
-        assert_eq!(c.severity, expected, "{}", c.detail);
-        assert!(c.detail.contains(mentions), "{}", c.detail);
+        let outcome = reached(|f| {
+            f.docker_ps = docker_ps.into();
+            f.unhealthy = unhealthy.into();
+        });
+        let sut = checker();
+
+        let results = sut.check_node(&node(), &outcome, now());
+
+        let containers = by_aspect(&results, "containers");
+        assert_eq!(containers.severity, expected, "{}", containers.detail);
+        assert!(containers.detail.contains(mentions), "{}", containers.detail);
     }
 
     #[rstest]
@@ -515,26 +525,32 @@ mod tests {
         Severity::Fail
     )]
     fn ports_verdicts(#[case] listening: &str, #[case] expected: Severity) {
-        let mut facts = healthy();
-        facts.listening = listening.into();
-        let c = by_aspect(&run(facts), "inbound ports");
-        assert_eq!(c.severity, expected, "{}", c.detail);
+        let outcome = reached(|f| f.listening = listening.into());
+        let sut = checker();
+
+        let results = sut.check_node(&node(), &outcome, now());
+
+        let ports = by_aspect(&results, "inbound ports");
+        assert_eq!(ports.severity, expected, "{}", ports.detail);
     }
 
-    #[test]
-    fn a_scoped_link_local_listener_is_read_and_a_hostname_is_not() {
-        assert!(
-            public_listen_ports("LISTEN 0 4096 [fe80::1%eth0]:9100 [::]:*\n")
-                .contains(&9100)
-        );
-        assert!(
-            public_listen_ports("LISTEN 0 4096 localhost:9100 [::]:*\n")
-                .is_empty()
-        );
-        assert!(
-            !public_listen_ports("LISTEN 0 4096 [::1]:9000 [::]:*\n")
-                .contains(&9000)
-        );
+    #[rstest]
+    #[case::scoped_link_local(
+        "LISTEN 0 4096 [fe80::1%eth0]:9100 [::]:*\n",
+        true
+    )]
+    #[case::a_hostname_is_not_an_address(
+        "LISTEN 0 4096 localhost:9100 [::]:*\n",
+        false
+    )]
+    #[case::ipv6_loopback("LISTEN 0 4096 [::1]:9000 [::]:*\n", false)]
+    fn a_listener_counts_only_on_a_public_address(
+        #[case] line: &str,
+        #[case] expected: bool,
+    ) {
+        let ports = public_listen_ports(line);
+
+        assert_eq!(!ports.is_empty(), expected, "{ports:?}");
     }
 
     #[rstest]
@@ -550,10 +566,13 @@ mod tests {
         #[case] cert: Option<&str>,
         #[case] expected: Severity,
     ) {
-        let mut facts = healthy();
-        facts.cert = cert.map(String::from);
-        let c = by_aspect(&run(facts), "certificate expiry");
-        assert_eq!(c.severity, expected, "{}", c.detail);
+        let outcome = reached(|f| f.cert = cert.map(String::from));
+        let sut = checker();
+
+        let results = sut.check_node(&node(), &outcome, now());
+
+        let expiry = by_aspect(&results, "certificate expiry");
+        assert_eq!(expiry.severity, expected, "{}", expiry.detail);
     }
 
     #[rstest]
@@ -587,10 +606,13 @@ mod tests {
         #[case] expected: Severity,
         #[case] mentions: &str,
     ) {
-        let mut facts = healthy();
-        facts.renewal = renewal.into();
-        let c = by_aspect(&run(facts), "certificate renewal");
-        assert_eq!(c.severity, expected, "{}", c.detail);
-        assert!(c.detail.contains(mentions), "{}", c.detail);
+        let outcome = reached(|f| f.renewal = renewal.into());
+        let sut = checker();
+
+        let results = sut.check_node(&node(), &outcome, now());
+
+        let result = by_aspect(&results, "certificate renewal");
+        assert_eq!(result.severity, expected, "{}", result.detail);
+        assert!(result.detail.contains(mentions), "{}", result.detail);
     }
 }

@@ -345,44 +345,100 @@ mod tests {
         #[case] connected: bool,
         #[case] expected: PanelState<'static>,
     ) {
-        assert_eq!(
-            node(disabled, connecting, connected, Some("boom")).panel_state(),
-            expected
-        );
+        let sut = node(disabled, connecting, connected, Some("boom"));
+
+        let state = sut.panel_state();
+
+        assert_eq!(state, expected);
+    }
+
+    #[rstest]
+    #[case::enabled_and_connected(false, false, true, true)]
+    #[case::still_connecting(false, true, false, false)]
+    #[case::disabled(true, false, true, false)]
+    #[case::disconnected(false, false, false, false)]
+    fn only_an_enabled_connected_node_is_active(
+        #[case] disabled: bool,
+        #[case] connecting: bool,
+        #[case] connected: bool,
+        #[case] expected: bool,
+    ) {
+        let sut = node(disabled, connecting, connected, None);
+
+        let active = sut.is_active();
+
+        assert_eq!(active, expected);
+    }
+
+    /// Losing the connection does not disable a node: the panel still expects
+    /// it back, so its checks stay in the report.
+    #[test]
+    fn a_disconnected_node_is_still_enabled() {
+        let sut = node(false, false, false, None);
+
+        let enabled = sut.is_enabled();
+
+        assert!(enabled);
     }
 
     #[test]
-    fn only_an_enabled_connected_node_is_active() {
-        assert!(node(false, false, true, None).is_active());
-        assert!(!node(false, true, false, None).is_active());
-        assert!(!node(true, false, true, None).is_active());
-        assert!(node(false, false, false, None).is_enabled());
+    fn an_address_that_is_an_ip_is_not_a_domain() {
+        let sut = node(false, false, true, None);
+
+        let domain = sut.domain();
+
+        assert_eq!(domain, None);
     }
 
     #[test]
-    fn a_domain_is_an_address_that_is_not_an_ip() {
-        let mut n = node(false, false, true, None);
-        assert_eq!(n.domain(), None);
-        n.address = "alpha.example.com".into();
-        assert_eq!(n.domain(), Some("alpha.example.com"));
+    fn an_address_that_is_a_hostname_is_the_nodes_domain() {
+        let mut sut = node(false, false, true, None);
+        sut.address = "alpha.example.com".into();
+
+        let domain = sut.domain();
+
+        assert_eq!(domain, Some("alpha.example.com"));
     }
 
-    #[test]
-    fn a_channel_name_carries_address_and_port() {
-        let c = Channel {
+    fn channel() -> Channel {
+        Channel {
             remark: "beta direct".into(),
             address: "beta.example.com".into(),
             port: 8443,
             transport: Some("XHTTP".into()),
             ..Default::default()
-        };
-        assert_eq!(c.name(), "channel beta direct (beta.example.com:8443)");
-        assert!(c.is_xhttp());
+        }
+    }
+
+    #[test]
+    fn a_channel_name_carries_address_and_port() {
+        let sut = channel();
+
+        let name = sut.name();
+
+        assert_eq!(name, "channel beta direct (beta.example.com:8443)");
+    }
+
+    #[test]
+    fn the_transport_is_recognised_whatever_its_case() {
+        let sut = channel();
+
+        let xhttp = sut.is_xhttp();
+
+        assert!(xhttp);
     }
 
     #[test]
     fn severity_pads_to_the_requested_width() {
-        assert_eq!(format!("{:<6}|", Severity::Ok), "OK    |");
+        let sut = Severity::Ok;
+
+        let padded = format!("{sut:<6}|");
+
+        assert_eq!(padded, "OK    |");
+    }
+
+    #[test]
+    fn severities_order_from_ok_to_fail() {
         assert!(
             Severity::Ok < Severity::Warn && Severity::Warn < Severity::Fail
         );

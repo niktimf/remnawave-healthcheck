@@ -1,6 +1,9 @@
 mod config;
 mod run;
+
 mod telegram;
+#[cfg(test)]
+mod test_util;
 
 use clap::Parser;
 use remnawave_healthcheck_core::report::Outcome;
