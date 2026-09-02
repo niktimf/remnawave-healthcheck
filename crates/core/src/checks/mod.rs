@@ -1,6 +1,7 @@
 //! Every check is a pure function from facts to `CheckResult`s. Nothing here
 //! opens a socket or a process.
 
+use crate::model::Severity;
 use std::fmt::Write;
 
 /// The detail every check reports when the subscription answered with the HWID
@@ -19,6 +20,35 @@ pub(crate) fn commas(
         let _ = write!(out, "{item}");
     }
     out
+}
+
+/// A verdict without a name. Checks that share one context produce these, and
+/// the context names them in one place — so an aspect is spelled once rather
+/// than at every return point inside a check.
+pub(crate) struct Verdict {
+    pub severity: Severity,
+    pub detail: String,
+}
+
+impl Verdict {
+    fn new(severity: Severity, detail: impl Into<String>) -> Self {
+        Self {
+            severity,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn ok(detail: impl Into<String>) -> Self {
+        Self::new(Severity::Ok, detail)
+    }
+
+    pub fn warn(detail: impl Into<String>) -> Self {
+        Self::new(Severity::Warn, detail)
+    }
+
+    pub fn fail(detail: impl Into<String>) -> Self {
+        Self::new(Severity::Fail, detail)
+    }
 }
 
 pub mod channel;

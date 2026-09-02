@@ -3,9 +3,10 @@
 //! need geocheck's egress addresses only at classification time.
 
 use crate::config::Config;
+use crate::judge::{Collected, ProbeResult, ProbeStage};
 use crate::telegram::Notifier;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use remnawave_healthcheck_core::checks::{self, channel::Precheck};
 use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Snapshot, SshOutcome, TlsFacts,
@@ -15,7 +16,6 @@ use remnawave_healthcheck_core::report::{self, Outcome, Report};
 use remnawave_healthcheck_io::{PanelClient, SshRunner, probe, tls, xhttp};
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -68,7 +68,7 @@ pub async fn run(config: Config) -> Result<Outcome> {
         xhttp,
         probes,
     };
-    let results = judge(&snapshot, now, collected, &config);
+    let results = config.judge.verdicts(&snapshot, now, collected);
 
     let report = Report::of(&results);
     print!("{}", report.table());
@@ -88,101 +88,6 @@ pub async fn run(config: Config) -> Result<Outcome> {
         }
     }
     Ok(outcome)
-}
-
-/// Facts of every family, keyed so `judge` can pair them with the snapshot.
-struct Collected {
-    geo: HashMap<String, GeoOutcome>,
-    ssh: HashMap<String, SshOutcome>,
-    tls: Vec<(String, TlsFacts)>,
-    xhttp: Vec<(usize, XhttpFacts)>,
-    probes: ProbeStage,
-}
-
-enum ProbeStage {
-    Skipped,
-    SetupFailed(String),
-    Done(Vec<(usize, ProbeResult)>),
-}
-
-enum ProbeResult {
-    Decided(CheckResult),
-    Probed {
-        expect: String,
-        outcome: ProbeOutcome,
-    },
-}
-
-/// The address a completed geocheck saw the node leave from. A job that never
-/// completed contributes nothing rather than an absent address.
-fn done_egress(outcome: &GeoOutcome) -> Option<IpAddr> {
-    match outcome {
-        GeoOutcome::Done(facts) => facts.egress,
-        GeoOutcome::Failed(_) => None,
-    }
-}
-
-/// Pure: turn the snapshot and the collected facts into results.
-fn judge(
-    snapshot: &Snapshot,
-    now: DateTime<Utc>,
-    c: Collected,
-    config: &Config,
-) -> Vec<CheckResult> {
-    let mut results = config.panel_checker.all(snapshot);
-    let mut egress: HashMap<&str, IpAddr> = HashMap::new();
-    for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
-        if let Some(out) = c.geo.get(&node.name) {
-            if let Some(ip) = done_egress(out) {
-                egress.insert(node.name.as_str(), ip);
-            }
-            results.extend(config.geo_checker.check_node(node, out));
-        }
-        if let Some(out) = c.ssh.get(&node.name) {
-            results.extend(config.ssh_checker.check_node(node, out, now));
-        }
-    }
-    for (host, facts) in &c.tls {
-        results.push(checks::tls::check(
-            host,
-            facts,
-            now,
-            config.cert_warn_days,
-        ));
-    }
-    for (idx, facts) in &c.xhttp {
-        results.push(checks::channel::xhttp(&snapshot.channels[*idx], facts));
-    }
-    match c.probes {
-        ProbeStage::Skipped => {}
-        ProbeStage::SetupFailed(detail) => {
-            results.push(checks::channel::setup_failed(detail));
-        }
-        ProbeStage::Done(list) => {
-            for (idx, r) in list {
-                match r {
-                    ProbeResult::Decided(r) => results.push(r),
-                    ProbeResult::Probed { expect, outcome } => {
-                        let node = snapshot
-                            .nodes
-                            .iter()
-                            .find(|n| n.name == expect)
-                            .expect(
-                                "the expected exit came out of this snapshot",
-                            );
-                        let want = egress.get(expect.as_str()).copied();
-                        results.push(checks::channel::classify(
-                            &snapshot.channels[idx],
-                            node,
-                            want,
-                            &outcome,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    results
 }
 
 async fn collect<T: Send + 'static>(mut set: JoinSet<T>) -> Vec<T> {
@@ -417,189 +322,7 @@ fn write_step_summary(results: &[CheckResult]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{by_name, config};
-    use remnawave_healthcheck_core::model::{
-        Channel, GeoFacts, HostFacts, Node, Profile, Severity, parse_ip,
-    };
-    use serde_json::json;
-
-    fn snapshot() -> Snapshot {
-        let node = Node {
-            uuid: "u-beta".into(),
-            name: "beta".into(),
-            address: "beta.example.com".into(),
-            country_code: "DE".into(),
-            is_connected: true,
-            users_online: 3,
-            xray_uptime_secs: 3600,
-            xray_version: Some("26.6.27".into()),
-            node_version: Some("3.3.2".into()),
-            profile_uuid: Some("p".into()),
-            inbound_tags: vec!["in".into()],
-            inbound_ports: vec![443],
-            ..Default::default()
-        };
-        let profile = Profile {
-            uuid: "p".into(),
-            name: "p".into(),
-            config: json!({"inbounds": [{"tag": "in", "port": 443}], "outbounds": [{"tag": "direct", "protocol": "freedom"}]}),
-        };
-        Snapshot {
-            nodes: vec![node],
-            profiles: HashMap::from([("p".to_string(), profile)]),
-            channels: vec![Channel {
-                remark: "beta direct".into(),
-                inbound_tag: "in".into(),
-                profile_uuid: Some("p".into()),
-                address: "beta.example.com".into(),
-                port: 443,
-                transport: Some("xhttp".into()),
-                path: Some("/p".into()),
-                outbound: json!({"protocol": "vless"}),
-                ..Default::default()
-            }],
-            served_remarks: vec!["beta direct".into()],
-            panel_host: "panel.example.com".into(),
-            sub_host: Some("sub.example.com".into()),
-            ..Default::default()
-        }
-    }
-
-    fn healthy_ssh() -> SshOutcome {
-        SshOutcome::Reached(HostFacts {
-            docker_ps: "remnanode\trunning\n".into(),
-            listening: "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n".into(),
-            cert: Some("notAfter=Nov 20 10:00:00 2036 GMT\n".into()),
-            renewal: "PORT80=open\n".into(),
-            ..Default::default()
-        })
-    }
-
-    /// A geocheck that completed, in the shape the panel stores it.
-    fn healthy_geo() -> GeoOutcome {
-        GeoOutcome::Done(GeoFacts {
-            egress: parse_ip("192.0.2.20"),
-            report: json!({"schema": 1, "identity": {"ipv4": "192.0.2.20"}}),
-        })
-    }
-
-    fn probed(exit: &str) -> ProbeStage {
-        ProbeStage::Done(vec![(
-            0,
-            ProbeResult::Probed {
-                expect: "beta".into(),
-                outcome: ProbeOutcome {
-                    exit_ip: parse_ip(exit),
-                    stderr_tail: String::new(),
-                },
-            },
-        )])
-    }
-
-    #[test]
-    fn judge_pairs_every_family_with_the_snapshot() {
-        let s = snapshot();
-        let now = Utc::now();
-        let collected = Collected {
-            geo: HashMap::from([("beta".to_string(), healthy_geo())]),
-            ssh: HashMap::from([("beta".to_string(), healthy_ssh())]),
-            tls: vec![(
-                "panel.example.com".into(),
-                TlsFacts {
-                    not_after: Some(now + chrono::Duration::days(60)),
-                    error: None,
-                },
-            )],
-            xhttp: vec![(
-                0,
-                XhttpFacts {
-                    without_slash: Ok(400),
-                    with_slash: Ok(400),
-                },
-            )],
-            probes: probed("192.0.2.20"),
-        };
-
-        let results = judge(&s, now, collected, &config());
-
-        for name in [
-            "node beta / panel status",
-            "node beta / users online",
-            "node beta / egress address",
-            "node beta / containers",
-            "tls panel.example.com",
-            "channel beta direct / xhttp path",
-            "channel beta direct (beta.example.com:443)",
-        ] {
-            let result = by_name(&results, name);
-            assert_eq!(
-                result.severity,
-                Severity::Ok,
-                "{name}: {}",
-                result.detail
-            );
-        }
-        let report = Report::of(&results);
-        assert_eq!(report.overall(), Severity::Ok, "{}", report.table());
-    }
-
-    #[test]
-    fn a_setup_failure_and_an_unreachable_host_degrade_without_hiding_the_rest()
-    {
-        let s = snapshot();
-        let collected = Collected {
-            geo: HashMap::from([(
-                "beta".to_string(),
-                GeoOutcome::Failed("timeout".into()),
-            )]),
-            ssh: HashMap::from([(
-                "beta".to_string(),
-                SshOutcome::Unreachable("Connection refused".into()),
-            )]),
-            tls: vec![],
-            xhttp: vec![],
-            probes: ProbeStage::SetupFailed("obtaining xray: boom".into()),
-        };
-
-        let results = judge(&s, Utc::now(), collected, &config());
-
-        assert_eq!(
-            by_name(&results, "node beta / geocheck").severity,
-            Severity::Warn
-        );
-        assert_eq!(
-            by_name(&results, "node beta / ssh").severity,
-            Severity::Warn
-        );
-        assert_eq!(
-            by_name(&results, "channels setup").severity,
-            Severity::Fail
-        );
-        assert!(results.iter().all(|r| r.name != "node beta / containers"));
-        assert_eq!(Report::of(&results).outcome(), Outcome::Failed);
-    }
-
-    /// Without geocheck there is no address to compare the tunnel's exit
-    /// against, and an unverified exit is not a passing one.
-    #[test]
-    fn a_probe_without_a_known_egress_is_unverified_not_green() {
-        let s = snapshot();
-        let collected = Collected {
-            geo: HashMap::new(),
-            ssh: HashMap::new(),
-            tls: vec![],
-            xhttp: vec![],
-            probes: probed("192.0.2.20"),
-        };
-
-        let results = judge(&s, Utc::now(), collected, &config());
-
-        assert_eq!(
-            by_name(&results, "channel beta direct (beta.example.com:443)")
-                .severity,
-            Severity::Warn
-        );
-    }
+    use crate::test_util::{config, snapshot};
 
     #[tokio::test]
     #[should_panic(expected = "boom")]

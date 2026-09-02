@@ -1,6 +1,7 @@
 //! Configuration from flags and environment. Every value is both a flag and a
 //! variable; `--help` prints the whole table with defaults.
 
+use crate::judge::Judge;
 use anyhow::{Result, bail};
 use clap::Parser;
 use remnawave_healthcheck_core::checks::geo::GeoChecker;
@@ -142,10 +143,7 @@ pub struct Config {
     pub geocheck_timeout: Duration,
     pub tls_timeout: Duration,
     pub xhttp_timeout: Duration,
-    pub cert_warn_days: u32,
-    pub panel_checker: PanelChecker,
-    pub geo_checker: GeoChecker,
-    pub ssh_checker: SshChecker,
+    pub judge: Judge,
     pub no_ssh: bool,
     pub no_channels: bool,
     pub no_geocheck: bool,
@@ -214,19 +212,21 @@ impl Config {
             geocheck_timeout: Duration::from_secs(args.geocheck_timeout_secs),
             tls_timeout: Duration::from_secs(10),
             xhttp_timeout: Duration::from_secs(6),
-            cert_warn_days: args.cert_warn_days,
-            panel_checker: PanelChecker {
-                config_warn_days: args.config_warn_days,
-                load_warn_factor: args.load_warn_factor,
-                mem_free_warn_pct: args.mem_free_warn_pct,
-            },
-            geo_checker: GeoChecker {
-                reputation_warn_risk: args.reputation_warn_risk,
-            },
-            ssh_checker: SshChecker {
+            judge: Judge {
+                panel: PanelChecker {
+                    config_warn_days: args.config_warn_days,
+                    load_warn_factor: args.load_warn_factor,
+                    mem_free_warn_pct: args.mem_free_warn_pct,
+                },
+                geo: GeoChecker {
+                    reputation_warn_risk: args.reputation_warn_risk,
+                },
+                ssh: SshChecker {
+                    cert_warn_days: args.cert_warn_days,
+                    container: args.node_container,
+                    acme_dir: args.acme_dir,
+                },
                 cert_warn_days: args.cert_warn_days,
-                container: args.node_container,
-                acme_dir: args.acme_dir,
             },
             no_ssh: args.no_ssh,
             no_channels: args.no_channels,
@@ -280,12 +280,12 @@ mod tests {
             (
                 config.concurrency,
                 config.probe_timeout.as_secs(),
-                config.cert_warn_days
+                config.judge.cert_warn_days
             ),
             (8, 22, 14)
         );
         assert_eq!((config.ssh.user.clone(), config.ssh.port), (None, 22));
-        assert_eq!(config.ssh_checker.container, "remnanode");
+        assert_eq!(config.judge.ssh.container, "remnanode");
         assert!(config.hwid.is_none());
     }
 

@@ -1,7 +1,7 @@
 //! Verdicts over a geocheck report. The panel types `rawReport` as an opaque
 //! object, so every field is read defensively: absent data is "no data".
 
-use super::commas;
+use super::{Verdict, commas};
 use crate::model::{CheckResult, GeoFacts, GeoOutcome, Node, node_check};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use std::fmt::Write;
 const GEOCHECK_SCHEMA: u64 = 1;
 
 /// Reads a geocheck report and says what it means. Holds the one judgement
-/// call the caller gets to make, so the thresholds stop travelling as an
+/// call the caller gets to make, so the threshold stops travelling as an
 /// argument through every verdict.
 #[derive(Debug, Clone, Copy)]
 pub struct GeoChecker {
@@ -27,53 +27,186 @@ impl GeoChecker {
         node: &Node,
         outcome: &GeoOutcome,
     ) -> Vec<CheckResult> {
-        match outcome {
-            GeoOutcome::Failed(reason) => vec![CheckResult::warn(
-                node_check(&node.name, "geocheck"),
-                format!("no geocheck result: {reason}"),
-            )],
-            GeoOutcome::Done(facts) => {
-                let report = &facts.report;
-                let mut results: Vec<CheckResult> =
-                    schema_guard(node, report).into_iter().collect();
-                results.extend([
-                    egress(node, facts),
-                    geo_consensus(node, report),
-                    self.reputation(node, report),
-                    connectivity(node, report),
-                    findings(node, report),
-                    routing(node, report),
-                ]);
-                results
+        let facts = match outcome {
+            GeoOutcome::Failed(reason) => {
+                return vec![CheckResult::warn(
+                    node_check(&node.name, "geocheck"),
+                    format!("no geocheck result: {reason}"),
+                )];
             }
+            GeoOutcome::Done(facts) => facts,
+        };
+        let geo = Geo {
+            node,
+            facts,
+            checker: *self,
+        };
+        let mut results: Vec<CheckResult> =
+            schema_guard(node, &facts.report).into_iter().collect();
+        // Every geocheck-derived check, in report order, with the aspect it is
+        // named by.
+        results.extend(
+            [
+                ("egress address", geo.egress()),
+                ("geo consensus", geo.consensus()),
+                ("reputation", geo.reputation()),
+                ("connectivity", geo.connectivity()),
+                ("geocheck findings", geo.findings()),
+                ("routing", geo.routing()),
+            ]
+            .into_iter()
+            .map(|(aspect, v)| {
+                CheckResult::new(
+                    node_check(&node.name, aspect),
+                    v.severity,
+                    v.detail,
+                )
+            }),
+        );
+        results
+    }
+}
+
+/// One node's completed geocheck, with the settings its verdicts need. Every
+/// check below reads the same report, so it is held once rather than passed
+/// around.
+struct Geo<'a> {
+    node: &'a Node,
+    facts: &'a GeoFacts,
+    checker: GeoChecker,
+}
+
+impl Geo<'_> {
+    fn report(&self) -> &Value {
+        &self.facts.report
+    }
+
+    fn egress(&self) -> Verdict {
+        let Some(ip) = self.facts.egress else {
+            return Verdict::warn(
+                "geocheck reported no IPv4 address, so exits of channels expected to leave through this node cannot be verified",
+            );
+        };
+        let identity = &self.report()["identity"];
+        let mut detail = format!("egress {ip}");
+        if let Some(asn) = identity.get("asn").and_then(text) {
+            let asn =
+                asn.strip_prefix("AS").map_or(asn.clone(), str::to_string);
+            let _ = write!(detail, " AS{asn}");
+        }
+        if let Some(org) = identity.get("as_name").and_then(text) {
+            let _ = write!(detail, " ({org})");
+        }
+        Verdict::ok(detail)
+    }
+
+    fn consensus(&self) -> Verdict {
+        let Some((family, shares)) =
+            country_shares(&self.report()["consensus"])
+        else {
+            return Verdict::ok("no consensus data");
+        };
+        let seen = seen_as(family, &shares);
+        let expected = self.node.country_code.to_uppercase();
+        if expected.is_empty() {
+            Verdict::ok(format!(
+                "seen as {seen}; the panel has no country for this node"
+            ))
+        } else if top_country(&shares) == expected {
+            Verdict::ok(format!("seen as {seen}"))
+        } else {
+            Verdict::warn(format!("seen as {seen}; panel says {expected}"))
         }
     }
 
-    fn reputation(self, node: &Node, report: &Value) -> CheckResult {
-        let name = node_check(&node.name, "reputation");
-        let rep = &report["reputation"];
+    fn reputation(&self) -> Verdict {
+        let rep = &self.report()["reputation"];
         if !rep.is_object() {
-            return CheckResult::ok(name, "no reputation data");
+            return Verdict::ok("no reputation data");
         }
         // geocheck spends one proxycheck.io query per address per run against
         // an allowance of 100 a day without an API key. Exhausting it answers
         // with an error and nothing else, which must not read as a clean
         // address.
         if let Some(error) = rep.get("error").and_then(Value::as_str) {
-            return CheckResult::warn(
-                name,
-                format!("reputation unavailable: {error}"),
-            );
+            return Verdict::warn(format!("reputation unavailable: {error}"));
         }
         let risk = rep.get("risk").and_then(Value::as_f64);
         let detail = reputation_detail(rep, risk);
-        let over =
-            risk.is_some_and(|r| r >= f64::from(self.reputation_warn_risk));
+        let over = risk
+            .is_some_and(|r| r >= f64::from(self.checker.reputation_warn_risk));
         if over || compromising(rep) {
-            CheckResult::warn(name, detail)
+            Verdict::warn(detail)
         } else {
-            CheckResult::ok(name, detail)
+            Verdict::ok(detail)
         }
+    }
+
+    fn connectivity(&self) -> Verdict {
+        let checks = &self.report()["connectivity_checks"];
+        if !checks.is_object() {
+            return Verdict::ok("no connectivity data");
+        }
+        let mut notes: Vec<String> = endpoints(checks)
+            .into_iter()
+            .filter(|(_, v)| !v.eq_ignore_ascii_case("ok"))
+            .map(|(n, v)| format!("{n}: {v}"))
+            .collect();
+        if checks.get("plain_http_blocked").and_then(Value::as_bool)
+            == Some(true)
+        {
+            notes.push("plain http blocked".to_string());
+        }
+        match checks.get("clean").and_then(Value::as_bool) {
+            Some(true) => Verdict::ok("clean"),
+            Some(false) if notes.is_empty() => Verdict::warn("not clean"),
+            // No verdict and nothing to report is no data; anything else is
+            // the notes, whether geocheck called the run unclean or said
+            // nothing at all.
+            None if notes.is_empty() => Verdict::ok("no verdict"),
+            _ => Verdict::warn(notes.join(", ")),
+        }
+    }
+
+    /// geocheck's own verdicts over the run, already graded. `alert` means it
+    /// believes the measurement itself was intercepted; that is worth a warning
+    /// but not a failure, because it describes the conditions the report was
+    /// taken under rather than the node refusing to serve.
+    fn findings(&self) -> Verdict {
+        let Some(items) = self.report()["findings"].as_array() else {
+            return Verdict::ok("no findings data");
+        };
+        if items.is_empty() {
+            return Verdict::ok("nothing flagged");
+        }
+        let listed = commas(items.iter().filter_map(finding));
+        if items.iter().any(above_info) {
+            Verdict::warn(listed)
+        } else {
+            Verdict::ok(listed)
+        }
+    }
+
+    /// The traceroute report. This is `connectivity`; the captive-portal
+    /// section is `connectivity_checks`, and geocheck really does name them
+    /// that way.
+    ///
+    /// A remnanode container without `CAP_NET_RAW` cannot trace at all, and the
+    /// score reported in that case describes nothing — an unusable trace is no
+    /// data rather than a bad route.
+    fn routing(&self) -> Verdict {
+        let path = &self.report()["connectivity"];
+        if !traced(path) {
+            return Verdict::ok("no routing data");
+        }
+        let intercepted =
+            path["breakdown"]["intercepted"].as_u64().unwrap_or(0);
+        if intercepted > 0 {
+            return Verdict::warn(intercepted_detail(path, intercepted));
+        }
+        let score = path["score"].as_i64().unwrap_or_default();
+        let floor = path["latency_floor_ms"].as_f64().unwrap_or_default();
+        Verdict::ok(format!("score {score}/100, floor {floor:.1} ms"))
     }
 }
 
@@ -103,26 +236,6 @@ fn text(v: &Value) -> Option<String> {
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
-}
-
-fn egress(node: &Node, facts: &GeoFacts) -> CheckResult {
-    let name = node_check(&node.name, "egress address");
-    let Some(ip) = facts.egress else {
-        return CheckResult::warn(
-            name,
-            "geocheck reported no IPv4 address, so exits of channels expected to leave through this node cannot be verified",
-        );
-    };
-    let identity = &facts.report["identity"];
-    let mut detail = format!("egress {ip}");
-    if let Some(asn) = identity.get("asn").and_then(text) {
-        let asn = asn.strip_prefix("AS").map_or(asn.clone(), str::to_string);
-        let _ = write!(detail, " AS{asn}");
-    }
-    if let Some(org) = identity.get("as_name").and_then(text) {
-        let _ = write!(detail, " ({org})");
-    }
-    CheckResult::ok(name, detail)
 }
 
 /// Country shares out of `consensus`, which geocheck keys by address family and
@@ -181,28 +294,6 @@ fn top_country(shares: &BTreeMap<String, f64>) -> String {
         .unwrap_or_default()
 }
 
-fn geo_consensus(node: &Node, report: &Value) -> CheckResult {
-    let name = node_check(&node.name, "geo consensus");
-    let Some((family, shares)) = country_shares(&report["consensus"]) else {
-        return CheckResult::ok(name, "no consensus data");
-    };
-    let seen = seen_as(family, &shares);
-    let expected = node.country_code.to_uppercase();
-    if expected.is_empty() {
-        CheckResult::ok(
-            name,
-            format!("seen as {seen}; the panel has no country for this node"),
-        )
-    } else if top_country(&shares) == expected {
-        CheckResult::ok(name, format!("seen as {seen}"))
-    } else {
-        CheckResult::warn(
-            name,
-            format!("seen as {seen}; panel says {expected}"),
-        )
-    }
-}
-
 /// Detections worth a warning whatever the risk number says. Every node is
 /// hosting space, so `hosting` and `vpn` are the resting state of a healthy
 /// exit and `risk` sits well above zero on its own; these two are not.
@@ -229,26 +320,6 @@ fn reputation_detail(rep: &Value, risk: Option<f64>) -> String {
     )
 }
 
-/// geocheck's own verdicts over the run, already graded. `alert` means it
-/// believes the measurement itself was intercepted; that is worth a warning but
-/// not a failure, because it describes the conditions the report was taken
-/// under rather than the node refusing to serve.
-fn findings(node: &Node, report: &Value) -> CheckResult {
-    let name = node_check(&node.name, "geocheck findings");
-    let Some(items) = report["findings"].as_array() else {
-        return CheckResult::ok(name, "no findings data");
-    };
-    if items.is_empty() {
-        return CheckResult::ok(name, "nothing flagged");
-    }
-    let listed = commas(items.iter().filter_map(finding));
-    if items.iter().any(above_info) {
-        CheckResult::warn(name, listed)
-    } else {
-        CheckResult::ok(name, listed)
-    }
-}
-
 fn finding(item: &Value) -> Option<String> {
     let title = item.get("title").and_then(Value::as_str)?;
     Some(format!("{title} ({})", severity_of(item)))
@@ -267,27 +338,6 @@ fn above_info(item: &Value) -> bool {
     severity_of(item) != "info"
 }
 
-/// The traceroute report. This is `connectivity`; the captive-portal section
-/// above is `connectivity_checks`, and geocheck really does name them that way.
-///
-/// A remnanode container without `CAP_NET_RAW` cannot trace at all, and the
-/// score reported in that case describes nothing — an unusable trace is no
-/// data rather than a bad route.
-fn routing(node: &Node, report: &Value) -> CheckResult {
-    let name = node_check(&node.name, "routing");
-    let path = &report["connectivity"];
-    if !traced(path) {
-        return CheckResult::ok(name, "no routing data");
-    }
-    let intercepted = path["breakdown"]["intercepted"].as_u64().unwrap_or(0);
-    if intercepted > 0 {
-        return CheckResult::warn(name, intercepted_detail(path, intercepted));
-    }
-    let score = path["score"].as_i64().unwrap_or_default();
-    let floor = path["latency_floor_ms"].as_f64().unwrap_or_default();
-    CheckResult::ok(name, format!("score {score}/100, floor {floor:.1} ms"))
-}
-
 fn traced(path: &Value) -> bool {
     path.is_object()
         && ["icmp_available", "privileged"]
@@ -302,17 +352,6 @@ fn intercepted_detail(path: &Value, count: u64) -> String {
     } else {
         format!("intercepted: {names}")
     }
-}
-
-fn targets_verdicted<'a>(path: &'a Value, verdict: &str) -> Vec<&'a str> {
-    let Some(targets) = path["targets"].as_array() else {
-        return Vec::new();
-    };
-    targets
-        .iter()
-        .filter(|t| t.get("verdict").and_then(Value::as_str) == Some(verdict))
-        .filter_map(|t| t.get("name").and_then(Value::as_str))
-        .collect()
 }
 
 /// Endpoints as `[ { name|url|host, verdict }, … ]` or `{ name: { verdict } }`.
@@ -339,33 +378,15 @@ fn endpoints(checks: &Value) -> Vec<(String, String)> {
     }
 }
 
-fn connectivity(node: &Node, report: &Value) -> CheckResult {
-    let name = node_check(&node.name, "connectivity");
-    let checks = &report["connectivity_checks"];
-    if !checks.is_object() {
-        return CheckResult::ok(name, "no connectivity data");
-    }
-    let mut notes: Vec<String> = endpoints(checks)
-        .into_iter()
-        .filter(|(_, v)| !v.eq_ignore_ascii_case("ok"))
-        .map(|(n, v)| format!("{n}: {v}"))
-        .collect();
-    if checks.get("plain_http_blocked").and_then(Value::as_bool) == Some(true) {
-        notes.push("plain http blocked".to_string());
-    }
-    match checks.get("clean").and_then(Value::as_bool) {
-        Some(true) => CheckResult::ok(name, "clean"),
-        Some(false) => CheckResult::warn(
-            name,
-            if notes.is_empty() {
-                "not clean".to_string()
-            } else {
-                notes.join(", ")
-            },
-        ),
-        None if notes.is_empty() => CheckResult::ok(name, "no verdict"),
-        None => CheckResult::warn(name, notes.join(", ")),
-    }
+fn targets_verdicted<'a>(path: &'a Value, verdict: &str) -> Vec<&'a str> {
+    let Some(targets) = path["targets"].as_array() else {
+        return Vec::new();
+    };
+    targets
+        .iter()
+        .filter(|t| t.get("verdict").and_then(Value::as_str) == Some(verdict))
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .collect()
 }
 
 #[cfg(test)]

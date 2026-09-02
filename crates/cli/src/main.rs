@@ -1,4 +1,5 @@
 mod config;
+mod judge;
 mod run;
 
 mod telegram;

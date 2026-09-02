@@ -1,7 +1,7 @@
 //! Verdicts over what a node answered over SSH. Only what the panel API does
 //! not know: containers, listening ports and the TLS certificate lifecycle.
 
-use super::commas;
+use super::{Verdict, commas};
 use crate::model::{
     CheckResult, HostFacts, Node, Severity, SshOutcome, node_check,
 };
@@ -26,45 +26,12 @@ pub struct SshChecker {
     pub acme_dir: String,
 }
 
-struct Verdict {
-    severity: Severity,
-    detail: String,
-}
-
-impl Verdict {
-    fn new(severity: Severity, detail: impl Into<String>) -> Self {
-        Self {
-            severity,
-            detail: detail.into(),
-        }
-    }
-    fn ok(detail: impl Into<String>) -> Self {
-        Self::new(Severity::Ok, detail)
-    }
-    fn warn(detail: impl Into<String>) -> Self {
-        Self::new(Severity::Warn, detail)
-    }
-    fn fail(detail: impl Into<String>) -> Self {
-        Self::new(Severity::Fail, detail)
-    }
-}
-
 struct Host<'a> {
     node: &'a Node,
     facts: &'a HostFacts,
     now: DateTime<Utc>,
     t: &'a SshChecker,
 }
-
-type Check = fn(&Host) -> Verdict;
-
-/// Every node-side check, in report order, with the aspect it is named by.
-const CHECKS: [(&str, Check); 4] = [
-    ("containers", |h| h.containers()),
-    ("inbound ports", |h| h.ports()),
-    ("certificate expiry", |h| h.cert()),
-    ("certificate renewal", |h| h.renewal()),
-];
 
 impl SshChecker {
     /// An unreachable host is one WARN, not four FAILs: some nodes admit only
@@ -90,17 +57,23 @@ impl SshChecker {
             now,
             t: self,
         };
-        CHECKS
-            .iter()
-            .map(|(aspect, check)| {
-                let v = check(&host);
-                CheckResult::new(
-                    node_check(&node.name, aspect),
-                    v.severity,
-                    v.detail,
-                )
-            })
-            .collect()
+        // Every node-side check, in report order, with the aspect it is
+        // named by.
+        [
+            ("containers", host.containers()),
+            ("inbound ports", host.ports()),
+            ("certificate expiry", host.cert()),
+            ("certificate renewal", host.renewal()),
+        ]
+        .into_iter()
+        .map(|(aspect, v)| {
+            CheckResult::new(
+                node_check(&node.name, aspect),
+                v.severity,
+                v.detail,
+            )
+        })
+        .collect()
     }
 }
 
