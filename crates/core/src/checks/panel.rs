@@ -224,8 +224,11 @@ pub struct PanelChecker {
 
 const DAY_SECS: u64 = 86_400;
 
-/// Nobody online on a node the panel calls connected: the node serves nothing,
-/// whatever the panel status says.
+/// Nobody online on a node the panel calls connected. Worth looking at, but not
+/// a failure: every node is hosting space that can legitimately be idle — a
+/// fresh node, a quiet hour — and the panel itself keeps `node_status` and
+/// `node_online_users` as separate metrics rather than deriving one from the
+/// other.
 fn users_online(nodes: &[Node]) -> Vec<CheckResult> {
     nodes
         .iter()
@@ -233,7 +236,7 @@ fn users_online(nodes: &[Node]) -> Vec<CheckResult> {
         .map(|n| {
             let name = node_check(&n.name, "users online");
             if n.users_online == 0 {
-                CheckResult::fail(name, "0 users online on a connected node")
+                CheckResult::warn(name, "0 users online on a connected node")
             } else {
                 CheckResult::ok(name, format!("{} online", n.users_online))
             }
@@ -611,7 +614,7 @@ mod tests {
 
     #[rstest]
     #[case::connected_with_users(false, true, 12, Some(Severity::Ok))]
-    #[case::connected_with_nobody(false, true, 0, Some(Severity::Fail))]
+    #[case::connected_with_nobody(false, true, 0, Some(Severity::Warn))]
     #[case::disconnected_is_skipped(false, false, 0, None)]
     #[case::disabled_is_skipped(true, true, 0, None)]
     fn users_online_judges_only_active_nodes(

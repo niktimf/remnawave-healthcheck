@@ -92,6 +92,30 @@ pub struct HostStats {
     pub uptime_secs: u64,
 }
 
+/// The port a URL without an explicit one is served on.
+pub const HTTPS_PORT: u16 = 443;
+
+/// A host whose TLS certificate is checked, and the port it answers on. A
+/// panel behind a reverse proxy on a non-standard port is a supported
+/// deployment, so the port travels with the host rather than being assumed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Endpoint {
+    /// What the check is named after: the bare host on the standard port, and
+    /// `host:port` anywhere else, so two endpoints never share a row.
+    pub fn label(&self) -> String {
+        if self.port == HTTPS_PORT {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
 /// A node as `/api/nodes` describes it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Node {
@@ -220,11 +244,11 @@ pub struct Snapshot {
     pub served_remarks: Vec<String>,
     /// The subscription answered with the HWID placeholder instead of configs.
     pub hwid_stub: bool,
-    /// Host of the panel URL — its TLS certificate is checked.
-    pub panel_host: String,
-    /// Host of the monitoring user's subscription URL, when it differs from
-    /// the panel host.
-    pub sub_host: Option<String>,
+    /// The panel URL's endpoint — its TLS certificate is checked.
+    pub panel: Endpoint,
+    /// The monitoring user's subscription endpoint, when it differs from the
+    /// panel's.
+    pub sub: Option<Endpoint>,
 }
 
 // ---------------------------------------------------------------------------

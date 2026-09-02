@@ -7,7 +7,7 @@ pub mod topology;
 mod test_util;
 
 pub use model::{
-    Channel, CheckResult, GeoFacts, GeoOutcome, HostFacts, HostStats, Node,
-    PanelState, ProbeOutcome, Profile, Severity, Snapshot, SshOutcome,
+    Channel, CheckResult, Endpoint, GeoFacts, GeoOutcome, HostFacts, HostStats,
+    Node, PanelState, ProbeOutcome, Profile, Severity, Snapshot, SshOutcome,
     TlsFacts, XhttpFacts, node_check, parse_ip,
 };

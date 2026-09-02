@@ -33,6 +33,13 @@ struct Host<'a> {
     t: &'a SshChecker,
 }
 
+/// The node-side checks could not be set up at all — a local problem rather
+/// than any node's. Reported once, because the alternative is the whole family
+/// vanishing from the report without a word.
+pub fn setup_failed(detail: impl Into<String>) -> CheckResult {
+    CheckResult::fail("ssh setup", detail)
+}
+
 impl SshChecker {
     /// An unreachable host is one WARN, not four FAILs: some nodes admit only
     /// the CI runners, and the API-side checks still cover them.

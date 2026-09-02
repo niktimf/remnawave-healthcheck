@@ -4,7 +4,7 @@ use crate::config::{Args, Config};
 use crate::judge::Judge;
 use clap::Parser;
 use remnawave_healthcheck_core::model::{
-    Channel, CheckResult, Node, Profile, Snapshot,
+    Channel, CheckResult, Endpoint, Node, Profile, Snapshot,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -88,8 +88,14 @@ pub(crate) fn snapshot() -> Snapshot {
             ..Default::default()
         }],
         served_remarks: vec!["beta direct".into()],
-        panel_host: "panel.example.com".into(),
-        sub_host: Some("sub.example.com".into()),
+        panel: Endpoint {
+            host: "panel.example.com".into(),
+            port: 443,
+        },
+        sub: Some(Endpoint {
+            host: "sub.example.com".into(),
+            port: 443,
+        }),
         ..Default::default()
     }
 }

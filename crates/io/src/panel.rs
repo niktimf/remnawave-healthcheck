@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{
-    Channel, HostStats, Node, Profile, Snapshot,
+    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Snapshot,
 };
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, Url};
@@ -134,8 +134,13 @@ impl PanelClient {
         })
     }
 
-    pub fn host(&self) -> &str {
-        self.base.host_str().unwrap_or_default()
+    /// Where the panel answers, port included: a panel behind a reverse proxy
+    /// on a non-standard port is checked there, not on 443.
+    pub fn endpoint(&self) -> Endpoint {
+        Endpoint {
+            host: self.base.host_str().unwrap_or_default().to_string(),
+            port: self.base.port_or_known_default().unwrap_or(HTTPS_PORT),
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -276,7 +281,7 @@ impl PanelClient {
         let rendered = parse_rendered(&rendered)
             .context("parsing the JSON subscription")?;
         Ok(build_snapshot(
-            self.host(),
+            &self.endpoint(),
             &user,
             nodes,
             profiles.config_profiles,
@@ -545,12 +550,16 @@ fn is_hwid_stub(rendered: &[RenderedConfig]) -> bool {
         })
 }
 
-fn host_of(url: &str) -> Option<String> {
-    Url::parse(url).ok()?.host_str().map(str::to_string)
+fn endpoint_of(url: &str) -> Option<Endpoint> {
+    let url = Url::parse(url).ok()?;
+    Some(Endpoint {
+        host: url.host_str()?.to_string(),
+        port: url.port_or_known_default().unwrap_or(HTTPS_PORT),
+    })
 }
 
 fn build_snapshot(
-    panel_host: &str,
+    panel: &Endpoint,
     user: &UserDto,
     nodes: Vec<NodeDto>,
     profiles: Vec<ProfileDto>,
@@ -594,7 +603,7 @@ fn build_snapshot(
             path: r.path,
         })
         .collect();
-    let sub_host = host_of(&user.subscription_url).filter(|h| h != panel_host);
+    let sub = endpoint_of(&user.subscription_url).filter(|e| e != panel);
     Snapshot {
         nodes: nodes.into_iter().map(Node::from).collect(),
         profiles: profiles
@@ -613,8 +622,8 @@ fn build_snapshot(
         channels,
         served_remarks,
         hwid_stub,
-        panel_host: panel_host.to_string(),
-        sub_host,
+        panel: panel.clone(),
+        sub,
     }
 }
 
@@ -724,8 +733,11 @@ mod tests {
         assert_eq!(snapshot.served_remarks, vec!["alpha direct".to_string()]);
         assert!(snapshot.profiles.contains_key("p-1"));
         assert!(!snapshot.hwid_stub);
-        assert_eq!(snapshot.sub_host.as_deref(), Some("sub.example.com"));
-        assert_eq!(snapshot.panel_host, "127.0.0.1");
+        assert_eq!(
+            snapshot.sub.as_ref().map(|e| e.host.as_str()),
+            Some("sub.example.com")
+        );
+        assert_eq!(snapshot.panel.host, "127.0.0.1");
     }
 
     #[tokio::test]
@@ -830,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn the_host_comes_from_the_panel_url() {
+    fn the_endpoint_comes_from_the_panel_url() {
         let sut = PanelClient::new(
             "https://panel.example.com/",
             "t",
@@ -839,8 +851,27 @@ mod tests {
         )
         .unwrap();
 
-        let host = sut.host();
+        let endpoint = sut.endpoint();
 
-        assert_eq!(host, "panel.example.com");
+        assert_eq!(endpoint.host, "panel.example.com");
+        assert_eq!(endpoint.port, 443);
+    }
+
+    /// A panel behind a reverse proxy on another port is checked there, not
+    /// on 443.
+    #[test]
+    fn a_non_default_port_in_the_panel_url_is_kept() {
+        let sut = PanelClient::new(
+            "https://panel.example.com:8443/",
+            "t",
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
+
+        let endpoint = sut.endpoint();
+
+        assert_eq!(endpoint.port, 8443);
+        assert_eq!(endpoint.label(), "panel.example.com:8443");
     }
 }

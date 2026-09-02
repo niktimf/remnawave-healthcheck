@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use remnawave_healthcheck_core::checks::channel;
 use remnawave_healthcheck_core::checks::geo::GeoChecker;
 use remnawave_healthcheck_core::checks::panel::PanelChecker;
-use remnawave_healthcheck_core::checks::ssh::SshChecker;
+use remnawave_healthcheck_core::checks::ssh::{self, SshChecker};
 use remnawave_healthcheck_core::checks::tls;
 use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Snapshot, SshOutcome, TlsFacts,
@@ -17,10 +17,28 @@ use std::net::IpAddr;
 /// Facts of every family, keyed so `judge` can pair them with the snapshot.
 pub struct Collected {
     pub geo: HashMap<String, GeoOutcome>,
-    pub ssh: HashMap<String, SshOutcome>,
+    pub ssh: SshStage,
     pub tls: Vec<(String, TlsFacts)>,
     pub xhttp: Vec<(usize, XhttpFacts)>,
     pub probes: ProbeStage,
+}
+
+/// Why a family produced nothing is worth a line in the report, so the stages
+/// it can end in are spelled out rather than collapsed into an empty map.
+pub enum SshStage {
+    Skipped,
+    SetupFailed(String),
+    Done(HashMap<String, SshOutcome>),
+}
+
+impl SshStage {
+    /// What each node's run produced, when the family got to run at all.
+    fn reached(&self) -> Option<&HashMap<String, SshOutcome>> {
+        match self {
+            Self::Done(reached) => Some(reached),
+            Self::Skipped | Self::SetupFailed(_) => None,
+        }
+    }
 }
 
 pub enum ProbeStage {
@@ -67,6 +85,7 @@ impl Judge {
     ) -> Vec<CheckResult> {
         let egress = egress_by_node(snapshot, &c.geo);
         let mut results = self.panel.all(snapshot);
+        results.extend(ssh_setup(&c.ssh));
         results.extend(self.per_node(snapshot, now, &c));
         results.extend(c.tls.iter().map(|(host, facts)| {
             tls::check(host, facts, now, self.cert_warn_days)
@@ -85,16 +104,27 @@ impl Judge {
         now: DateTime<Utc>,
         c: &Collected,
     ) -> Vec<CheckResult> {
+        let reached = c.ssh.reached();
         let mut out = Vec::new();
         for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
             if let Some(outcome) = c.geo.get(&node.name) {
                 out.extend(self.geo.check_node(node, outcome));
             }
-            if let Some(outcome) = c.ssh.get(&node.name) {
+            if let Some(outcome) = reached.and_then(|r| r.get(&node.name)) {
                 out.extend(self.ssh.check_node(node, outcome, now));
             }
         }
         out
+    }
+}
+
+/// A family that could not start is one result, not a silence.
+fn ssh_setup(stage: &SshStage) -> Option<CheckResult> {
+    match stage {
+        SshStage::SetupFailed(detail) => {
+            Some(ssh::setup_failed(detail.as_str()))
+        }
+        SshStage::Skipped | SshStage::Done(_) => None,
     }
 }
 
@@ -200,7 +230,10 @@ mod tests {
         let now = Utc::now();
         let collected = Collected {
             geo: HashMap::from([("beta".to_string(), healthy_geo())]),
-            ssh: HashMap::from([("beta".to_string(), healthy_ssh())]),
+            ssh: SshStage::Done(HashMap::from([(
+                "beta".to_string(),
+                healthy_ssh(),
+            )])),
             tls: vec![(
                 "panel.example.com".into(),
                 TlsFacts {
@@ -227,7 +260,7 @@ mod tests {
             "node beta / egress address",
             "node beta / containers",
             "tls panel.example.com",
-            "channel beta direct / xhttp path",
+            "channel beta direct (beta.example.com:443) / xhttp path",
             "channel beta direct (beta.example.com:443)",
         ] {
             let result = by_name(&results, name);
@@ -251,10 +284,10 @@ mod tests {
                 "beta".to_string(),
                 GeoOutcome::Failed("timeout".into()),
             )]),
-            ssh: HashMap::from([(
+            ssh: SshStage::Done(HashMap::from([(
                 "beta".to_string(),
                 SshOutcome::Unreachable("Connection refused".into()),
-            )]),
+            )])),
             tls: vec![],
             xhttp: vec![],
             probes: ProbeStage::SetupFailed("obtaining xray: boom".into()),
@@ -279,6 +312,29 @@ mod tests {
         assert_eq!(Report::of(&results).outcome(), Outcome::Failed);
     }
 
+    /// A local misconfiguration must not make a whole family disappear: the
+    /// run was asked for node-side checks and produced none.
+    #[test]
+    fn an_ssh_setup_failure_is_reported_rather_than_dropped() {
+        let s = snapshot();
+        let collected = Collected {
+            geo: HashMap::new(),
+            ssh: SshStage::SetupFailed(
+                "writing the key file: permission denied".into(),
+            ),
+            tls: vec![],
+            xhttp: vec![],
+            probes: ProbeStage::Skipped,
+        };
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        let setup = by_name(&results, "ssh setup");
+        assert_eq!(setup.severity, Severity::Fail);
+        assert!(setup.detail.contains("permission denied"), "{}", setup.detail);
+    }
+
     /// Without geocheck there is no address to compare the tunnel's exit
     /// against, and an unverified exit is not a passing one.
     #[test]
@@ -286,7 +342,7 @@ mod tests {
         let s = snapshot();
         let collected = Collected {
             geo: HashMap::new(),
-            ssh: HashMap::new(),
+            ssh: SshStage::Skipped,
             tls: vec![],
             xhttp: vec![],
             probes: probed("192.0.2.20"),

@@ -98,7 +98,10 @@ const XHTTP_ALIVE: u16 = 400;
 const XHTTP_STALE_PATH: u16 = 404;
 
 pub fn xhttp(channel: &Channel, facts: &XhttpFacts) -> CheckResult {
-    let name = format!("channel {} / xhttp path", channel.remark);
+    // The full channel name, not just the remark: a remark template can
+    // collapse several hosts onto one name, and two such rows would otherwise
+    // be indistinguishable in the report.
+    let name = format!("{} / xhttp path", channel.name());
     match (&facts.without_slash, &facts.with_slash) {
         (Ok(XHTTP_ALIVE), Ok(XHTTP_ALIVE)) => CheckResult::ok(
             name,
@@ -350,7 +353,10 @@ mod tests {
 
         let result = xhttp(&s.channels[0], &facts);
 
-        assert_eq!(result.name, "channel beta direct / xhttp path");
+        assert_eq!(
+            result.name,
+            "channel beta direct (beta.example.com:443) / xhttp path"
+        );
         assert_eq!(result.severity, expected, "{}", result.detail);
         assert!(
             result.detail.contains(mentions),

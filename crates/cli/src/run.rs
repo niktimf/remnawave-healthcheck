@@ -3,7 +3,7 @@
 //! need geocheck's egress addresses only at classification time.
 
 use crate::config::Config;
-use crate::judge::{Collected, ProbeResult, ProbeStage};
+use crate::judge::{Collected, ProbeResult, ProbeStage, SshStage};
 use crate::telegram::Notifier;
 use anyhow::Result;
 use chrono::Utc;
@@ -133,18 +133,15 @@ async fn geocheck_all(
     collect(set).await.into_iter().collect()
 }
 
-async fn ssh_all(
-    snapshot: &Snapshot,
-    config: &Config,
-) -> HashMap<String, SshOutcome> {
+async fn ssh_all(snapshot: &Snapshot, config: &Config) -> SshStage {
     if config.no_ssh {
-        return HashMap::new();
+        return SshStage::Skipped;
     }
     let runner = match SshRunner::new(config.ssh.clone()) {
         Ok(r) => Arc::new(r),
         Err(e) => {
             error!("ssh: {e:#}");
-            return HashMap::new();
+            return SshStage::SetupFailed(format!("{e:#}"));
         }
     };
     let mut set = JoinSet::new();
@@ -164,22 +161,24 @@ async fn ssh_all(
             (name, out)
         });
     }
-    collect(set).await.into_iter().collect()
+    SshStage::Done(collect(set).await.into_iter().collect())
 }
 
 async fn tls_all(
     snapshot: &Snapshot,
     config: &Config,
 ) -> Vec<(String, TlsFacts)> {
-    let mut hosts = vec![snapshot.panel_host.clone()];
-    hosts.extend(snapshot.sub_host.clone());
+    let endpoints =
+        std::iter::once(snapshot.panel.clone()).chain(snapshot.sub.clone());
     let mut set = JoinSet::new();
-    for host in hosts {
+    for endpoint in endpoints {
         let timeout = config.tls_timeout;
         set.spawn(async move {
-            let facts = tls::inspect(&host, 443, timeout).await;
-            info!(%host, ?facts, "tls");
-            (host, facts)
+            let facts =
+                tls::inspect(&endpoint.host, endpoint.port, timeout).await;
+            let label = endpoint.label();
+            info!(%label, ?facts, "tls");
+            (label, facts)
         });
     }
     collect(set).await
