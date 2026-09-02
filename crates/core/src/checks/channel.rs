@@ -6,7 +6,6 @@ use crate::model::{
 };
 use crate::topology::Resolver;
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::net::IpAddr;
 
 /// The two ways a pre-probe examination ends: probe it, or here is the result.
@@ -57,11 +56,12 @@ pub fn classify(
     let name = channel.name();
     match (outcome.exit_ip, expect_ip) {
         (None, _) => {
-            let mut detail = "no exit (tunnel dead)".to_string();
-            if !outcome.stderr_tail.is_empty() {
-                let _ = write!(detail, " | xray: {}", outcome.stderr_tail);
-            }
-            CheckResult::fail(name, detail)
+            let xray = if outcome.stderr_tail.is_empty() {
+                String::new()
+            } else {
+                format!(" | xray: {}", outcome.stderr_tail)
+            };
+            CheckResult::fail(name, format!("no exit (tunnel dead){xray}"))
         }
         (Some(got), None) => CheckResult::warn(
             name,
@@ -88,20 +88,32 @@ pub fn setup_failed(detail: impl Into<String>) -> CheckResult {
 
 /// Both path forms of an xhttp inbound must answer 400 (path accepted, session
 /// invalid). 404 without the slash is xray #6307: node and client versions skew.
+/// What a live xhttp inbound answers a probe that is not a real client: xray
+/// read the request and refused its contents. Both path forms must give this,
+/// so here it is the healthy status rather than a complaint.
+const XHTTP_ALIVE: u16 = 400;
+
+/// What a node running xray from before XTLS/Xray-core#6307 answers for the
+/// form without the trailing slash, while the slash form still works.
+const XHTTP_STALE_PATH: u16 = 404;
+
 pub fn xhttp(channel: &Channel, facts: &XhttpFacts) -> CheckResult {
     let name = format!("channel {} / xhttp path", channel.remark);
     match (&facts.without_slash, &facts.with_slash) {
-        (Ok(400), Ok(400)) => {
-            CheckResult::ok(name, "both path forms answer 400")
-        }
-        (Ok(404), Ok(400)) => CheckResult::fail(
+        (Ok(XHTTP_ALIVE), Ok(XHTTP_ALIVE)) => CheckResult::ok(
             name,
-            "404 without the trailing slash, 400 with it: xray #6307 (client/node version skew), update xray on the node",
+            format!("both path forms answer {XHTTP_ALIVE}"),
+        ),
+        (Ok(XHTTP_STALE_PATH), Ok(XHTTP_ALIVE)) => CheckResult::fail(
+            name,
+            format!(
+                "{XHTTP_STALE_PATH} without the trailing slash, {XHTTP_ALIVE} with it: xray #6307 (client/node version skew), update xray on the node"
+            ),
         ),
         (Ok(a), Ok(b)) => CheckResult::fail(
             name,
             format!(
-                "unexpected statuses: {a} without slash, {b} with slash (want 400/400)"
+                "unexpected statuses: {a} without slash, {b} with slash (want {XHTTP_ALIVE}/{XHTTP_ALIVE})"
             ),
         ),
         (Err(e), _) | (_, Err(e)) => {

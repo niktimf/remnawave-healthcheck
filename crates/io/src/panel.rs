@@ -90,16 +90,17 @@ fn head(body: &str) -> String {
 /// cause an operator can act on sits in the sources.
 pub fn error_chain(e: reqwest::Error) -> String {
     let e = e.without_url();
-    let mut parts = vec![e.to_string()];
-    let mut source = std::error::Error::source(&e);
-    while let Some(s) = source {
-        let text = s.to_string();
-        if parts.last() != Some(&text) {
-            parts.push(text);
-        }
-        source = s.source();
-    }
-    parts.join(": ")
+    let sources =
+        std::iter::successors(std::error::Error::source(&e), |source| {
+            source.source()
+        });
+    let mut chain: Vec<String> = std::iter::once(e.to_string())
+        .chain(sources.map(ToString::to_string))
+        .collect();
+    // reqwest repeats a cause verbatim at more than one level; only runs of
+    // the same text are noise, so consecutive duplicates go.
+    chain.dedup();
+    chain.join(": ")
 }
 
 #[derive(Deserialize)]

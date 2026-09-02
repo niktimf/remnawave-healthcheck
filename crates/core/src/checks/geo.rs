@@ -5,7 +5,6 @@ use super::{Verdict, commas};
 use crate::model::{CheckResult, GeoFacts, GeoOutcome, Node, node_check};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fmt::Write;
 
 /// The `schema` of `remnawave/geocheck` v0.3.0, the release remnanode pins in
 /// its `Dockerfile`. geocheck bumps it whenever the JSON shape changes
@@ -41,29 +40,28 @@ impl GeoChecker {
             facts,
             checker: *self,
         };
-        let mut results: Vec<CheckResult> =
-            schema_guard(node, &facts.report).into_iter().collect();
+        let named = |(aspect, v): (&str, Verdict)| {
+            CheckResult::new(
+                node_check(&node.name, aspect),
+                v.severity,
+                v.detail,
+            )
+        };
         // Every geocheck-derived check, in report order, with the aspect it is
-        // named by.
-        results.extend(
-            [
+        // named by. The schema guard leads, and is usually absent.
+        schema_guard(&facts.report)
+            .map(|v| ("geocheck", v))
+            .into_iter()
+            .chain([
                 ("egress address", geo.egress()),
                 ("geo consensus", geo.consensus()),
                 ("reputation", geo.reputation()),
                 ("connectivity", geo.connectivity()),
                 ("geocheck findings", geo.findings()),
                 ("routing", geo.routing()),
-            ]
-            .into_iter()
-            .map(|(aspect, v)| {
-                CheckResult::new(
-                    node_check(&node.name, aspect),
-                    v.severity,
-                    v.detail,
-                )
-            }),
-        );
-        results
+            ])
+            .map(named)
+            .collect()
     }
 }
 
@@ -88,16 +86,19 @@ impl Geo<'_> {
             );
         };
         let identity = &self.report()["identity"];
-        let mut detail = format!("egress {ip}");
-        if let Some(asn) = identity.get("asn").and_then(text) {
-            let asn =
-                asn.strip_prefix("AS").map_or(asn.clone(), str::to_string);
-            let _ = write!(detail, " AS{asn}");
-        }
-        if let Some(org) = identity.get("as_name").and_then(text) {
-            let _ = write!(detail, " ({org})");
-        }
-        Verdict::ok(detail)
+        let asn = identity.get("asn").and_then(text).map(|raw| {
+            let number = raw.strip_prefix("AS").unwrap_or(&raw).to_string();
+            format!(" AS{number}")
+        });
+        let network = identity
+            .get("as_name")
+            .and_then(text)
+            .map(|name| format!(" ({name})"));
+        Verdict::ok(format!(
+            "egress {ip}{}{}",
+            asn.unwrap_or_default(),
+            network.unwrap_or_default()
+        ))
     }
 
     fn consensus(&self) -> Verdict {
@@ -147,16 +148,16 @@ impl Geo<'_> {
         if !checks.is_object() {
             return Verdict::ok("no connectivity data");
         }
-        let mut notes: Vec<String> = endpoints(checks)
+        let altered = endpoints(checks)
             .into_iter()
-            .filter(|(_, v)| !v.eq_ignore_ascii_case("ok"))
-            .map(|(n, v)| format!("{n}: {v}"))
+            .filter(|(_, verdict)| !verdict.eq_ignore_ascii_case("ok"))
+            .map(|(endpoint, verdict)| format!("{endpoint}: {verdict}"));
+        let plain_http_blocked =
+            checks.get("plain_http_blocked").and_then(Value::as_bool)
+                == Some(true);
+        let notes: Vec<String> = altered
+            .chain(plain_http_blocked.then(|| "plain http blocked".to_string()))
             .collect();
-        if checks.get("plain_http_blocked").and_then(Value::as_bool)
-            == Some(true)
-        {
-            notes.push("plain http blocked".to_string());
-        }
         match checks.get("clean").and_then(Value::as_bool) {
             Some(true) => Verdict::ok("clean"),
             Some(false) if notes.is_empty() => Verdict::warn("not clean"),
@@ -213,18 +214,13 @@ impl Geo<'_> {
 /// `schema` is the one field that can tell these checks they are reading a
 /// report they were not written for. Silent when it matches: this is a guard,
 /// not a status, and every node repeating "schema 1" would only pad the report.
-fn schema_guard(node: &Node, report: &Value) -> Option<CheckResult> {
-    let name = node_check(&node.name, "geocheck");
+fn schema_guard(report: &Value) -> Option<Verdict> {
     match report.get("schema").and_then(Value::as_u64) {
         Some(GEOCHECK_SCHEMA) => None,
-        Some(other) => Some(CheckResult::warn(
-            name,
-            format!(
-                "geocheck schema {other}, expected {GEOCHECK_SCHEMA}: fields may be misread"
-            ),
-        )),
-        None => Some(CheckResult::warn(
-            name,
+        Some(other) => Some(Verdict::warn(format!(
+            "geocheck schema {other}, expected {GEOCHECK_SCHEMA}: fields may be misread"
+        ))),
+        None => Some(Verdict::warn(
             "no geocheck schema field: this report predates the shape these checks read",
         )),
     }

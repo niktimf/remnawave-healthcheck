@@ -77,15 +77,13 @@ impl<'a> Report<'a> {
     }
 
     fn counts(&self) -> (usize, usize, usize) {
-        let mut c = (0, 0, 0);
-        for r in self.results {
-            match r.severity {
-                Severity::Fail => c.0 += 1,
-                Severity::Warn => c.1 += 1,
-                Severity::Ok => c.2 += 1,
-            }
-        }
-        c
+        let count = |severity| {
+            self.results
+                .iter()
+                .filter(|r| r.severity == severity)
+                .count()
+        };
+        (count(Severity::Fail), count(Severity::Warn), count(Severity::Ok))
     }
 
     /// Plain-text table. Widths are measured in characters: remarks carry
@@ -98,10 +96,10 @@ impl<'a> Report<'a> {
             .max()
             .unwrap_or(0)
             .max(5);
-        let mut out = String::new();
+        let mut body = String::new();
         for r in &rows {
             let _ = writeln!(
-                out,
+                body,
                 "{:<6} {:<nw$}  {}",
                 r.severity,
                 r.name,
@@ -109,28 +107,27 @@ impl<'a> Report<'a> {
                 nw = name_w
             );
         }
-        out.push('\n');
-        let _ = writeln!(out, "OVERALL: {}", self.overall());
-        out
+        format!("{body}\nOVERALL: {}\n", self.overall())
     }
 
     /// The GitHub job summary: every row, so the run page tells the whole story.
     pub fn markdown(&self) -> String {
         let (fail, warn, ok) = self.counts();
-        let mut out = format!(
+        let header = format!(
             "## Healthcheck: {} — {fail} fail, {warn} warn, {ok} ok\n\n| Severity | Check | Detail |\n|---|---|---|\n",
             self.overall()
         );
+        let mut body = String::new();
         for r in self.sorted() {
             let _ = writeln!(
-                out,
+                body,
                 "| {} | {} | {} |",
                 r.severity,
                 escape_markdown_cell(&r.name),
                 escape_markdown_cell(&r.detail)
             );
         }
-        out
+        header + &body
     }
 
     /// The Telegram message: a headline with counts, then only the WARN/FAIL
@@ -152,28 +149,28 @@ impl<'a> Report<'a> {
             .collect();
         let footer = run_url.map(|u| format!("\n{u}")).unwrap_or_default();
 
-        let assemble = |lines: &[String], dropped: usize| {
-            let mut text = headline.clone();
-            for l in lines {
-                text.push('\n');
-                text.push_str(l);
+        let assemble = |kept: usize| {
+            let mut lines = String::new();
+            for line in &problems[..kept] {
+                let _ = write!(lines, "\n{line}");
             }
-            if dropped > 0 {
-                let _ = write!(text, "\n… and {dropped} more");
-            }
-            text.push('\n');
-            text.push_str(&footer);
-            text
+            let dropped = problems.len() - kept;
+            let more = if dropped > 0 {
+                format!("\n… and {dropped} more")
+            } else {
+                String::new()
+            };
+            format!("{headline}{lines}{more}\n{footer}")
         };
 
-        let mut keep = problems.len();
-        loop {
-            let text = assemble(&problems[..keep], problems.len() - keep);
-            if text.chars().count() <= TELEGRAM_LIMIT || keep == 0 {
-                return text;
-            }
-            keep -= 1;
-        }
+        // Drop problem lines from the end until the message fits. The headline
+        // and the footer always survive, so the shortest candidate is the one
+        // returned when even that is over the limit.
+        (0..=problems.len())
+            .rev()
+            .map(assemble)
+            .find(|text| text.chars().count() <= TELEGRAM_LIMIT)
+            .unwrap_or_else(|| assemble(0))
     }
 
     fn headline(&self) -> String {

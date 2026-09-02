@@ -190,10 +190,12 @@ async fn run(
 /// What went wrong in ssh's own words: the deepest source's last non-empty
 /// line, capped so it fits an alert.
 fn error_detail(err: &openssh::Error) -> String {
-    let mut deepest: &dyn std::error::Error = err;
-    while let Some(source) = deepest.source() {
-        deepest = source;
-    }
+    let deepest =
+        std::iter::successors(Some(err as &dyn std::error::Error), |e| {
+            e.source()
+        })
+        .last()
+        .unwrap_or(err);
     let text = deepest.to_string();
     let reason = text
         .lines()

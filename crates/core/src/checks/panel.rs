@@ -288,13 +288,18 @@ impl PanelChecker {
                 } else {
                     s.memory_free as f64 * 100.0 / s.memory_total as f64
                 };
-                let mut problems = Vec::new();
-                if load1 > self.load_warn_factor * f64::from(cpus) {
-                    problems.push(format!("load {load1:.2} on {cpus} cpu(s)"));
-                }
-                if mem_free_pct < f64::from(self.mem_free_warn_pct) {
-                    problems.push(format!("{mem_free_pct:.0}% memory free"));
-                }
+                let overloaded = load1 > self.load_warn_factor * f64::from(cpus);
+                let short_on_memory =
+                    mem_free_pct < f64::from(self.mem_free_warn_pct);
+                let problems: Vec<String> = [
+                    overloaded
+                        .then(|| format!("load {load1:.2} on {cpus} cpu(s)")),
+                    short_on_memory
+                        .then(|| format!("{mem_free_pct:.0}% memory free")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
                 let summary = format!(
                     "load {load1:.2}/{cpus} cpu, {mem_free_pct:.0}% mem free, up {}d",
                     s.uptime_secs / DAY_SECS
@@ -314,15 +319,18 @@ impl PanelChecker {
     /// Every panel-derived check, in report order.
     pub fn all(self, snapshot: &Snapshot) -> Vec<CheckResult> {
         let nodes = &snapshot.nodes;
-        let mut out = node_status(nodes);
-        out.extend(users_online(nodes));
-        out.extend(self.config_age(nodes));
-        out.extend(self.host(nodes));
-        out.push(xray_version_drift(nodes));
-        out.push(remnanode_version_drift(nodes));
-        out.push(subscription_coverage(snapshot));
-        out.extend(monitoring_coverage(snapshot));
-        out
+        node_status(nodes)
+            .into_iter()
+            .chain(users_online(nodes))
+            .chain(self.config_age(nodes))
+            .chain(self.host(nodes))
+            .chain([
+                xray_version_drift(nodes),
+                remnanode_version_drift(nodes),
+                subscription_coverage(snapshot),
+            ])
+            .chain(monitoring_coverage(snapshot))
+            .collect()
     }
 }
 

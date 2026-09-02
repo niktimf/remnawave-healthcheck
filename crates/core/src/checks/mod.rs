@@ -2,7 +2,6 @@
 //! opens a socket or a process.
 
 use crate::model::Severity;
-use std::fmt::Write;
 
 /// The detail every check reports when the subscription answered with the HWID
 /// placeholder instead of configs.
@@ -12,14 +11,11 @@ pub const HWID_STUB_DETAIL: &str = "the subscription answered with the HWID plac
 pub(crate) fn commas(
     items: impl IntoIterator<Item = impl std::fmt::Display>,
 ) -> String {
-    let mut out = String::new();
-    for item in items {
-        if !out.is_empty() {
-            out.push_str(", ");
-        }
-        let _ = write!(out, "{item}");
-    }
-    out
+    items
+        .into_iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A verdict without a name. Checks that share one context produce these, and
