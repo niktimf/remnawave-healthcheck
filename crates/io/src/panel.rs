@@ -7,6 +7,7 @@ use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{
     Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Snapshot,
 };
+use remnawave_healthcheck_core::topology;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -280,14 +281,19 @@ impl PanelClient {
             .await?;
         let rendered = parse_rendered(&rendered)
             .context("parsing the JSON subscription")?;
-        Ok(build_snapshot(
+        let mut snapshot = build_snapshot(
             &self.endpoint(),
             &user,
             nodes,
             profiles.config_profiles,
             raw,
             rendered,
-        ))
+        );
+        // The hosts are only known once the profiles are in hand, and the pure
+        // crate cannot look them up itself.
+        snapshot.resolved =
+            resolve_hosts(topology::hosts_to_resolve(&snapshot)).await;
+        Ok(snapshot)
     }
 }
 
@@ -550,6 +556,35 @@ fn is_hwid_stub(rendered: &[RenderedConfig]) -> bool {
         })
 }
 
+/// Addresses for the hosts `core` may have to compare. A cascade can point at
+/// a front domain for a node the panel records by address, and only an address
+/// tells that the two name one machine; the pure crate opens no sockets, so
+/// the lookups happen here. A name that resolves to nothing is left out, and
+/// the topology then reports it as an unknown next hop.
+async fn resolve_hosts(
+    hosts: std::collections::BTreeSet<String>,
+) -> HashMap<String, std::net::IpAddr> {
+    const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut resolved = HashMap::new();
+    for host in hosts {
+        let lookup = tokio::net::lookup_host((host.as_str(), 0));
+        let Ok(Ok(addrs)) = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await
+        else {
+            tracing::debug!(%host, "dns: no answer");
+            continue;
+        };
+        // IPv4 first: the panel records node addresses that way, and a match
+        // across families would be a coincidence rather than a fact.
+        let addrs: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+        if let Some(ip) =
+            addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first())
+        {
+            resolved.insert(host, *ip);
+        }
+    }
+    resolved
+}
+
 fn endpoint_of(url: &str) -> Option<Endpoint> {
     let url = Url::parse(url).ok()?;
     Some(Endpoint {
@@ -624,6 +659,9 @@ fn build_snapshot(
         hwid_stub,
         panel: panel.clone(),
         sub,
+        // Filled by `snapshot`: the names are only known once the
+        // profiles are in hand.
+        resolved: HashMap::new(),
     }
 }
 
@@ -633,6 +671,8 @@ mod tests {
     use crate::test_util::{client, client_with, envelope, hwid};
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::net::IpAddr;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -794,6 +834,32 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("401"), "{err:#}");
+    }
+
+    /// `core` compares a cascade's front domain against the node the panel
+    /// records by address, and it opens no sockets — so the answers are looked
+    /// up here.
+    #[tokio::test]
+    async fn hosts_are_resolved_to_addresses() {
+        let hosts = BTreeSet::from(["localhost".to_string()]);
+
+        let resolved = resolve_hosts(hosts).await;
+
+        assert!(
+            resolved.get("localhost").is_some_and(IpAddr::is_loopback),
+            "{resolved:?}"
+        );
+    }
+
+    /// A name that resolves to nothing is simply absent: the topology then
+    /// reports an unknown next hop, which is the honest answer.
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_is_left_out() {
+        let hosts = BTreeSet::from(["nowhere.invalid".to_string()]);
+
+        let resolved = resolve_hosts(hosts).await;
+
+        assert!(resolved.is_empty(), "{resolved:?}");
     }
 
     #[test]

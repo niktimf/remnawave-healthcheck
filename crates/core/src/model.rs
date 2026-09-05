@@ -249,6 +249,12 @@ pub struct Snapshot {
     /// The monitoring user's subscription endpoint, when it differs from the
     /// panel's.
     pub sub: Option<Endpoint>,
+    /// Hosts named in the panel's data, resolved to addresses before the
+    /// routing graph is walked. A cascade can point at a front domain for a
+    /// node the panel records by address, and only an address can tell that
+    /// the two name one machine. This crate opens no sockets, so it is handed
+    /// the answers.
+    pub resolved: HashMap<String, IpAddr>,
 }
 
 // ---------------------------------------------------------------------------

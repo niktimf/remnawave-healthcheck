@@ -1,6 +1,7 @@
-use crate::model::{Channel, Node, Snapshot};
+use crate::model::{Channel, Node, Snapshot, parse_ip};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::net::IpAddr;
 
 /// A cascade longer than this is a configuration mistake, not a topology.
 pub const MAX_HOPS: usize = 8;
@@ -187,6 +188,27 @@ enum Routed<'a> {
     Unsupported(UnsupportedSelector),
 }
 
+/// Every host named in the panel's data that is not already an address: the
+/// nodes' own addresses and the destinations of every profile's outbounds.
+///
+/// The caller resolves these and hands the answers back in `Snapshot.resolved`
+/// before the graph is walked, because a cascade may point at a front domain
+/// for a node the panel records by address — and this crate opens no sockets.
+pub fn hosts_to_resolve(snapshot: &Snapshot) -> BTreeSet<String> {
+    let nodes = snapshot.nodes.iter().map(|n| n.address.clone());
+    let destinations = snapshot
+        .profiles
+        .values()
+        .filter_map(|p| p.config.get("outbounds")?.as_array())
+        .flatten()
+        .filter_map(|o| Outbound(o).destination())
+        .map(|d| d.address);
+    nodes
+        .chain(destinations)
+        .filter(|host| !host.is_empty() && parse_ip(host).is_none())
+        .collect()
+}
+
 /// One outbound of a config.
 #[derive(Clone, Copy)]
 struct Outbound<'a>(&'a Value);
@@ -292,12 +314,13 @@ impl<'a> Resolver<'a> {
                 .ok_or_else(|| ResolveError::NoDestination {
                     tag: outbound.name(),
                 })?;
-            let next = nodes.iter().find(|n| n.address == address).ok_or_else(
-                || ResolveError::UnknownNextHop {
+            let next = nodes
+                .iter()
+                .find(|n| self.same_host(&n.address, &address))
+                .ok_or_else(|| ResolveError::UnknownNextHop {
                     tag: outbound.name(),
                     address,
-                },
-            )?;
+                })?;
             inbound_tag = self
                 .config_of(next)?
                 .inbound_tag_on_port(port)
@@ -308,6 +331,23 @@ impl<'a> Resolver<'a> {
             node = next;
         }
         Err(ResolveError::TooDeep { max: MAX_HOPS })
+    }
+
+    /// Whether two spellings name one machine. The panel records a node by its
+    /// address while a cascade may point at a front domain for the same host,
+    /// so equal text is sufficient but not necessary — equal addresses settle
+    /// the rest. Names are resolved by `io` before the walk; this crate opens
+    /// no sockets.
+    fn same_host(self, a: &str, b: &str) -> bool {
+        a == b
+            || matches!(
+                (self.address_of(a), self.address_of(b)),
+                (Some(x), Some(y)) if x == y
+            )
+    }
+
+    fn address_of(self, host: &str) -> Option<IpAddr> {
+        parse_ip(host).or_else(|| self.snapshot.resolved.get(host).copied())
     }
 
     fn entry_node(self, channel: &Channel) -> Result<&'a Node, ResolveError> {
@@ -403,6 +443,7 @@ mod tests {
     use super::*;
     use crate::model::{Channel, Node, Profile, Snapshot};
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn node(name: &str, address: &str, profile: &str, tags: &[&str]) -> Node {
         Node {
@@ -618,6 +659,106 @@ mod tests {
         let exit = sut.exit_of(&ch);
 
         assert!(matches!(exit, Err(ResolveError::UnknownOutbound { .. })));
+    }
+
+    /// What `io` must resolve before the walk: the front domain, and not the
+    /// addresses that are already addresses.
+    #[test]
+    fn hosts_to_resolve_lists_names_and_skips_literal_addresses() {
+        let snap = snapshot(
+            vec![
+                node("alpha", "192.0.2.10", "p-bridge", &["in-bridge"]),
+                node("gamma", "192.0.2.30", "p-exit", &["in-exit"]),
+            ],
+            vec![
+                bridge_profile(
+                    "p-bridge",
+                    "in-bridge",
+                    443,
+                    "to-gamma",
+                    "gamma.front.example",
+                    2087,
+                ),
+                exit_profile("p-exit", "in-exit", 2087),
+            ],
+        );
+
+        let hosts = hosts_to_resolve(&snap);
+
+        assert_eq!(
+            hosts.into_iter().collect::<Vec<_>>(),
+            vec!["gamma.front.example".to_string()]
+        );
+    }
+
+    /// The panel records a node by address while a cascade points at a front
+    /// domain for the same machine. Both name one node, and only the resolved
+    /// address says so.
+    #[test]
+    fn a_next_hop_named_by_a_domain_reaches_the_node_at_that_address() {
+        let mut snap = snapshot(
+            vec![
+                node("alpha", "192.0.2.10", "p-bridge", &["in-bridge"]),
+                node("gamma", "192.0.2.30", "p-exit", &["in-exit"]),
+            ],
+            vec![
+                bridge_profile(
+                    "p-bridge",
+                    "in-bridge",
+                    443,
+                    "to-gamma",
+                    "gamma.front.example",
+                    2087,
+                ),
+                exit_profile("p-exit", "in-exit", 2087),
+            ],
+        );
+        snap.resolved = HashMap::from([(
+            "gamma.front.example".to_string(),
+            "192.0.2.30".parse().unwrap(),
+        )]);
+        let ch =
+            channel("cdn front", "in-bridge", "p-bridge", "cdn.example.com");
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch).unwrap();
+
+        assert_eq!(exit.name, "gamma");
+    }
+
+    /// A domain that resolves somewhere else is still not that node.
+    #[test]
+    fn a_next_hop_resolving_elsewhere_is_not_a_match() {
+        let mut snap = snapshot(
+            vec![
+                node("alpha", "192.0.2.10", "p-bridge", &["in-bridge"]),
+                node("gamma", "192.0.2.30", "p-exit", &["in-exit"]),
+            ],
+            vec![
+                bridge_profile(
+                    "p-bridge",
+                    "in-bridge",
+                    443,
+                    "to-nowhere",
+                    "elsewhere.example",
+                    2087,
+                ),
+                exit_profile("p-exit", "in-exit", 2087),
+            ],
+        );
+        snap.resolved = HashMap::from([(
+            "elsewhere.example".to_string(),
+            "203.0.113.9".parse().unwrap(),
+        )]);
+        let ch =
+            channel("dangling", "in-bridge", "p-bridge", "cdn.example.com");
+
+        let sut = Resolver::new(&snap);
+
+        let exit = sut.exit_of(&ch);
+
+        assert!(matches!(exit, Err(ResolveError::UnknownNextHop { .. })));
     }
 
     #[test]
