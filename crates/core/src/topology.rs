@@ -450,10 +450,7 @@ mod tests {
             name: name.into(),
             address: address.into(),
             profile_uuid: Some(profile.into()),
-            inbound_tags: tags
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
+            inbound_tags: tags.iter().map(ToString::to_string).collect(),
             is_connected: true,
             xray_version: Some("26.6.27".into()),
             ..Default::default()

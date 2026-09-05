@@ -436,13 +436,34 @@ struct ResolvedDto {
     port: u16,
     #[serde(default)]
     transport: Option<String>,
+    /// `ResolvedProxyConfigSchema` is an intersection of four schemas, and only
+    /// the shared fields sit at the top level: `path` and `host` belong to the
+    /// transport, `serverName` to the security. Reading them one level too high
+    /// yields `None` for every channel — silently, which is how it went
+    /// unnoticed until xhttp probes started reporting "channel has no path".
+    #[serde(default)]
+    transport_options: Option<TransportOptionsDto>,
+    #[serde(default)]
+    security_options: Option<SecurityOptionsDto>,
+    metadata: MetadataDto,
+}
+
+/// Only the parts the checks need; a transport that carries neither leaves both
+/// absent.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransportOptionsDto {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
     host: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecurityOptionsDto {
     #[serde(default)]
     server_name: Option<String>,
-    metadata: MetadataDto,
 }
 
 #[derive(Debug, Deserialize)]
@@ -620,22 +641,27 @@ fn build_snapshot(
     let channels = raw
         .resolved_proxy_configs
         .into_iter()
-        .map(|r| Channel {
-            outbound: served
-                .get(&r.final_remark)
-                .cloned()
-                .unwrap_or(Value::Null),
-            sni: r
-                .server_name
-                .filter(|s| !s.is_empty())
-                .or(r.host.filter(|s| !s.is_empty())),
-            remark: r.final_remark,
-            inbound_tag: r.metadata.inbound_tag,
-            profile_uuid: r.metadata.config_profile_uuid,
-            address: r.address,
-            port: r.port,
-            transport: r.transport,
-            path: r.path,
+        .map(|r| {
+            let transport = r.transport_options.unwrap_or_default();
+            let server_name = r
+                .security_options
+                .and_then(|s| s.server_name)
+                .filter(|s| !s.is_empty());
+            let host = transport.host.filter(|s| !s.is_empty());
+            Channel {
+                outbound: served
+                    .get(&r.final_remark)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                sni: server_name.or(host),
+                remark: r.final_remark,
+                inbound_tag: r.metadata.inbound_tag,
+                profile_uuid: r.metadata.config_profile_uuid,
+                address: r.address,
+                port: r.port,
+                transport: r.transport,
+                path: transport.path.filter(|s| !s.is_empty()),
+            }
         })
         .collect();
     let sub = endpoint_of(&user.subscription_url).filter(|e| e != panel);
@@ -719,7 +745,14 @@ mod tests {
             .mount(server).await;
         Mock::given(method("GET")).and(path("/api/subscriptions/by-short-uuid/abc123/raw")).and(query_param("withDisabledHosts", "false")).and(header("x-hwid", "dev-1"))
             .respond_with(envelope(&json!({"resolvedProxyConfigs": [{"finalRemark": "alpha direct", "address": "alpha.example.com", "port": 443,
-                "transport": "xhttp", "path": "/p", "host": "cdn.example.com", "serverName": "",
+                // `path`, `host` and `serverName` sit inside the transport and
+                // security objects, per ResolvedProxyConfigSchema: the shape is
+                // an intersection, and only the shared fields are at the top.
+                "protocol": "vless",
+                "transport": "xhttp",
+                "transportOptions": {"path": "/p", "host": "cdn.example.com", "mode": "auto", "extra": null},
+                "security": "tls",
+                "securityOptions": {"serverName": "", "alpn": null, "fingerprint": null},
                 "metadata": {"inboundTag": "in-a", "configProfileUuid": "p-1"}}],
                 "convertedUserInfo": {"hwidCheckup": {"subscriptionAllowed": true}}})))
             .mount(server).await;
