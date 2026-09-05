@@ -2,6 +2,7 @@ use super::commas;
 use crate::model::{
     CheckResult, Node, PanelState, Severity, Snapshot, node_check,
 };
+use crate::topology::Resolver;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the panel itself thinks of each node. Costs no SSH and no tunnels.
@@ -148,32 +149,63 @@ impl<'a> Coverage<'a> {
     }
 }
 
-/// Inbounds live on a node that never reach the monitoring user — typically the
-/// user was not added to the squad, so the channel drops out of every check.
+/// Inbounds that run on a node and serve no channel of the monitoring user.
+/// The panel knows why in each case, and the reasons are not the same fault:
+/// a cascade's receiving end is unreachable by any client and belongs to no
+/// subscription by construction, while an inbound nothing at all leads to is a
+/// node listening on a port for nobody.
 fn monitoring_coverage(snapshot: &Snapshot) -> Vec<CheckResult> {
     let covered: BTreeSet<&str> = snapshot
         .channels
         .iter()
         .map(|c| c.inbound_tag.as_str())
         .collect();
-    let mut out = Vec::new();
+    let resolver = Resolver::new(snapshot);
     let mut seen: BTreeSet<&str> = BTreeSet::new();
 
-    for node in snapshot.nodes.iter().filter(|n| n.is_enabled()) {
-        for tag in &node.inbound_tags {
-            if covered.contains(tag.as_str()) || !seen.insert(tag.as_str()) {
-                continue;
-            }
-            out.push(CheckResult::warn(
-                format!("inbound {tag} monitored"),
-                format!(
-                    "inbound '{tag}' on node '{}' is not in the monitoring user's subscription",
-                    node.name
-                ),
-            ));
-        }
+    snapshot
+        .nodes
+        .iter()
+        .filter(|n| n.is_enabled())
+        .flat_map(|node| node.inbound_tags.iter().map(move |tag| (node, tag)))
+        .filter(|(_, tag)| {
+            !covered.contains(tag.as_str()) && seen.insert(tag.as_str())
+        })
+        .filter_map(|(node, tag)| uncovered(snapshot, resolver, node, tag))
+        .collect()
+}
+
+/// Why one inbound serves no channel here, when that is worth reporting.
+fn uncovered(
+    snapshot: &Snapshot,
+    resolver: Resolver<'_>,
+    node: &Node,
+    tag: &str,
+) -> Option<CheckResult> {
+    let name = format!("inbound {tag} monitored");
+    if let Some(host) = snapshot.excluded.iter().find(|h| h.inbound_tag == tag)
+    {
+        return Some(CheckResult::warn(
+            name,
+            format!(
+                "inbound '{tag}' on node '{}' is served by host '{}', which the panel keeps out of this subscription type: nothing here checks that channel",
+                node.name, host.remark
+            ),
+        ));
     }
-    out
+    // A cascade's receiving end: clients never dial it, so no host points at
+    // it and none can. The cascade itself is checked end to end by the
+    // channel that enters it.
+    if resolver.is_cascade_target(node, tag) {
+        return None;
+    }
+    Some(CheckResult::warn(
+        name,
+        format!(
+            "inbound '{tag}' on node '{}' is in no subscription and no cascade routes into it: the node is listening for nobody",
+            node.name
+        ),
+    ))
 }
 
 /// Whether the enabled nodes agree on one version of `what`.
@@ -340,8 +372,10 @@ impl PanelChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Channel, HostStats};
+    use crate::model::{Channel, ExcludedHost, HostStats, Profile};
     use rstest::rstest;
+    use serde_json::json;
+    use std::collections::HashMap;
 
     fn node(
         name: &str,
@@ -532,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn an_inbound_the_monitoring_user_cannot_see_warns() {
+    fn an_inbound_nothing_leads_to_warns() {
         let snapshot = snap(
             vec![node(
                 "alpha",
@@ -550,7 +584,81 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "inbound in-lonely monitored");
         assert_eq!(results[0].severity, Severity::Warn);
-        assert!(results[0].detail.contains("in-lonely"));
+        assert!(
+            results[0].detail.contains("listening for nobody"),
+            "{}",
+            results[0].detail
+        );
+    }
+
+    /// The receiving end of a cascade. No host points at it and none can:
+    /// traffic arrives from the node before it, not from a client.
+    #[test]
+    fn an_inbound_a_cascade_routes_into_is_not_reported() {
+        let mut snapshot = snap(
+            vec![
+                node("alpha", false, true, "26.6.27", &["in-a"]),
+                node("beta", false, true, "26.6.27", &["in-bridge"]),
+            ],
+            &["in-a"],
+            &["ch-in-a"],
+        );
+        snapshot.nodes[1].profile_uuid = Some("p-exit".into());
+        snapshot.profiles = HashMap::from([
+            (
+                "p".to_string(),
+                Profile {
+                    uuid: "p".into(),
+                    name: "gateway".into(),
+                    config: json!({
+                        "inbounds": [{"tag": "in-a", "port": 443}],
+                        "outbounds": [{"tag": "to-beta", "protocol": "vless",
+                            "settings": {"vnext": [{"address": snapshot.nodes[1].address, "port": 8443}]}}]
+                    }),
+                },
+            ),
+            (
+                "p-exit".to_string(),
+                Profile {
+                    uuid: "p-exit".into(),
+                    name: "exit".into(),
+                    config: json!({
+                        "inbounds": [{"tag": "in-bridge", "port": 8443}],
+                        "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+                    }),
+                },
+            ),
+        ]);
+
+        let results = monitoring_coverage(&snapshot);
+
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    /// The host exists and works; the panel simply never renders it in this
+    /// subscription type, so the channel is checked by nothing here. Naming
+    /// the host is what makes that actionable.
+    #[test]
+    fn an_inbound_whose_host_is_kept_out_of_this_subscription_names_it() {
+        let mut snapshot = snap(
+            vec![node("alpha", false, true, "26.6.27", &["in-private"])],
+            &[],
+            &[],
+        );
+        snapshot.excluded = vec![ExcludedHost {
+            remark: "Россия-1".into(),
+            inbound_tag: "in-private".into(),
+        }];
+
+        let results = monitoring_coverage(&snapshot);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].severity, Severity::Warn);
+        assert!(
+            results[0].detail.contains("Россия-1"),
+            "{}",
+            results[0].detail
+        );
     }
 
     #[test]

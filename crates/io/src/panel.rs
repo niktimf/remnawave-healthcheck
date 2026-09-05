@@ -5,7 +5,8 @@
 use anyhow::{Context, Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{
-    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Served, Snapshot,
+    Channel, Endpoint, ExcludedHost, HTTPS_PORT, HostStats, Node, Profile,
+    Served, Snapshot,
 };
 use remnawave_healthcheck_core::topology;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -659,15 +660,22 @@ fn build_snapshot(
     } else {
         rendered.into_iter().map(|c| (c.remark, c.served)).collect()
     };
-    let channels = raw
-        .resolved_proxy_configs
-        .into_iter()
-        .filter(|r| {
+    let (rendered_here, excluded_here): (Vec<_>, Vec<_>) =
+        raw.resolved_proxy_configs.into_iter().partition(|r| {
             !r.metadata
                 .exclude_from_subscription_types
                 .iter()
                 .any(|t| t == SUBSCRIPTION_TYPE)
+        });
+    let excluded = excluded_here
+        .into_iter()
+        .map(|r| ExcludedHost {
+            remark: r.final_remark,
+            inbound_tag: r.metadata.inbound_tag,
         })
+        .collect();
+    let channels = rendered_here
+        .into_iter()
         .map(|r| {
             let transport = r.transport_options.unwrap_or_default();
             let server_name = r
@@ -694,6 +702,7 @@ fn build_snapshot(
         .collect();
     let sub = endpoint_of(&user.subscription_url).filter(|e| e != panel);
     Snapshot {
+        excluded,
         nodes: nodes.into_iter().map(Node::from).collect(),
         profiles: profiles
             .into_iter()
@@ -935,6 +944,14 @@ mod tests {
         let snapshot = sut.snapshot(42).await.unwrap();
 
         assert!(snapshot.channels.is_empty(), "{:?}", snapshot.channels);
+        assert_eq!(
+            snapshot.excluded,
+            vec![ExcludedHost {
+                remark: "alpha direct".into(),
+                inbound_tag: "in-a".into(),
+            }],
+            "an excluded host is kept, so a check can name it"
+        );
     }
 
     /// The panel writes `""` for a field a host does not set, and an empty

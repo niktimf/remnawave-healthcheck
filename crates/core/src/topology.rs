@@ -161,6 +161,21 @@ impl<'a> Config<'a> {
             .map(Outbound)
     }
 
+    /// The port an inbound listens on: the inverse of `inbound_tag_on_port`,
+    /// used to ask whether anything routes into that inbound.
+    fn port_of_inbound(self, tag: &str) -> Option<u16> {
+        self.0
+            .get("inbounds")?
+            .as_array()?
+            .iter()
+            .find(|inbound| {
+                inbound.get("tag").and_then(Value::as_str) == Some(tag)
+            })
+            .and_then(|inbound| inbound.get("port"))
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+    }
+
     fn inbound_tag_on_port(self, port: u16) -> Option<String> {
         self.0
             .get("inbounds")?
@@ -331,6 +346,28 @@ impl<'a> Resolver<'a> {
             node = next;
         }
         Err(ResolveError::TooDeep { max: MAX_HOPS })
+    }
+
+    /// Whether traffic reaches this inbound from another node rather than from
+    /// a client: some profile forwards into this node's address on the port the
+    /// inbound listens on. Such an inbound is the receiving end of a cascade —
+    /// no host points at it and none can, because a client never dials it.
+    pub fn is_cascade_target(self, node: &Node, inbound_tag: &str) -> bool {
+        let Ok(config) = self.config_of(node) else {
+            return false;
+        };
+        let Some(port) = config.port_of_inbound(inbound_tag) else {
+            return false;
+        };
+        self.snapshot
+            .profiles
+            .values()
+            .filter_map(|p| p.config.get("outbounds")?.as_array())
+            .flatten()
+            .filter_map(|o| Outbound(o).destination())
+            .any(|d| {
+                d.port == port && self.same_host(&node.address, &d.address)
+            })
     }
 
     /// Whether two spellings name one machine. The panel records a node by its
@@ -505,6 +542,91 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// The receiving end of a cascade: the bridge forwards into `beta:443`,
+    /// where `in-exit` listens.
+    #[test]
+    fn an_inbound_a_cascade_forwards_into_is_a_cascade_target() {
+        let s = snapshot(
+            vec![
+                node("alpha", "192.0.2.1", "p-bridge", &["in-a"]),
+                node("beta", "192.0.2.2", "p-exit", &["in-exit"]),
+            ],
+            vec![
+                bridge_profile(
+                    "p-bridge",
+                    "in-a",
+                    443,
+                    "to-beta",
+                    "192.0.2.2",
+                    443,
+                ),
+                exit_profile("p-exit", "in-exit", 443),
+            ],
+        );
+
+        let sut = Resolver::new(&s);
+
+        assert!(sut.is_cascade_target(&s.nodes[1], "in-exit"));
+    }
+
+    /// The entry inbound of the same cascade: clients dial it, nothing
+    /// forwards into it.
+    #[test]
+    fn an_inbound_clients_dial_is_not_a_cascade_target() {
+        let s = snapshot(
+            vec![
+                node("alpha", "192.0.2.1", "p-bridge", &["in-a"]),
+                node("beta", "192.0.2.2", "p-exit", &["in-exit"]),
+            ],
+            vec![
+                bridge_profile(
+                    "p-bridge",
+                    "in-a",
+                    443,
+                    "to-beta",
+                    "192.0.2.2",
+                    443,
+                ),
+                exit_profile("p-exit", "in-exit", 443),
+            ],
+        );
+
+        let sut = Resolver::new(&s);
+
+        assert!(!sut.is_cascade_target(&s.nodes[0], "in-a"));
+    }
+
+    /// The panel records the node by address while the cascade points at its
+    /// front domain, so the answer comes from the resolved addresses.
+    #[test]
+    fn a_cascade_naming_the_node_by_its_front_domain_still_counts() {
+        let mut s = snapshot(
+            vec![
+                node("alpha", "192.0.2.1", "p-bridge", &["in-a"]),
+                node("beta", "192.0.2.2", "p-exit", &["in-exit"]),
+            ],
+            vec![
+                bridge_profile(
+                    "p-bridge",
+                    "in-a",
+                    443,
+                    "to-beta",
+                    "front.example.com",
+                    443,
+                ),
+                exit_profile("p-exit", "in-exit", 443),
+            ],
+        );
+        s.resolved = HashMap::from([(
+            "front.example.com".to_string(),
+            parse_ip("192.0.2.2").unwrap(),
+        )]);
+
+        let sut = Resolver::new(&s);
+
+        assert!(sut.is_cascade_target(&s.nodes[1], "in-exit"));
     }
 
     fn channel(

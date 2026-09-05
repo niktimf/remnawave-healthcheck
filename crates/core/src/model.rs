@@ -270,6 +270,16 @@ impl Channel {
     }
 }
 
+/// A host the panel resolved but keeps out of this subscription type
+/// (`metadata.excludeFromSubscriptionTypes`). It is not a channel — nothing
+/// renders it here, so there is no config to probe — but the inbound it serves
+/// is not an unmonitored one either, and saying so needs the host's name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExcludedHost {
+    pub remark: String,
+    pub inbound_tag: String,
+}
+
 /// An Xray config profile: the full JSON, as stored in the panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -284,6 +294,8 @@ pub struct Snapshot {
     pub nodes: Vec<Node>,
     pub profiles: HashMap<String, Profile>,
     pub channels: Vec<Channel>,
+    /// Hosts the panel resolved and then kept out of this subscription type.
+    pub excluded: Vec<ExcludedHost>,
     /// What the rendered subscription served, duplicates included, so the
     /// coverage check can name what is missing or doubled.
     pub served_remarks: Vec<String>,
