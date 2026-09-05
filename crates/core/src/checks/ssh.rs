@@ -141,22 +141,36 @@ impl Host<'_> {
         if self.node.inbound_ports.is_empty() {
             return Verdict::ok("no inbound ports declared by the panel");
         }
-        let public = public_listen_ports(&self.facts.listening);
-        let silent: Vec<u16> = self
-            .node
-            .inbound_ports
+        let listening = listen_ports(&self.facts.listening);
+        let expected = &self.node.inbound_ports;
+        let absent: Vec<u16> = expected
             .iter()
             .copied()
-            .filter(|p| !public.contains(p))
+            .filter(|p| {
+                !listening.public.contains(p) && !listening.loopback.contains(p)
+            })
             .collect();
-        if silent.is_empty() {
-            Verdict::ok(format!(
-                "listening on {}",
-                commas(&self.node.inbound_ports)
-            ))
-        } else {
-            Verdict::fail(format!("not listening: {}", commas(&silent)))
+        if !absent.is_empty() {
+            return Verdict::fail(format!(
+                "not listening: {}",
+                commas(&absent)
+            ));
         }
+        let (public, fronted): (Vec<u16>, Vec<u16>) = expected
+            .iter()
+            .copied()
+            .partition(|p| listening.public.contains(p));
+        let mut parts = Vec::new();
+        if !public.is_empty() {
+            parts.push(format!("listening on {}", commas(&public)));
+        }
+        if !fronted.is_empty() {
+            parts.push(format!(
+                "{} on loopback behind a local proxy",
+                commas(&fronted)
+            ));
+        }
+        Verdict::ok(parts.join("; "))
     }
 
     fn cert(&self) -> Verdict {
@@ -255,8 +269,20 @@ impl Host<'_> {
 }
 
 /// Ports of the `ss -ltn` listeners something outside the node can reach.
-fn public_listen_ports(ss_output: &str) -> BTreeSet<u16> {
-    let mut ports = BTreeSet::new();
+/// Listening ports, split by whether anything outside the host can reach them.
+///
+/// An inbound behind a local reverse proxy listens only on loopback — both the
+/// selfsteal and the CDN-front patterns are built that way — and it is
+/// correctly configured. Reading that as "not listening" is the same verdict a
+/// genuinely absent inbound gets, and the two are not the same thing.
+#[derive(Debug, Default)]
+struct Listening {
+    public: BTreeSet<u16>,
+    loopback: BTreeSet<u16>,
+}
+
+fn listen_ports(ss_output: &str) -> Listening {
+    let mut listening = Listening::default();
     for line in ss_output.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 5 || !fields[0].eq_ignore_ascii_case("LISTEN") {
@@ -266,11 +292,12 @@ fn public_listen_ports(ss_output: &str) -> BTreeSet<u16> {
             continue;
         };
         if address.is_loopback() {
-            continue;
+            listening.loopback.insert(port);
+        } else {
+            listening.public.insert(port);
         }
-        ports.insert(port);
     }
-    ports
+    listening
 }
 
 /// `*:443`, `[::]:8443`, `[fe80::1%eth0]:9100` — the shapes `ss` prints that
@@ -491,10 +518,12 @@ mod tests {
         assert!(containers.detail.contains(mentions), "{}", containers.detail);
     }
 
+    /// An inbound behind a local reverse proxy listens only on loopback — the
+    /// selfsteal and CDN-front patterns both do this, and it is correct.
     #[rstest]
-    #[case::loopback_does_not_count(
+    #[case::loopback_is_a_front_not_a_failure(
         "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\nLISTEN 0 4096 127.0.0.1:8443 0.0.0.0:*\n",
-        Severity::Fail
+        Severity::Ok
     )]
     #[case::wildcard_and_ipv6_count(
         "State Recv-Q Send-Q Local-Address:Port Peer-Address:Port\nLISTEN 0 4096 *:443 *:*\nLISTEN 0 4096 [::]:8443 [::]:*\n",
@@ -514,6 +543,23 @@ mod tests {
         assert_eq!(ports.severity, expected, "{}", ports.detail);
     }
 
+    #[test]
+    fn a_fronted_port_is_named_as_such_rather_than_hidden() {
+        let outcome = reached(|f| {
+            f.listening =
+                "LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\nLISTEN 0 4096 127.0.0.1:8443 0.0.0.0:*\n"
+                    .into();
+        });
+        let sut = checker();
+
+        let results = sut.check_node(&node(), &outcome, now());
+
+        assert_eq!(
+            by_aspect(&results, "inbound ports").detail,
+            "listening on 443; 8443 on loopback behind a local proxy"
+        );
+    }
+
     #[rstest]
     #[case::scoped_link_local(
         "LISTEN 0 4096 [fe80::1%eth0]:9100 [::]:*\n",
@@ -528,7 +574,7 @@ mod tests {
         #[case] line: &str,
         #[case] expected: bool,
     ) {
-        let ports = public_listen_ports(line);
+        let ports = listen_ports(line).public;
 
         assert_eq!(!ports.is_empty(), expected, "{ports:?}");
     }
