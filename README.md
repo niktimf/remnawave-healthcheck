@@ -44,6 +44,10 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 - **Through a real Xray tunnel** — every channel of the monitoring user's subscription, run with the
   exact outbound the panel served, its exit compared with the expected node's egress address by
   following the routing graph of the config profiles (cascades included).
+- **Auto-select entries** — a host whose XRAY-JSON template injects other hosts (`remnawave.
+  injectHosts`) is served a balancer instead of an outbound of its own, so it has no exit to compare
+  and its address is a placeholder. It is checked as what it is: the injector must have selected
+  candidates at all, and at least two of the channels it routes through must be alive.
 
 ## What it needs
 

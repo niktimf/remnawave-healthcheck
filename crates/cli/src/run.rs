@@ -193,7 +193,7 @@ async fn xhttp_all(
     }
     let mut set = JoinSet::new();
     for (idx, channel) in snapshot.channels.iter().enumerate() {
-        if !channel.is_xhttp() || channel.outbound.is_null() {
+        if !channel.is_xhttp() || channel.served.direct().is_none() {
             continue;
         }
         if !matches!(
@@ -236,10 +236,17 @@ async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
     for (idx, channel) in snapshot.channels.iter().enumerate() {
         match checks::channel::precheck(channel, snapshot) {
             Precheck::Decided(r) => list.push((idx, ProbeResult::Decided(r))),
+            // A selector has no tunnel of its own; its verdict is the
+            // balancer check, once the candidates' tunnels are in.
+            Precheck::Selector => {}
             Precheck::Probe(expect) => {
                 let limit = Arc::clone(&limit);
                 let binary = binary.clone();
-                let outbound = channel.outbound.clone();
+                let outbound = channel
+                    .served
+                    .direct()
+                    .cloned()
+                    .expect("a probeable channel carries an outbound");
                 let expect = expect.name.clone();
                 let (timeout, echo) =
                     (config.probe_timeout, config.echo_url.clone());

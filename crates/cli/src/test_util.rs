@@ -4,7 +4,7 @@ use crate::config::{Args, Config};
 use crate::judge::Judge;
 use clap::Parser;
 use remnawave_healthcheck_core::model::{
-    Channel, CheckResult, Endpoint, Node, Profile, Snapshot,
+    Channel, CheckResult, Endpoint, Node, Profile, Served, Snapshot,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -84,7 +84,7 @@ pub(crate) fn snapshot() -> Snapshot {
             port: 443,
             transport: Some("xhttp".into()),
             path: Some("/p".into()),
-            outbound: json!({"protocol": "vless"}),
+            served: Served::Direct(json!({"protocol": "vless"})),
             ..Default::default()
         }],
         served_remarks: vec!["beta direct".into()],

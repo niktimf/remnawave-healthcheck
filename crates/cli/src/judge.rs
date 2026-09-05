@@ -2,7 +2,7 @@
 //! whole module is a function of the snapshot and what the families gathered.
 
 use chrono::{DateTime, Utc};
-use remnawave_healthcheck_core::checks::channel;
+use remnawave_healthcheck_core::checks::channel::{self, Liveness};
 use remnawave_healthcheck_core::checks::geo::GeoChecker;
 use remnawave_healthcheck_core::checks::panel::PanelChecker;
 use remnawave_healthcheck_core::checks::ssh::{self, SshChecker};
@@ -11,7 +11,7 @@ use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Snapshot, SshOutcome, TlsFacts,
     XhttpFacts,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 /// Facts of every family, keyed so `judge` can pair them with the snapshot.
@@ -128,20 +128,49 @@ fn ssh_setup(stage: &SshStage) -> Option<CheckResult> {
     }
 }
 
-/// One verdict per channel: what the tunnel did, or why none was run.
+/// One verdict per channel: what the tunnel did, or why none was run — then
+/// one per selector, which has no tunnel of its own and is judged by the
+/// candidates it routes through.
 fn channels(
     snapshot: &Snapshot,
     probes: ProbeStage,
     egress: &HashMap<&str, IpAddr>,
 ) -> Vec<CheckResult> {
-    match probes {
+    let alive = alive_channels(&probes);
+    let liveness = alive.as_ref().map_or(Liveness::NotRun, Liveness::Alive);
+    let selectors = snapshot
+        .channels
+        .iter()
+        .filter(|c| c.served.is_selector())
+        .map(|c| channel::selector(c, snapshot, liveness));
+    let tunnels = match probes {
         ProbeStage::Skipped => Vec::new(),
         ProbeStage::SetupFailed(detail) => vec![channel::setup_failed(detail)],
         ProbeStage::Done(list) => list
             .into_iter()
             .map(|(idx, result)| channel_verdict(snapshot, idx, result, egress))
             .collect(),
-    }
+    };
+    tunnels.into_iter().chain(selectors).collect()
+}
+
+/// The channels whose tunnel came out somewhere. `None` when no tunnel ran at
+/// all: a balancer is then judged by its size alone rather than declared dead.
+fn alive_channels(probes: &ProbeStage) -> Option<HashSet<usize>> {
+    let ProbeStage::Done(list) = probes else {
+        return None;
+    };
+    Some(
+        list.iter()
+            .filter(|(_, result)| match result {
+                ProbeResult::Probed { outcome, .. } => {
+                    outcome.exit_ip.is_some()
+                }
+                ProbeResult::Decided(_) => false,
+            })
+            .map(|(idx, _)| *idx)
+            .collect(),
+    )
 }
 
 /// The exit a tunnel came out of, against the egress its expected node was
@@ -188,7 +217,7 @@ mod tests {
     use super::*;
     use crate::test_util::{by_name, judge, snapshot};
     use remnawave_healthcheck_core::model::{
-        GeoFacts, HostFacts, Severity, parse_ip,
+        GeoFacts, HostFacts, Served, Severity, parse_ip,
     };
     use remnawave_healthcheck_core::report::{Outcome, Report};
     use serde_json::json;
@@ -333,6 +362,48 @@ mod tests {
         let setup = by_name(&results, "ssh setup");
         assert_eq!(setup.severity, Severity::Fail);
         assert!(setup.detail.contains("permission denied"), "{}", setup.detail);
+    }
+
+    /// The auto-select entry: no tunnel of its own, one verdict about the
+    /// candidates it routes through.
+    #[test]
+    fn a_selector_is_judged_by_the_candidates_that_are_live() {
+        let mut s = snapshot();
+        let mut auto = s.channels[0].clone();
+        auto.remark = "auto".into();
+        auto.address = "auto.wifi.host.com".into();
+        auto.port = 1234;
+        auto.served = Served::Selector(vec![
+            json!({"tag": "cand-1", "protocol": "vless"}),
+        ]);
+        s.channels.push(auto);
+        let collected = Collected {
+            geo: HashMap::new(),
+            ssh: SshStage::Skipped,
+            tls: vec![],
+            xhttp: vec![],
+            probes: probed("192.0.2.20"),
+        };
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        let balancer = by_name(
+            &results,
+            "channel auto (auto.wifi.host.com:1234) / balancer",
+        );
+        assert_eq!(balancer.severity, Severity::Warn, "{}", balancer.detail);
+        assert!(
+            balancer.detail.contains("only one live candidate"),
+            "{}",
+            balancer.detail
+        );
+        assert!(
+            !results
+                .iter()
+                .any(|r| r.name == "channel auto (auto.wifi.host.com:1234)"),
+            "a selector has no tunnel verdict of its own"
+        );
     }
 
     /// Without geocheck there is no address to compare the tunnel's exit

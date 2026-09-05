@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{
-    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Snapshot,
+    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Served, Snapshot,
 };
 use remnawave_healthcheck_core::topology;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -524,11 +524,11 @@ impl From<NodeDto> for Node {
 
 // --- rendered subscription -----------------------------------------------
 
-/// One config the subscription rendered: its remark and the first proxy outbound.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One config the subscription rendered: its remark and what it serves.
+#[derive(Debug, Clone, PartialEq)]
 struct RenderedConfig {
     remark: String,
-    outbound: Value,
+    served: Served,
 }
 
 fn is_proxy(outbound: &Value) -> bool {
@@ -541,18 +541,31 @@ fn is_proxy(outbound: &Value) -> bool {
     )
 }
 
+/// A host carrying an XRAY-JSON template with a `remnawave.injectHosts` block
+/// is served a balancer over outbounds injected from other hosts instead of an
+/// outbound of its own. The balancer is what tells the two apart: the injector
+/// is stripped from the served config, its candidates are not.
+fn balances(config: &Value) -> bool {
+    config
+        .pointer("/routing/balancers")
+        .and_then(Value::as_array)
+        .is_some_and(|balancers| !balancers.is_empty())
+}
+
 /// The remark is mandatory: it is the only join to the resolved channel.
 fn config_entry(config: &Value) -> Option<RenderedConfig> {
     let remark = config.get("remarks").and_then(Value::as_str)?.to_string();
-    let outbound = config
+    let proxies = config
         .get("outbounds")?
         .as_array()?
         .iter()
-        .find(|o| is_proxy(o))?;
-    Some(RenderedConfig {
-        remark,
-        outbound: outbound.clone(),
-    })
+        .filter(|o| is_proxy(o));
+    let served = if balances(config) {
+        Served::Selector(proxies.cloned().collect())
+    } else {
+        Served::Direct(proxies.into_iter().next()?.clone())
+    };
+    Some(RenderedConfig { remark, served })
 }
 
 /// The panel serves an array of per-host configs, or one config for a
@@ -578,7 +591,10 @@ fn is_hwid_stub(rendered: &[RenderedConfig]) -> bool {
     };
     !rendered.is_empty()
         && rendered.iter().all(|c| {
-            target(&c.outbound).is_some_and(|(a, p)| a == "0.0.0.0" && p == 1)
+            c.served
+                .direct()
+                .and_then(target)
+                .is_some_and(|(a, p)| a == "0.0.0.0" && p == 1)
         })
 }
 
@@ -638,13 +654,10 @@ fn build_snapshot(
             .is_some_and(|h| !h.subscription_allowed);
     let served_remarks: Vec<String> =
         rendered.iter().map(|c| c.remark.clone()).collect();
-    let served: HashMap<String, Value> = if hwid_stub {
+    let served: HashMap<String, Served> = if hwid_stub {
         HashMap::new()
     } else {
-        rendered
-            .into_iter()
-            .map(|c| (c.remark, c.outbound))
-            .collect()
+        rendered.into_iter().map(|c| (c.remark, c.served)).collect()
     };
     let channels = raw
         .resolved_proxy_configs
@@ -663,10 +676,10 @@ fn build_snapshot(
                 .filter(|s| !s.is_empty());
             let host = transport.host.filter(|s| !s.is_empty());
             Channel {
-                outbound: served
+                served: served
                     .get(&r.final_remark)
                     .cloned()
-                    .unwrap_or(Value::Null),
+                    .unwrap_or_default(),
                 sni: server_name,
                 host,
                 remark: r.final_remark,
@@ -840,7 +853,7 @@ mod tests {
                 Some("cdn.example.com")
             )
         );
-        assert_eq!(channel.outbound["protocol"], "vless");
+        assert_eq!(channel.served.direct().unwrap()["protocol"], "vless");
         assert_eq!(snapshot.served_remarks, vec!["alpha direct".to_string()]);
         assert!(snapshot.profiles.contains_key("p-1"));
         assert!(!snapshot.hwid_stub);
@@ -861,7 +874,7 @@ mod tests {
         let snapshot = sut.snapshot(42).await.unwrap();
 
         assert!(snapshot.hwid_stub);
-        assert!(snapshot.channels[0].outbound.is_null());
+        assert_eq!(snapshot.channels[0].served, Served::Nothing);
     }
 
     #[tokio::test]
@@ -984,7 +997,39 @@ mod tests {
 
         let channels = parse_rendered(&body).unwrap();
 
-        assert_eq!(channels[0].outbound["protocol"], "vless");
+        assert_eq!(channels[0].served.direct().unwrap()["protocol"], "vless");
+    }
+
+    /// The auto-select entry: a balancer over the outbounds the panel's
+    /// injector copied from other hosts. Its own address is a placeholder, so
+    /// the candidates are the only thing to read.
+    #[test]
+    fn a_config_carrying_a_balancer_is_read_as_its_candidates() {
+        let body = json!({"remarks": "auto", "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "cand-1", "protocol": "vless"},
+            {"tag": "cand-2", "protocol": "vless"},
+            {"tag": "block", "protocol": "blackhole"}],
+            "routing": {"balancers": [{"tag": "lb", "selector": ["cand-"]}]}})
+        .to_string();
+
+        let channels = parse_rendered(&body).unwrap();
+
+        assert_eq!(channels[0].served.candidates().len(), 2);
+    }
+
+    /// The selector matched no host: the balancer is served over nothing, and
+    /// that is a state to report rather than a config to drop.
+    #[test]
+    fn a_balancer_the_injector_filled_with_nothing_is_still_a_selector() {
+        let body = json!({"remarks": "auto", "outbounds": [
+            {"tag": "direct", "protocol": "freedom"}],
+            "routing": {"balancers": [{"tag": "lb", "selector": ["cand-"]}]}})
+        .to_string();
+
+        let channels = parse_rendered(&body).unwrap();
+
+        assert_eq!(channels[0].served, Served::Selector(vec![]));
     }
 
     #[test]

@@ -212,9 +212,48 @@ pub struct Channel {
     /// edge's own name and this is the key the edge routes on. Send one in
     /// place of the other and the edge answers instead of the inbound.
     pub host: Option<String>,
-    /// Ready-made Xray outbound from the subscription. `Value::Null` means the
-    /// subscription served no config for this channel.
-    pub outbound: Value,
+    /// What the rendered subscription served for this channel.
+    pub served: Served,
+}
+
+/// The three shapes a rendered subscription entry takes.
+///
+/// The third exists because a host can carry an XRAY-JSON template with a
+/// `remnawave.injectHosts` block: the panel then serves it not an outbound of
+/// its own but a balancer over outbounds injected from other hosts. Such a
+/// host is a client-side selector — its `address:port` is a placeholder no
+/// node listens on — and asking where it exits has no answer.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Served {
+    /// The panel resolved the host, the subscription carries no config for it.
+    #[default]
+    Nothing,
+    /// One ready-made Xray outbound: an ordinary channel, probed by tunnel.
+    Direct(Value),
+    /// A balancer over the candidates the injector selected.
+    Selector(Vec<Value>),
+}
+
+impl Served {
+    /// The outbound to run a tunnel through, when there is exactly one.
+    pub const fn direct(&self) -> Option<&Value> {
+        match self {
+            Self::Direct(outbound) => Some(outbound),
+            Self::Nothing | Self::Selector(_) => None,
+        }
+    }
+
+    /// The candidates of a balancer; empty for everything else.
+    pub fn candidates(&self) -> &[Value] {
+        match self {
+            Self::Selector(candidates) => candidates,
+            Self::Nothing | Self::Direct(_) => &[],
+        }
+    }
+
+    pub const fn is_selector(&self) -> bool {
+        matches!(self, Self::Selector(_))
+    }
 }
 
 impl Channel {
