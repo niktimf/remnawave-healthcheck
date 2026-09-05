@@ -49,7 +49,9 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 - **Auto-select entries** — a host whose XRAY-JSON template injects other hosts (`remnawave.
   injectHosts`) is served a balancer instead of an outbound of its own, so it has no exit to compare
   and its address is a placeholder. It is checked as what it is: the injector must have selected
-  candidates at all, and at least two of the channels it routes through must be alive.
+  candidates at all, and at least two of the channels it routes through must be alive. A host the
+  panel keeps out of the subscription type but a balancer carries — the auto-select-only host — is
+  taken from that balancer and probed like any other channel, rather than going unchecked.
 
 ## What it needs
 

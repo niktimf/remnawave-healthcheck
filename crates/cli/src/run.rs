@@ -193,7 +193,7 @@ async fn xhttp_all(
     }
     let mut set = JoinSet::new();
     for (idx, channel) in snapshot.channels.iter().enumerate() {
-        if !channel.is_xhttp() || channel.served.direct().is_none() {
+        if !channel.is_xhttp() || channel.served.outbound().is_none() {
             continue;
         }
         if !matches!(
@@ -244,7 +244,7 @@ async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
                 let binary = binary.clone();
                 let outbound = channel
                     .served
-                    .direct()
+                    .outbound()
                     .cloned()
                     .expect("a probeable channel carries an outbound");
                 let expect = expect.name.clone();

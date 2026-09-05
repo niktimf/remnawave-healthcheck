@@ -230,15 +230,23 @@ pub enum Served {
     Nothing,
     /// One ready-made Xray outbound: an ordinary channel, probed by tunnel.
     Direct(Value),
+    /// The same, but taken from another entry's balancer rather than served as
+    /// an entry of its own. A host the panel keeps out of this subscription
+    /// type still reaches clients this way — auto-select is the only way they
+    /// get it — so it is a channel like any other, and probed like one.
+    Candidate(Value),
     /// A balancer over the candidates the injector selected.
     Selector(Vec<Value>),
 }
 
 impl Served {
-    /// The outbound to run a tunnel through, when there is exactly one.
-    pub const fn direct(&self) -> Option<&Value> {
+    /// The outbound to run a tunnel through, however the subscription
+    /// delivered it.
+    pub const fn outbound(&self) -> Option<&Value> {
         match self {
-            Self::Direct(outbound) => Some(outbound),
+            Self::Direct(outbound) | Self::Candidate(outbound) => {
+                Some(outbound)
+            }
             Self::Nothing | Self::Selector(_) => None,
         }
     }
@@ -247,12 +255,18 @@ impl Served {
     pub fn candidates(&self) -> &[Value] {
         match self {
             Self::Selector(candidates) => candidates,
-            Self::Nothing | Self::Direct(_) => &[],
+            Self::Nothing | Self::Direct(_) | Self::Candidate(_) => &[],
         }
     }
 
     pub const fn is_selector(&self) -> bool {
         matches!(self, Self::Selector(_))
+    }
+
+    /// Served inside another entry, so the subscription renders no entry of its
+    /// own for it and coverage must not expect one.
+    pub const fn is_candidate(&self) -> bool {
+        matches!(self, Self::Candidate(_))
     }
 }
 

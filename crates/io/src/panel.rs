@@ -569,6 +569,57 @@ fn config_entry(config: &Value) -> Option<RenderedConfig> {
     Some(RenderedConfig { remark, served })
 }
 
+fn channel_of(r: ResolvedDto, served: Served) -> Channel {
+    let transport = r.transport_options.unwrap_or_default();
+    let server_name = r
+        .security_options
+        .and_then(|s| s.server_name)
+        .filter(|s| !s.is_empty());
+    Channel {
+        served,
+        sni: server_name,
+        host: transport.host.filter(|s| !s.is_empty()),
+        remark: r.final_remark,
+        inbound_tag: r.metadata.inbound_tag,
+        profile_uuid: r.metadata.config_profile_uuid,
+        address: r.address,
+        port: r.port,
+        transport: r.transport,
+        path: transport.path.filter(|s| !s.is_empty()),
+    }
+}
+
+/// Where an outbound sends traffic, as the host that would carry it: address,
+/// port and the transport path. Address and port alone are not enough — four
+/// hosts of this panel share `tw.vlnxflow.com:443` and differ only by path.
+fn outbound_target(outbound: &Value) -> Option<(&str, u64, Option<&str>)> {
+    let settings = outbound.get("settings")?;
+    let first = ["vnext", "servers"]
+        .iter()
+        .find_map(|k| settings.get(k)?.as_array()?.first())?;
+    let stream = outbound.get("streamSettings");
+    let path = ["xhttpSettings", "wsSettings", "httpSettings"]
+        .iter()
+        .find_map(|k| stream?.get(k)?.get("path")?.as_str());
+    Some((first.get("address")?.as_str()?, first.get("port")?.as_u64()?, path))
+}
+
+/// The candidate that carries this host, if a balancer does. Matching is by
+/// where the outbound points rather than by remark: the injector renames the
+/// outbound, and the remark of the entry it lands in belongs to the selector.
+fn candidate_for(r: &ResolvedDto, candidates: &[&Value]) -> Option<Value> {
+    let path = r
+        .transport_options
+        .as_ref()
+        .and_then(|t| t.path.as_deref())
+        .filter(|p| !p.is_empty());
+    let mine = (r.address.as_str(), u64::from(r.port), path);
+    candidates
+        .iter()
+        .find(|c| outbound_target(c) == Some(mine))
+        .map(|c| (*c).clone())
+}
+
 /// The panel serves an array of per-host configs, or one config for a
 /// single-host subscription. Anything else yields nothing rather than a guess.
 fn parse_rendered(raw: &str) -> Result<Vec<RenderedConfig>> {
@@ -593,7 +644,7 @@ fn is_hwid_stub(rendered: &[RenderedConfig]) -> bool {
     !rendered.is_empty()
         && rendered.iter().all(|c| {
             c.served
-                .direct()
+                .outbound()
                 .and_then(target)
                 .is_some_and(|(a, p)| a == "0.0.0.0" && p == 1)
         })
@@ -667,39 +718,33 @@ fn build_snapshot(
                 .iter()
                 .any(|t| t == SUBSCRIPTION_TYPE)
         });
-    let excluded = excluded_here
-        .into_iter()
-        .map(|r| ExcludedHost {
-            remark: r.final_remark,
-            inbound_tag: r.metadata.inbound_tag,
-        })
-        .collect();
-    let channels = rendered_here
+    let mut channels: Vec<Channel> = rendered_here
         .into_iter()
         .map(|r| {
-            let transport = r.transport_options.unwrap_or_default();
-            let server_name = r
-                .security_options
-                .and_then(|s| s.server_name)
-                .filter(|s| !s.is_empty());
-            let host = transport.host.filter(|s| !s.is_empty());
-            Channel {
-                served: served
-                    .get(&r.final_remark)
-                    .cloned()
-                    .unwrap_or_default(),
-                sni: server_name,
-                host,
-                remark: r.final_remark,
-                inbound_tag: r.metadata.inbound_tag,
-                profile_uuid: r.metadata.config_profile_uuid,
-                address: r.address,
-                port: r.port,
-                transport: r.transport,
-                path: transport.path.filter(|s| !s.is_empty()),
-            }
+            let served =
+                served.get(&r.final_remark).cloned().unwrap_or_default();
+            channel_of(r, served)
         })
         .collect();
+    // A host kept out of this subscription type still reaches clients when a
+    // balancer carries it: auto-select is then the only way its clients get
+    // it, and it is a channel like any other. One that no balancer carries is
+    // reachable by nobody here, and only its name is kept, for the check that
+    // says so.
+    let candidates: Vec<&Value> =
+        served.values().flat_map(Served::candidates).collect();
+    let mut excluded = Vec::new();
+    for r in excluded_here {
+        match candidate_for(&r, &candidates) {
+            Some(outbound) => {
+                channels.push(channel_of(r, Served::Candidate(outbound)));
+            }
+            None => excluded.push(ExcludedHost {
+                remark: r.final_remark,
+                inbound_tag: r.metadata.inbound_tag,
+            }),
+        }
+    }
     let sub = endpoint_of(&user.subscription_url).filter(|e| e != panel);
     Snapshot {
         excluded,
@@ -862,7 +907,7 @@ mod tests {
                 Some("cdn.example.com")
             )
         );
-        assert_eq!(channel.served.direct().unwrap()["protocol"], "vless");
+        assert_eq!(channel.served.outbound().unwrap()["protocol"], "vless");
         assert_eq!(snapshot.served_remarks, vec!["alpha direct".to_string()]);
         assert!(snapshot.profiles.contains_key("p-1"));
         assert!(!snapshot.hwid_stub);
@@ -970,6 +1015,36 @@ mod tests {
         assert_eq!(snapshot.channels[0].sni, None);
     }
 
+    /// The panel keeps this host out of the subscription type, and a balancer
+    /// in another entry carries it: that is how auto-select-only hosts reach
+    /// clients, so it is a channel and gets probed like one.
+    #[tokio::test]
+    async fn a_host_a_balancer_carries_is_a_channel_after_all() {
+        let server = MockServer::start().await;
+        let mut raw = raw_body();
+        raw["response"]["resolvedProxyConfigs"][0]["metadata"]["excludeFromSubscriptionTypes"] =
+            json!(["XRAY_JSON"]);
+        let rendered = json!([{"remarks": "auto", "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "cand-1", "protocol": "vless",
+             "settings": {"vnext": [{"address": "alpha.example.com", "port": 443}]},
+             "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/p"}}}],
+            "routing": {"balancers": [{"tag": "lb", "selector": ["cand-"]}]}}]);
+        mount_all_with_raw(&server, rendered, raw).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        let channel = snapshot
+            .channels
+            .iter()
+            .find(|c| c.remark == "alpha direct")
+            .expect("the balancer carries it");
+        assert!(channel.served.is_candidate(), "{:?}", channel.served);
+        assert_eq!(channel.served.outbound().unwrap()["tag"], "cand-1");
+        assert!(snapshot.excluded.is_empty(), "{:?}", snapshot.excluded);
+    }
+
     /// `core` compares a cascade's front domain against the node the panel
     /// records by address, and it opens no sockets — so the answers are looked
     /// up here.
@@ -1014,7 +1089,7 @@ mod tests {
 
         let channels = parse_rendered(&body).unwrap();
 
-        assert_eq!(channels[0].served.direct().unwrap()["protocol"], "vless");
+        assert_eq!(channels[0].served.outbound().unwrap()["protocol"], "vless");
     }
 
     /// The auto-select entry: a balancer over the outbounds the panel's

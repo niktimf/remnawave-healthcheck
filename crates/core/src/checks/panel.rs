@@ -94,9 +94,13 @@ struct Coverage<'a> {
 
 impl<'a> Coverage<'a> {
     fn of(snapshot: &'a Snapshot) -> Self {
+        // A host another entry's balancer carries is rendered inside that
+        // entry, not as one of its own, so it is neither missing here nor
+        // unexpected there.
         let resolved: BTreeSet<&str> = snapshot
             .channels
             .iter()
+            .filter(|c| !c.served.is_candidate())
             .map(|c| c.remark.as_str())
             .collect();
         // One pass: the served set and the ones served more than once come out
@@ -188,7 +192,7 @@ fn uncovered(
         return Some(CheckResult::warn(
             name,
             format!(
-                "inbound '{tag}' on node '{}' is served by host '{}', which the panel keeps out of this subscription type: nothing here checks that channel",
+                "inbound '{tag}' on node '{}' is served by host '{}', which the panel keeps out of this subscription type and no balancer carries: nothing here checks that channel",
                 node.name, host.remark
             ),
         ));
@@ -372,7 +376,7 @@ impl PanelChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Channel, ExcludedHost, HostStats, Profile};
+    use crate::model::{Channel, ExcludedHost, HostStats, Profile, Served};
     use rstest::rstest;
     use serde_json::json;
     use std::collections::HashMap;
@@ -552,6 +556,21 @@ mod tests {
 
         assert_eq!(result.severity, Severity::Fail);
         assert!(result.detail.contains("ch-ghost"), "{}", result.detail);
+    }
+
+    /// The subscription renders such a host inside the auto-select entry, so
+    /// expecting an entry of its own would report a gap that is not one.
+    #[test]
+    fn a_channel_a_balancer_carries_is_not_expected_as_an_entry_of_its_own() {
+        let mut snapshot = snap(vec![], &["in-a"], &["ch-in-a"]);
+        let mut carried = snapshot.channels[0].clone();
+        carried.remark = "ch-private".into();
+        carried.served = Served::Candidate(json!({"protocol": "vless"}));
+        snapshot.channels.push(carried);
+
+        let result = subscription_coverage(&snapshot);
+
+        assert_eq!(result.severity, Severity::Ok, "{}", result.detail);
     }
 
     #[test]

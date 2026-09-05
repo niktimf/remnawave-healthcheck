@@ -41,7 +41,7 @@ pub fn precheck<'a>(channel: &Channel, snapshot: &'a Snapshot) -> Precheck<'a> {
             format!("expected exit '{}' is disabled in the panel", expect.name),
         ));
     }
-    if channel.served.direct().is_none() {
+    if channel.served.outbound().is_none() {
         return Precheck::Decided(CheckResult::fail(
             name,
             "the panel resolved this channel but the subscription served no config for it, so there is nothing to probe",
@@ -115,7 +115,7 @@ fn matched_candidates(channel: &Channel, snapshot: &Snapshot) -> Vec<usize> {
         .iter()
         .filter_map(|candidate| {
             snapshot.channels.iter().position(|c| {
-                c.served.direct().is_some_and(|o| same(o, candidate))
+                c.served.outbound().is_some_and(|o| same(o, candidate))
             })
         })
         .collect()
