@@ -204,8 +204,14 @@ pub struct Channel {
     pub transport: Option<String>,
     /// xhttp/ws path, when the transport has one.
     pub path: Option<String>,
-    /// SNI to present when probing the inbound directly.
+    /// TLS name to present when probing the inbound directly
+    /// (`securityOptions.serverName`).
     pub sni: Option<String>,
+    /// HTTP `Host` the client sends (`transportOptions.host`). On a fronted
+    /// channel it differs from [`Channel::sni`]: the handshake carries the
+    /// edge's own name and this is the key the edge routes on. Send one in
+    /// place of the other and the edge answers instead of the inbound.
+    pub host: Option<String>,
     /// Ready-made Xray outbound from the subscription. `Value::Null` means the
     /// subscription served no config for this channel.
     pub outbound: Value,

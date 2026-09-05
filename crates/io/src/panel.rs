@@ -667,7 +667,8 @@ fn build_snapshot(
                     .get(&r.final_remark)
                     .cloned()
                     .unwrap_or(Value::Null),
-                sni: server_name.or(host),
+                sni: server_name,
+                host,
                 remark: r.final_remark,
                 inbound_tag: r.metadata.inbound_tag,
                 profile_uuid: r.metadata.config_profile_uuid,
@@ -755,7 +756,7 @@ mod tests {
             "transport": "xhttp",
             "transportOptions": {"path": "/p", "host": "cdn.example.com", "mode": "auto", "extra": null},
             "security": "tls",
-            "securityOptions": {"serverName": "", "alpn": null, "fingerprint": null},
+            "securityOptions": {"serverName": "edge.example.net", "alpn": null, "fingerprint": null},
             "metadata": {"inboundTag": "in-a", "configProfileUuid": "p-1", "excludeFromSubscriptionTypes": []}}],
             "convertedUserInfo": {"hwidCheckup": {"subscriptionAllowed": true}}}})
     }
@@ -829,9 +830,15 @@ mod tests {
             (
                 channel.transport.as_deref(),
                 channel.path.as_deref(),
-                channel.sni.as_deref()
+                channel.sni.as_deref(),
+                channel.host.as_deref()
             ),
-            (Some("xhttp"), Some("/p"), Some("cdn.example.com"))
+            (
+                Some("xhttp"),
+                Some("/p"),
+                Some("edge.example.net"),
+                Some("cdn.example.com")
+            )
         );
         assert_eq!(channel.outbound["protocol"], "vless");
         assert_eq!(snapshot.served_remarks, vec!["alpha direct".to_string()]);
@@ -915,6 +922,22 @@ mod tests {
         let snapshot = sut.snapshot(42).await.unwrap();
 
         assert!(snapshot.channels.is_empty(), "{:?}", snapshot.channels);
+    }
+
+    /// The panel writes `""` for a field a host does not set, and an empty
+    /// name is no name: kept, it would be presented as the SNI.
+    #[tokio::test]
+    async fn an_empty_server_name_is_no_sni() {
+        let server = MockServer::start().await;
+        let mut raw = raw_body();
+        raw["response"]["resolvedProxyConfigs"][0]["securityOptions"]["serverName"] =
+            json!("");
+        mount_all_with_raw(&server, rendered_fixture(), raw).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert_eq!(snapshot.channels[0].sni, None);
     }
 
     /// `core` compares a cascade's front domain against the node the panel
