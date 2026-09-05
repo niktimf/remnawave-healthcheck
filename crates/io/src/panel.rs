@@ -5,8 +5,8 @@
 use anyhow::{Context, Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{
-    Channel, Endpoint, ExcludedHost, HTTPS_PORT, HostStats, Node, Profile,
-    Served, Snapshot,
+    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Served, Snapshot,
+    Unserved, UnservedHost,
 };
 use remnawave_healthcheck_core::topology;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -268,7 +268,7 @@ impl PanelClient {
         let raw: RawDto = self
             .get_json(
                 &format!(
-                    "/api/subscriptions/by-short-uuid/{}/raw?withDisabledHosts=false",
+                    "/api/subscriptions/by-short-uuid/{}/raw?withDisabledHosts=true",
                     user.short_uuid
                 ),
                 Auth::Token,
@@ -476,6 +476,12 @@ struct MetadataDto {
     /// coverage check must not expect back what was never promised.
     #[serde(default)]
     exclude_from_subscription_types: Vec<String>,
+    /// Switched off by an administrator. Such a host is asked for on purpose
+    /// (`withDisabledHosts=true`): it is served to nobody, but an inbound
+    /// whose only host is off is a different state from one with no host at
+    /// all, and the report says which.
+    #[serde(default)]
+    is_disabled: bool,
     /// `null` for a host without a profile — a real panel state.
     #[serde(default)]
     config_profile_uuid: Option<String>,
@@ -711,8 +717,20 @@ fn build_snapshot(
     } else {
         rendered.into_iter().map(|c| (c.remark, c.served)).collect()
     };
+    let (disabled_here, enabled_here): (Vec<_>, Vec<_>) = raw
+        .resolved_proxy_configs
+        .into_iter()
+        .partition(|r| r.metadata.is_disabled);
+    let mut unserved: Vec<UnservedHost> = disabled_here
+        .into_iter()
+        .map(|r| UnservedHost {
+            remark: r.final_remark,
+            inbound_tag: r.metadata.inbound_tag,
+            why: Unserved::Disabled,
+        })
+        .collect();
     let (rendered_here, excluded_here): (Vec<_>, Vec<_>) =
-        raw.resolved_proxy_configs.into_iter().partition(|r| {
+        enabled_here.into_iter().partition(|r| {
             !r.metadata
                 .exclude_from_subscription_types
                 .iter()
@@ -733,21 +751,21 @@ fn build_snapshot(
     // says so.
     let candidates: Vec<&Value> =
         served.values().flat_map(Served::candidates).collect();
-    let mut excluded = Vec::new();
     for r in excluded_here {
         match candidate_for(&r, &candidates) {
             Some(outbound) => {
                 channels.push(channel_of(r, Served::Candidate(outbound)));
             }
-            None => excluded.push(ExcludedHost {
+            None => unserved.push(UnservedHost {
                 remark: r.final_remark,
                 inbound_tag: r.metadata.inbound_tag,
+                why: Unserved::ExcludedFromType,
             }),
         }
     }
     let sub = endpoint_of(&user.subscription_url).filter(|e| e != panel);
     Snapshot {
-        excluded,
+        unserved,
         nodes: nodes.into_iter().map(Node::from).collect(),
         profiles: profiles
             .into_iter()
@@ -850,7 +868,7 @@ mod tests {
             .mount(server).await;
         Mock::given(method("GET"))
             .and(path("/api/subscriptions/by-short-uuid/abc123/raw"))
-            .and(query_param("withDisabledHosts", "false"))
+            .and(query_param("withDisabledHosts", "true"))
             .and(header("x-hwid", "dev-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(raw))
             .mount(server)
@@ -990,12 +1008,13 @@ mod tests {
 
         assert!(snapshot.channels.is_empty(), "{:?}", snapshot.channels);
         assert_eq!(
-            snapshot.excluded,
-            vec![ExcludedHost {
+            snapshot.unserved,
+            vec![UnservedHost {
                 remark: "alpha direct".into(),
                 inbound_tag: "in-a".into(),
+                why: Unserved::ExcludedFromType,
             }],
-            "an excluded host is kept, so a check can name it"
+            "an unserved host is kept, so a check can name it"
         );
     }
 
@@ -1013,6 +1032,32 @@ mod tests {
         let snapshot = sut.snapshot(42).await.unwrap();
 
         assert_eq!(snapshot.channels[0].sni, None);
+    }
+
+    /// The run asks for disabled hosts on purpose: an inbound whose only host
+    /// is switched off is a node listening for nobody, and that is worth a
+    /// different sentence than an inbound with no host at all. It is not a
+    /// channel — there is nothing to probe.
+    #[tokio::test]
+    async fn a_disabled_host_is_no_channel_but_is_remembered_as_disabled() {
+        let server = MockServer::start().await;
+        let mut raw = raw_body();
+        raw["response"]["resolvedProxyConfigs"][0]["metadata"]["isDisabled"] =
+            json!(true);
+        mount_all_with_raw(&server, rendered_fixture(), raw).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert!(snapshot.channels.is_empty(), "{:?}", snapshot.channels);
+        assert_eq!(
+            snapshot.unserved,
+            vec![UnservedHost {
+                remark: "alpha direct".into(),
+                inbound_tag: "in-a".into(),
+                why: Unserved::Disabled,
+            }]
+        );
     }
 
     /// The panel keeps this host out of the subscription type, and a balancer
@@ -1042,7 +1087,7 @@ mod tests {
             .expect("the balancer carries it");
         assert!(channel.served.is_candidate(), "{:?}", channel.served);
         assert_eq!(channel.served.outbound().unwrap()["tag"], "cand-1");
-        assert!(snapshot.excluded.is_empty(), "{:?}", snapshot.excluded);
+        assert!(snapshot.unserved.is_empty(), "{:?}", snapshot.unserved);
     }
 
     /// `core` compares a cascade's front domain against the node the panel

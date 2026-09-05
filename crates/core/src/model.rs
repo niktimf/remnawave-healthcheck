@@ -284,14 +284,26 @@ impl Channel {
     }
 }
 
-/// A host the panel resolved but keeps out of this subscription type
-/// (`metadata.excludeFromSubscriptionTypes`). It is not a channel — nothing
-/// renders it here, so there is no config to probe — but the inbound it serves
-/// is not an unmonitored one either, and saying so needs the host's name.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ExcludedHost {
+/// A host the panel knows and does not serve here. It is not a channel —
+/// there is no config to probe — but an inbound it belongs to is not an
+/// unmonitored one either, and saying which of the two it is needs the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnservedHost {
     pub remark: String,
     pub inbound_tag: String,
+    pub why: Unserved,
+}
+
+/// Why the panel serves a host to nobody. The two are different states: one is
+/// a switch an administrator threw, the other is a host that works and is kept
+/// out of this subscription format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unserved {
+    /// Switched off in the panel (`metadata.isDisabled`).
+    Disabled,
+    /// Kept out of this subscription type
+    /// (`metadata.excludeFromSubscriptionTypes`) and carried by no balancer.
+    ExcludedFromType,
 }
 
 /// An Xray config profile: the full JSON, as stored in the panel.
@@ -308,8 +320,8 @@ pub struct Snapshot {
     pub nodes: Vec<Node>,
     pub profiles: HashMap<String, Profile>,
     pub channels: Vec<Channel>,
-    /// Hosts the panel resolved and then kept out of this subscription type.
-    pub excluded: Vec<ExcludedHost>,
+    /// Hosts the panel serves to nobody here, and why.
+    pub unserved: Vec<UnservedHost>,
     /// What the rendered subscription served, duplicates included, so the
     /// coverage check can name what is missing or doubled.
     pub served_remarks: Vec<String>,

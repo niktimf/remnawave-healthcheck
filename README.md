@@ -28,9 +28,9 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 - **From the panel API** — node status with the panel's own reason, users online, config age
   (`xrayUptime`), host load and memory, Xray and remnanode version drift across nodes, subscription
   coverage (the rendered subscription serves exactly the channels the panel resolved), and inbounds serving
-  no channel of the monitoring user — a host kept out of this subscription type is named as such, an inbound
-  nothing leads to is reported as a node listening for nobody, and the receiving end of a cascade, which no
-  client ever dials, is passed over.
+  no channel of the monitoring user — a host kept out of this subscription type and a host switched off in the
+  panel are each named as such, an inbound no host and no cascade leads to is reported as the configuration
+  error it is, and the receiving end of a cascade, which no client ever dials, is passed over.
 - **From geocheck** (a job the panel runs on each node) — the node's real egress address and ASN,
   which country the world sees it in versus what the panel says, IP reputation, connectivity to
   external services, geocheck's own findings, and how directly the node reaches the internet.

@@ -1,6 +1,6 @@
 use super::commas;
 use crate::model::{
-    CheckResult, Node, PanelState, Severity, Snapshot, node_check,
+    CheckResult, Node, PanelState, Severity, Snapshot, Unserved, node_check,
 };
 use crate::topology::Resolver;
 use std::collections::{BTreeMap, BTreeSet};
@@ -187,13 +187,33 @@ fn uncovered(
     tag: &str,
 ) -> Option<CheckResult> {
     let name = format!("inbound {tag} monitored");
-    if let Some(host) = snapshot.excluded.iter().find(|h| h.inbound_tag == tag)
-    {
+    // A host kept out of this subscription type is the more actionable of the
+    // two states — the channel works and goes unchecked — so it is named first
+    // when an inbound has both kinds.
+    let hosts = |why| {
+        let named: Vec<&str> = snapshot
+            .unserved
+            .iter()
+            .filter(|h| h.inbound_tag == tag && h.why == why)
+            .map(|h| h.remark.as_str())
+            .collect();
+        (!named.is_empty()).then(|| commas(named))
+    };
+    if let Some(named) = hosts(Unserved::ExcludedFromType) {
         return Some(CheckResult::warn(
             name,
             format!(
-                "inbound '{tag}' on node '{}' is served by host '{}', which the panel keeps out of this subscription type and no balancer carries: nothing here checks that channel",
-                node.name, host.remark
+                "inbound '{tag}' on node '{}' is served by {named}, which the panel keeps out of this subscription type and no balancer carries: nothing here checks that channel",
+                node.name
+            ),
+        ));
+    }
+    if let Some(named) = hosts(Unserved::Disabled) {
+        return Some(CheckResult::warn(
+            name,
+            format!(
+                "inbound '{tag}' on node '{}' is served only by {named}, disabled in the panel: the node is listening for nobody",
+                node.name
             ),
         ));
     }
@@ -206,7 +226,7 @@ fn uncovered(
     Some(CheckResult::warn(
         name,
         format!(
-            "inbound '{tag}' on node '{}' is in no subscription and no cascade routes into it: the node is listening for nobody",
+            "inbound '{tag}' on node '{}' is in no subscription, no host of the panel leads to it and no cascade routes into it",
             node.name
         ),
     ))
@@ -376,7 +396,9 @@ impl PanelChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Channel, ExcludedHost, HostStats, Profile, Served};
+    use crate::model::{
+        Channel, HostStats, Profile, Served, Unserved, UnservedHost,
+    };
     use rstest::rstest;
     use serde_json::json;
     use std::collections::HashMap;
@@ -604,7 +626,35 @@ mod tests {
         assert_eq!(results[0].name, "inbound in-lonely monitored");
         assert_eq!(results[0].severity, Severity::Warn);
         assert!(
-            results[0].detail.contains("listening for nobody"),
+            results[0]
+                .detail
+                .contains("no host of the panel leads to it"),
+            "{}",
+            results[0].detail
+        );
+    }
+
+    /// The switch an administrator threw, as opposed to an inbound no host
+    /// was ever made for: the report names the host so the choice is visible.
+    #[test]
+    fn an_inbound_whose_only_host_is_disabled_names_it() {
+        let mut snapshot = snap(
+            vec![node("alpha", false, true, "26.6.27", &["in-off"])],
+            &[],
+            &[],
+        );
+        snapshot.unserved = vec![UnservedHost {
+            remark: "Анти-БПЛА-1".into(),
+            inbound_tag: "in-off".into(),
+            why: Unserved::Disabled,
+        }];
+
+        let results = monitoring_coverage(&snapshot);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].detail.contains("Анти-БПЛА-1")
+                && results[0].detail.contains("disabled"),
             "{}",
             results[0].detail
         );
@@ -664,9 +714,10 @@ mod tests {
             &[],
             &[],
         );
-        snapshot.excluded = vec![ExcludedHost {
+        snapshot.unserved = vec![UnservedHost {
             remark: "Россия-1".into(),
             inbound_tag: "in-private".into(),
+            why: Unserved::ExcludedFromType,
         }];
 
         let results = monitoring_coverage(&snapshot);
