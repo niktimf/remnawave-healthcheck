@@ -470,6 +470,11 @@ struct SecurityOptionsDto {
 #[serde(rename_all = "camelCase")]
 struct MetadataDto {
     inbound_tag: String,
+    /// Subscription renderings this host is kept out of. The panel drops such a
+    /// host before generating (`xray-json.generator.service.ts`), so the
+    /// coverage check must not expect back what was never promised.
+    #[serde(default)]
+    exclude_from_subscription_types: Vec<String>,
     /// `null` for a host without a profile — a real panel state.
     #[serde(default)]
     config_profile_uuid: Option<String>,
@@ -606,6 +611,9 @@ async fn resolve_hosts(
     resolved
 }
 
+/// The rendering this tool asks for: `/api/sub/{shortUuid}/json`.
+const SUBSCRIPTION_TYPE: &str = "XRAY_JSON";
+
 fn endpoint_of(url: &str) -> Option<Endpoint> {
     let url = Url::parse(url).ok()?;
     Some(Endpoint {
@@ -641,6 +649,12 @@ fn build_snapshot(
     let channels = raw
         .resolved_proxy_configs
         .into_iter()
+        .filter(|r| {
+            !r.metadata
+                .exclude_from_subscription_types
+                .iter()
+                .any(|t| t == SUBSCRIPTION_TYPE)
+        })
         .map(|r| {
             let transport = r.transport_options.unwrap_or_default();
             let server_name = r
@@ -731,7 +745,30 @@ mod tests {
             {"protocol": "freedom", "tag": "direct"}]}])
     }
 
+    /// `path`, `host` and `serverName` sit inside the transport and security
+    /// objects, per `ResolvedProxyConfigSchema`: the shape is an intersection,
+    /// and only the shared fields are at the top.
+    fn raw_body() -> Value {
+        json!({"response": {"resolvedProxyConfigs": [{
+            "finalRemark": "alpha direct", "address": "alpha.example.com", "port": 443,
+            "protocol": "vless",
+            "transport": "xhttp",
+            "transportOptions": {"path": "/p", "host": "cdn.example.com", "mode": "auto", "extra": null},
+            "security": "tls",
+            "securityOptions": {"serverName": "", "alpn": null, "fingerprint": null},
+            "metadata": {"inboundTag": "in-a", "configProfileUuid": "p-1", "excludeFromSubscriptionTypes": []}}],
+            "convertedUserInfo": {"hwidCheckup": {"subscriptionAllowed": true}}}})
+    }
+
     async fn mount_all(server: &MockServer, rendered: Value) {
+        mount_all_with_raw(server, rendered, raw_body()).await;
+    }
+
+    async fn mount_all_with_raw(
+        server: &MockServer,
+        rendered: Value,
+        raw: Value,
+    ) {
         Mock::given(method("GET")).and(path("/api/users/42")).and(header("authorization", "Bearer tok"))
             .respond_with(envelope(&json!({"id": 42, "shortUuid": "abc123", "subscriptionUrl": "https://sub.example.com/abc123"})))
             .mount(server).await;
@@ -743,19 +780,13 @@ mod tests {
         Mock::given(method("GET")).and(path("/api/config-profiles"))
             .respond_with(envelope(&json!({"configProfiles": [{"uuid": "p-1", "name": "main", "config": {"outbounds": [{"tag": "direct", "protocol": "freedom"}]}}]})))
             .mount(server).await;
-        Mock::given(method("GET")).and(path("/api/subscriptions/by-short-uuid/abc123/raw")).and(query_param("withDisabledHosts", "false")).and(header("x-hwid", "dev-1"))
-            .respond_with(envelope(&json!({"resolvedProxyConfigs": [{"finalRemark": "alpha direct", "address": "alpha.example.com", "port": 443,
-                // `path`, `host` and `serverName` sit inside the transport and
-                // security objects, per ResolvedProxyConfigSchema: the shape is
-                // an intersection, and only the shared fields are at the top.
-                "protocol": "vless",
-                "transport": "xhttp",
-                "transportOptions": {"path": "/p", "host": "cdn.example.com", "mode": "auto", "extra": null},
-                "security": "tls",
-                "securityOptions": {"serverName": "", "alpn": null, "fingerprint": null},
-                "metadata": {"inboundTag": "in-a", "configProfileUuid": "p-1"}}],
-                "convertedUserInfo": {"hwidCheckup": {"subscriptionAllowed": true}}})))
-            .mount(server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/subscriptions/by-short-uuid/abc123/raw"))
+            .and(query_param("withDisabledHosts", "false"))
+            .and(header("x-hwid", "dev-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(raw))
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/api/sub/abc123/json"))
             .and(header("x-hwid", "dev-1"))
@@ -867,6 +898,23 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("401"), "{err:#}");
+    }
+
+    /// The panel drops a host excluded from this subscription type before
+    /// rendering it (`xray-json.generator.service.ts`), so expecting it back is
+    /// expecting what was never promised.
+    #[tokio::test]
+    async fn a_host_excluded_from_this_subscription_type_is_not_a_channel() {
+        let server = MockServer::start().await;
+        let mut raw = raw_body();
+        raw["response"]["resolvedProxyConfigs"][0]["metadata"]["excludeFromSubscriptionTypes"] =
+            json!(["XRAY_JSON"]);
+        mount_all_with_raw(&server, rendered_fixture(), raw).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert!(snapshot.channels.is_empty(), "{:?}", snapshot.channels);
     }
 
     /// `core` compares a cascade's front domain against the node the panel

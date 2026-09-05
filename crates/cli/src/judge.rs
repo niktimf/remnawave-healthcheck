@@ -91,7 +91,7 @@ impl Judge {
             tls::check(host, facts, now, self.cert_warn_days)
         }));
         results.extend(c.xhttp.iter().map(|(idx, facts)| {
-            channel::xhttp(&snapshot.channels[*idx], facts)
+            channel::xhttp(&snapshot.channels[*idx], facts, snapshot)
         }));
         results.extend(channels(snapshot, c.probes, &egress));
         results
