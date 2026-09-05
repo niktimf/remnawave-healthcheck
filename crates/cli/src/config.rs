@@ -95,8 +95,10 @@ pub struct Args {
     pub load_warn_factor: f64,
     #[arg(long, env = "REMNAWAVE_MEM_FREE_WARN_PCT", default_value_t = 10)]
     pub mem_free_warn_pct: u8,
-    /// Warn at or above this geocheck reputation risk
-    #[arg(long, env = "REMNAWAVE_REPUTATION_WARN_RISK", default_value_t = 75)]
+    /// Warn at or above this geocheck reputation risk. proxycheck.io scores a
+    /// plain datacentre address 33 and adds to that when it detects a VPN, so
+    /// 60 is above what a healthy exit node scores and below the next step up.
+    #[arg(long, env = "REMNAWAVE_REPUTATION_WARN_RISK", default_value_t = 60)]
     pub reputation_warn_risk: u32,
     #[arg(long, env = "REMNAWAVE_GEOCHECK_TIMEOUT_SECS", default_value_t = 90)]
     pub geocheck_timeout_secs: u64,

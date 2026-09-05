@@ -305,8 +305,17 @@ fn reputation_detail(rep: &Value, risk: Option<f64>) -> String {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+    // The VPN service proxycheck.io attributes the address to, when it knows
+    // one. Being on that list is what gets an address refused by the services
+    // that keep such lists, so it belongs in the line even at a low risk.
+    let operator = rep
+        .get("operator")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(|name| format!(", operator: {name}"))
+        .unwrap_or_default();
     format!(
-        "risk {}, flags: {}",
+        "risk {}, flags: {}{operator}",
         risk.map_or_else(|| "?".to_string(), |r| format!("{r:.0}")),
         if flags.is_empty() {
             "none".to_string()
@@ -404,6 +413,25 @@ mod tests {
         GeoChecker {
             reputation_warn_risk: 75,
         }
+    }
+
+    /// proxycheck.io attributes some addresses to a named VPN service. The
+    /// risk stays at the datacentre floor, but being on that list is why a
+    /// service refuses the address, so the line says it.
+    #[test]
+    fn a_named_vpn_operator_is_part_of_the_reputation_line() {
+        let outcome = done(reputation_with("operator", json!("Snowd")));
+        let sut = checker();
+
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
+
+        let result = by_aspect(&results, "reputation");
+        assert_eq!(result.severity, Severity::Ok);
+        assert!(
+            result.detail.ends_with("operator: Snowd"),
+            "{}",
+            result.detail
+        );
     }
 
     /// The healthy report with one section swapped, which is how each case
