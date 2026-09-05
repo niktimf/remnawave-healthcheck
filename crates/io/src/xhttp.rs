@@ -7,6 +7,7 @@ use crate::panel::USER_AGENT;
 use remnawave_healthcheck_core::model::{Channel, XhttpFacts};
 use reqwest::Client;
 use reqwest::header::HOST;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -26,8 +27,23 @@ pub async fn probe(channel: &Channel, timeout: Duration) -> XhttpFacts {
         };
     let (plain, slash) = urls(&sni, channel.port, path);
     XhttpFacts {
-        without_slash: status(&client, &plain, &host).await,
-        with_slash: status(&client, &slash, &host).await,
+        without_slash: retrying(|| status(&client, &plain, &host)).await,
+        with_slash: retrying(|| status(&client, &slash, &host)).await,
+    }
+}
+
+/// One second attempt when the first failed to get an answer at all. A CDN
+/// edge throttling a burst — eight requests of one run land on the same one —
+/// times out and answers the retry; a status, by contrast, is deterministic,
+/// and asking again would only repeat it.
+async fn retrying<F, Fut>(attempt: F) -> Result<u16, String>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<u16, String>>,
+{
+    match attempt().await {
+        Ok(status) => Ok(status),
+        Err(_) => attempt().await,
     }
 }
 
@@ -103,6 +119,8 @@ async fn status(client: &Client, url: &str, host: &str) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::future::{Ready, ready};
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -233,6 +251,47 @@ mod tests {
         let result = status(&client, "http://127.0.0.1:9/p", "localhost").await;
 
         assert!(result.is_err(), "{result:?}");
+    }
+
+    /// An attempt that answers `answers` in order, counting the calls made.
+    fn answering<'a>(
+        answers: &'a [Result<u16, String>],
+        calls: &'a Cell<usize>,
+    ) -> impl Fn() -> Ready<Result<u16, String>> + 'a {
+        move || {
+            let made = calls.get();
+            calls.set(made + 1);
+            ready(answers[made.min(answers.len() - 1)].clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_taken_as_it_comes() {
+        let calls = Cell::new(0);
+
+        let result = retrying(answering(&[Ok(404)], &calls)).await;
+
+        assert_eq!((result, calls.get()), (Ok(404), 1));
+    }
+
+    #[tokio::test]
+    async fn a_request_that_got_no_answer_is_made_once_more() {
+        let calls = Cell::new(0);
+        let answers = [Err("timed out".to_string()), Ok(400)];
+
+        let result = retrying(answering(&answers, &calls)).await;
+
+        assert_eq!((result, calls.get()), (Ok(400), 2));
+    }
+
+    #[tokio::test]
+    async fn a_second_failure_is_the_answer() {
+        let calls = Cell::new(0);
+        let answers = [Err("timed out".to_string())];
+
+        let result = retrying(answering(&answers, &calls)).await;
+
+        assert_eq!((result, calls.get()), (Err("timed out".to_string()), 2));
     }
 
     #[tokio::test]
