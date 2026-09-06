@@ -9,11 +9,13 @@ use anyhow::Result;
 use chrono::Utc;
 use remnawave_healthcheck_core::checks::{self, channel::Precheck};
 use remnawave_healthcheck_core::model::{
-    CheckResult, GeoOutcome, ProbeOutcome, Snapshot, SshOutcome, TlsFacts,
-    XhttpFacts,
+    CheckResult, GeoOutcome, ProbeOutcome, Reported, Snapshot, SshOutcome,
+    TlsFacts, XhttpFacts,
 };
 use remnawave_healthcheck_core::report::{self, Outcome, Report};
-use remnawave_healthcheck_io::{PanelClient, SshRunner, probe, tls, xhttp};
+use remnawave_healthcheck_io::{
+    PanelClient, SshRunner, probe, tls, upstream, xhttp,
+};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -54,12 +56,13 @@ pub async fn run(config: Config) -> Result<Outcome> {
     );
     let now = Utc::now();
 
-    let (geo, ssh, tls, xhttp, probes) = tokio::join!(
+    let (geo, ssh, tls, xhttp, probes, upstream) = tokio::join!(
         geocheck_all(&panel, &snapshot, &config),
         ssh_all(&snapshot, &config),
         tls_all(&snapshot, &config),
         xhttp_all(&snapshot, &config),
         probe_all(&snapshot, &config),
+        upstream_release(&config),
     );
     let collected = Collected {
         geo,
@@ -67,6 +70,7 @@ pub async fn run(config: Config) -> Result<Outcome> {
         tls,
         xhttp,
         probes,
+        upstream,
     };
     let results = config.judge.verdicts(&snapshot, now, collected);
 
@@ -206,6 +210,28 @@ async fn xhttp_all(
         set.spawn(async move { (idx, xhttp::probe(&channel, timeout).await) });
     }
     collect(set).await
+}
+
+/// The newest stable panel release, from GitHub. The only request that leaves
+/// for anything but the panel and its nodes, so it is skippable and its failure
+/// is a verdict rather than the end of the run.
+async fn upstream_release(config: &Config) -> Reported {
+    if config.no_upstream {
+        return Reported::NotRead;
+    }
+    let reported = upstream::latest_release(
+        upstream::GITHUB_API,
+        upstream::PANEL_REPO,
+        config.github_token.as_deref(),
+        config.panel_timeout,
+    )
+    .await;
+    match &reported {
+        Reported::Known(tag) => info!(latest = %tag, "upstream release"),
+        Reported::Failed(why) => warn!("upstream release: {why}"),
+        Reported::NotRead => {}
+    }
+    reported
 }
 
 async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {

@@ -119,6 +119,14 @@ pub struct Args {
     /// Skip xhttp path probes
     #[arg(long, env = "REMNAWAVE_NO_XHTTP")]
     pub no_xhttp: bool,
+    /// Skip looking up the panel's newest release on GitHub
+    #[arg(long, env = "REMNAWAVE_NO_UPSTREAM")]
+    pub no_upstream: bool,
+    /// Token for the GitHub API: without one the release lookup shares an
+    /// allowance of 60 requests an hour with everything else on the runner's
+    /// address. Every Actions run already has `GITHUB_TOKEN`.
+    #[arg(long, env = "GITHUB_TOKEN", hide_env_values = true)]
+    pub github_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +158,8 @@ pub struct Config {
     pub no_channels: bool,
     pub no_geocheck: bool,
     pub no_xhttp: bool,
+    pub no_upstream: bool,
+    pub github_token: Option<String>,
     pub run_url: Option<String>,
 }
 
@@ -234,6 +244,8 @@ impl Config {
             no_channels: args.no_channels,
             no_geocheck: args.no_geocheck,
             no_xhttp: args.no_xhttp,
+            no_upstream: args.no_upstream,
+            github_token: non_empty(args.github_token),
             run_url: github_run_url(|k| std::env::var(k).ok()),
         })
     }

@@ -5,8 +5,8 @@
 use anyhow::{Context, Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{
-    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Served, Snapshot,
-    Unserved, UnservedHost,
+    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Reported, Served,
+    Snapshot, Unserved, UnservedHost,
 };
 use remnawave_healthcheck_core::topology;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -256,11 +256,21 @@ impl PanelClient {
             .response)
     }
 
-    /// Everything one run needs, in five requests.
+    /// Everything one run needs, in six requests.
     pub async fn snapshot(&self, user_id: u64) -> Result<Snapshot> {
         let user: UserDto = self
             .get_json(&format!("/api/users/{user_id}"), Auth::Token)
             .await?;
+        // The panel's own version is one line of the report and no reason to
+        // abandon the run: a token without the `metadata` scope answers 403,
+        // and that is a verdict of its own rather than a dead run.
+        let panel_version = match self
+            .get_json::<SystemMetadataDto>("/api/system/metadata", Auth::Token)
+            .await
+        {
+            Ok(meta) => Reported::Known(meta.version),
+            Err(e) => Reported::Failed(format!("{e:#}")),
+        };
         let nodes: Vec<NodeDto> =
             self.get_json("/api/nodes", Auth::Token).await?;
         let profiles: ProfilesDto =
@@ -285,6 +295,7 @@ impl PanelClient {
         let mut snapshot = build_snapshot(
             &self.endpoint(),
             &user,
+            panel_version,
             nodes,
             profiles.config_profiles,
             raw,
@@ -400,6 +411,13 @@ struct ProfileDto {
     name: String,
     #[serde(default)]
     config: Value,
+}
+
+/// `/api/system/metadata`: the panel's version, build and commit. Only the
+/// version is read.
+#[derive(Debug, Deserialize)]
+struct SystemMetadataDto {
+    version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -699,6 +717,7 @@ fn endpoint_of(url: &str) -> Option<Endpoint> {
 fn build_snapshot(
     panel: &Endpoint,
     user: &UserDto,
+    panel_version: Reported,
     nodes: Vec<NodeDto>,
     profiles: Vec<ProfileDto>,
     raw: RawDto,
@@ -765,6 +784,7 @@ fn build_snapshot(
     }
     let sub = endpoint_of(&user.subscription_url).filter(|e| e != panel);
     Snapshot {
+        panel_version,
         unserved,
         nodes: nodes.into_iter().map(Node::from).collect(),
         profiles: profiles
@@ -858,6 +878,14 @@ mod tests {
         Mock::given(method("GET")).and(path("/api/users/42")).and(header("authorization", "Bearer tok"))
             .respond_with(envelope(&json!({"id": 42, "shortUuid": "abc123", "subscriptionUrl": "https://sub.example.com/abc123"})))
             .mount(server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/system/metadata"))
+            .respond_with(envelope(&json!({
+                "version": "3.3.2",
+                "build": {"time": "2026-08-20T00:00:00Z", "number": "1"}
+            })))
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/api/nodes"))
             .respond_with(envelope(&json!([node_fixture()])))
@@ -1032,6 +1060,43 @@ mod tests {
         let snapshot = sut.snapshot(42).await.unwrap();
 
         assert_eq!(snapshot.channels[0].sni, None);
+    }
+
+    #[tokio::test]
+    async fn the_panel_reports_its_own_version() {
+        let server = MockServer::start().await;
+        mount_all(&server, rendered_fixture()).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert_eq!(
+            snapshot.panel_version,
+            Reported::Known("3.3.2".to_string())
+        );
+    }
+
+    /// The `metadata` scope may be missing from the token. One line of the
+    /// report is then unknown; the other hundred are not.
+    #[tokio::test]
+    async fn a_refused_metadata_request_does_not_end_the_run() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/system/metadata"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        mount_all(&server, rendered_fixture()).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert!(
+            matches!(&snapshot.panel_version, Reported::Failed(why) if why.contains("403")),
+            "{:?}",
+            snapshot.panel_version
+        );
+        assert!(!snapshot.nodes.is_empty(), "the rest of the run stands");
     }
 
     /// The run asks for disabled hosts on purpose: an inbound whose only host

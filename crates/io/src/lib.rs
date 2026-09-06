@@ -6,6 +6,7 @@ pub mod panel;
 pub mod probe;
 pub mod ssh;
 pub mod tls;
+pub mod upstream;
 pub mod xhttp;
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use super::commas;
 use crate::model::{
-    CheckResult, Node, PanelState, Severity, Snapshot, Unserved, node_check,
+    CheckResult, Node, PanelState, Reported, Severity, Snapshot, Unserved,
+    node_check,
 };
 use crate::topology::Resolver;
 use std::collections::{BTreeMap, BTreeSet};
@@ -150,6 +151,91 @@ impl<'a> Coverage<'a> {
         .filter(|(_, remarks)| !remarks.is_empty())
         .map(|(what, remarks)| format!("{what}: {remarks}"))
         .collect()
+    }
+}
+
+/// The panel's own version against the newest stable release upstream.
+///
+/// A major version behind fails: the upgrade is no longer a routine one and the
+/// API this tool reads may have moved. A minor behind warns. A patch behind is
+/// named and nothing more — patches land within days of each other, and a
+/// verdict that is yellow most of the time is one nobody reads.
+pub fn version(ours: &Reported, upstream: &Reported) -> CheckResult {
+    const NAME: &str = "panel version";
+    let ours = match ours {
+        Reported::Known(v) => v,
+        Reported::NotRead => {
+            return CheckResult::warn(NAME, "the panel reported no version");
+        }
+        Reported::Failed(why) => {
+            return CheckResult::warn(
+                NAME,
+                format!("the panel's version could not be read: {why}"),
+            );
+        }
+    };
+    let latest = match upstream {
+        Reported::Known(v) => v,
+        Reported::NotRead => {
+            return CheckResult::ok(
+                NAME,
+                format!("{ours}; the latest release was not looked up"),
+            );
+        }
+        Reported::Failed(why) => {
+            return CheckResult::warn(
+                NAME,
+                format!("{ours}; the latest release could not be read: {why}"),
+            );
+        }
+    };
+    compared(NAME, ours, latest)
+}
+
+/// Both versions in hand. A suffix (`3.3.2-fork.1`) is part of the name shown
+/// and no part of the comparison: a fork is judged by the release it is built
+/// on.
+fn compared(name: &str, ours: &str, latest: &str) -> CheckResult {
+    let (Some(mine), Some(theirs)) = (triple(ours), triple(latest)) else {
+        return CheckResult::warn(
+            name,
+            format!("running {ours}, latest release {latest}: not comparable"),
+        );
+    };
+    if mine >= theirs {
+        let how = if mine == theirs {
+            "the latest release"
+        } else {
+            "newer than the latest release"
+        };
+        return CheckResult::ok(
+            name,
+            format!("running {ours}, {how} {latest}"),
+        );
+    }
+    let behind = format!("running {ours}, latest release {latest}");
+    if mine.0 < theirs.0 {
+        CheckResult::fail(name, format!("{behind}: a major version behind"))
+    } else if mine.1 < theirs.1 {
+        CheckResult::warn(name, format!("{behind}: a minor version behind"))
+    } else {
+        CheckResult::ok(name, behind)
+    }
+}
+
+/// `major.minor.patch`, ignoring anything a fork or a pre-release appends.
+fn triple(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()
+        .unwrap_or_default();
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) => {
+            Some((major, minor, patch))
+        }
+        _ => None,
     }
 }
 
@@ -632,6 +718,89 @@ mod tests {
             "{}",
             results[0].detail
         );
+    }
+
+    fn known(v: &str) -> Reported {
+        Reported::Known(v.to_string())
+    }
+
+    #[rstest]
+    #[case::same("3.4.3", "3.4.3", Severity::Ok, "the latest release")]
+    #[case::patch_behind(
+        "3.4.1",
+        "3.4.3",
+        Severity::Ok,
+        "running 3.4.1, latest release 3.4.3"
+    )]
+    #[case::minor_behind(
+        "3.3.2",
+        "3.4.3",
+        Severity::Warn,
+        "a minor version behind"
+    )]
+    #[case::major_behind(
+        "3.3.2",
+        "4.0.0",
+        Severity::Fail,
+        "a major version behind"
+    )]
+    #[case::ahead(
+        "3.5.0",
+        "3.4.3",
+        Severity::Ok,
+        "newer than the latest release"
+    )]
+    // A fork carries its own suffix; it is judged by the release it is built on.
+    #[case::fork("3.4.3-fork.1", "3.4.3", Severity::Ok, "running 3.4.3-fork.1")]
+    #[case::tagged("v3.4.3", "3.4.3", Severity::Ok, "the latest release")]
+    #[case::unparseable("nightly", "3.4.3", Severity::Warn, "not comparable")]
+    fn version_table(
+        #[case] ours: &str,
+        #[case] latest: &str,
+        #[case] expected: Severity,
+        #[case] mentions: &str,
+    ) {
+        let result = version(&known(ours), &known(latest));
+
+        assert_eq!(result.name, "panel version");
+        assert_eq!(result.severity, expected, "{}", result.detail);
+        assert!(result.detail.contains(mentions), "{}", result.detail);
+    }
+
+    /// The upstream release is read over the network, and a network that did
+    /// not answer is not a panel that is out of date.
+    #[test]
+    fn an_unreadable_upstream_release_warns_and_still_names_our_version() {
+        let result = version(
+            &known("3.3.2"),
+            &Reported::Failed("403 rate limit exceeded".into()),
+        );
+
+        assert_eq!(result.severity, Severity::Warn);
+        assert!(
+            result.detail.contains("3.3.2")
+                && result.detail.contains("rate limit"),
+            "{}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn a_lookup_that_was_switched_off_is_not_a_complaint() {
+        let result = version(&known("3.3.2"), &Reported::NotRead);
+
+        assert_eq!(result.severity, Severity::Ok);
+        assert!(result.detail.contains("not looked up"), "{}", result.detail);
+    }
+
+    /// The token may lack the `metadata` scope. That is worth a line, not a
+    /// silent green.
+    #[test]
+    fn a_panel_that_did_not_report_its_version_warns() {
+        let result = version(&Reported::Failed("403".into()), &known("3.4.3"));
+
+        assert_eq!(result.severity, Severity::Warn);
+        assert!(result.detail.contains("403"), "{}", result.detail);
     }
 
     /// The switch an administrator threw, as opposed to an inbound no host

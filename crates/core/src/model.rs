@@ -284,6 +284,18 @@ impl Channel {
     }
 }
 
+/// A version string, or the reason it is not in hand. The three states are
+/// different answers and the report tells them apart: a version that was never
+/// asked for is not one that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Reported {
+    /// Not asked for — the family was switched off.
+    #[default]
+    NotRead,
+    Known(String),
+    Failed(String),
+}
+
 /// A host the panel knows and does not serve here. It is not a channel —
 /// there is no config to probe — but an inbound it belongs to is not an
 /// unmonitored one either, and saying which of the two it is needs the name.
@@ -320,6 +332,8 @@ pub struct Snapshot {
     pub nodes: Vec<Node>,
     pub profiles: HashMap<String, Profile>,
     pub channels: Vec<Channel>,
+    /// The panel's own version, as `/api/system/metadata` reports it.
+    pub panel_version: Reported,
     /// Hosts the panel serves to nobody here, and why.
     pub unserved: Vec<UnservedHost>,
     /// What the rendered subscription served, duplicates included, so the

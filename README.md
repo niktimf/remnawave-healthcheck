@@ -25,6 +25,11 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 
 ## What it checks
 
+- **From the panel API and GitHub** — the panel's own version against the newest stable release of
+  [remnawave/panel](https://github.com/remnawave/panel): a major version behind fails, a minor warns,
+  a patch is named and nothing more. This is the only request that leaves for anything but the panel
+  and its nodes; a GitHub that rate-limits or does not answer is a version that could not be read,
+  never a panel declared out of date. `--no-upstream` skips it.
 - **From the panel API** — node status with the panel's own reason, users online, config age
   (`xrayUptime`), host load and memory, Xray and remnanode version drift across nodes, subscription
   coverage (the rendered subscription serves exactly the channels the panel resolved), and inbounds serving
@@ -56,7 +61,10 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 ## What it needs
 
 - An API token (not an admin login JWT) with the `nodes`, `config-profiles`, `by-id`, `raw`, `geocheck`
-  and `geocheck-result` scopes.
+  and `geocheck-result` scopes, plus `metadata` for the version check — without it that one check warns
+  and the rest of the run is unaffected.
+- Optionally `GITHUB_TOKEN` for the release lookup: unauthenticated GitHub allows 60 requests an hour
+  per address, and a hosted runner shares its address. Every Actions run already has the token.
 - A monitoring user whose subscription includes every squad you want checked. If the panel limits devices
   per user, register one device for it (`POST /api/hwid/devices {hwid, userId}`) and pass its id as
   `REMNAWAVE_HWID`; otherwise the subscription answers with a placeholder and the tool says so.

@@ -4,12 +4,14 @@
 use chrono::{DateTime, Utc};
 use remnawave_healthcheck_core::checks::channel::{self, Liveness};
 use remnawave_healthcheck_core::checks::geo::GeoChecker;
-use remnawave_healthcheck_core::checks::panel::PanelChecker;
+use remnawave_healthcheck_core::checks::panel::{
+    self as panel_checks, PanelChecker,
+};
 use remnawave_healthcheck_core::checks::ssh::{self, SshChecker};
 use remnawave_healthcheck_core::checks::tls;
 use remnawave_healthcheck_core::model::{
-    CheckResult, GeoOutcome, ProbeOutcome, Snapshot, SshOutcome, TlsFacts,
-    XhttpFacts,
+    CheckResult, GeoOutcome, ProbeOutcome, Reported, Snapshot, SshOutcome,
+    TlsFacts, XhttpFacts,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -21,6 +23,8 @@ pub struct Collected {
     pub tls: Vec<(String, TlsFacts)>,
     pub xhttp: Vec<(usize, XhttpFacts)>,
     pub probes: ProbeStage,
+    /// The newest stable panel release upstream, when it was looked up.
+    pub upstream: Reported,
 }
 
 /// Why a family produced nothing is worth a line in the report, so the stages
@@ -85,6 +89,8 @@ impl Judge {
     ) -> Vec<CheckResult> {
         let egress = egress_by_node(snapshot, &c.geo);
         let mut results = self.panel.all(snapshot);
+        results
+            .push(panel_checks::version(&snapshot.panel_version, &c.upstream));
         results.extend(ssh_setup(&c.ssh));
         results.extend(self.per_node(snapshot, now, &c));
         results.extend(c.tls.iter().map(|(host, facts)| {
@@ -278,6 +284,7 @@ mod tests {
                 },
             )],
             probes: probed("192.0.2.20"),
+            upstream: Reported::NotRead,
         };
         let sut = judge();
 
@@ -320,6 +327,7 @@ mod tests {
             tls: vec![],
             xhttp: vec![],
             probes: ProbeStage::SetupFailed("obtaining xray: boom".into()),
+            upstream: Reported::NotRead,
         };
         let sut = judge();
 
@@ -354,6 +362,7 @@ mod tests {
             tls: vec![],
             xhttp: vec![],
             probes: ProbeStage::Skipped,
+            upstream: Reported::NotRead,
         };
         let sut = judge();
 
@@ -362,6 +371,33 @@ mod tests {
         let setup = by_name(&results, "ssh setup");
         assert_eq!(setup.severity, Severity::Fail);
         assert!(setup.detail.contains("permission denied"), "{}", setup.detail);
+    }
+
+    /// The version line is one of the run's verdicts, not a log note: a panel
+    /// a major version behind fails the run.
+    #[test]
+    fn the_panel_version_is_judged_against_the_newest_release() {
+        let s = snapshot();
+        let collected = Collected {
+            geo: HashMap::new(),
+            ssh: SshStage::Skipped,
+            tls: vec![],
+            xhttp: vec![],
+            probes: ProbeStage::Skipped,
+            upstream: Reported::Known("3.4.3".into()),
+        };
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        let version = by_name(&results, "panel version");
+        assert_eq!(version.severity, Severity::Warn, "{}", version.detail);
+        assert!(
+            version.detail.contains("3.3.2")
+                && version.detail.contains("3.4.3"),
+            "{}",
+            version.detail
+        );
     }
 
     /// The auto-select entry: no tunnel of its own, one verdict about the
@@ -383,6 +419,7 @@ mod tests {
             tls: vec![],
             xhttp: vec![],
             probes: probed("192.0.2.20"),
+            upstream: Reported::NotRead,
         };
         let sut = judge();
 
@@ -417,6 +454,7 @@ mod tests {
             tls: vec![],
             xhttp: vec![],
             probes: probed("192.0.2.20"),
+            upstream: Reported::NotRead,
         };
         let sut = judge();
 
