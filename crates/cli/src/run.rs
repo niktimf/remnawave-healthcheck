@@ -532,7 +532,7 @@ mod tests {
         )
         .await;
 
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<(String, ExitServices)>::new());
     }
 
     #[tokio::test]
@@ -542,6 +542,6 @@ mod tests {
 
         let facts = xhttp_all(&s, &config()).await;
 
-        assert!(facts.is_empty());
+        assert_eq!(facts, Vec::<(usize, XhttpFacts)>::new());
     }
 }

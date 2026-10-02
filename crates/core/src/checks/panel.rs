@@ -910,7 +910,7 @@ mod tests {
 
         let results = monitoring_coverage(&snapshot);
 
-        assert!(results.is_empty());
+        assert_eq!(results, Vec::<CheckResult>::new());
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
 
         let results = sut.host(&nodes);
 
-        assert!(results.is_empty());
+        assert_eq!(results, Vec::<CheckResult>::new());
     }
 
     #[test]

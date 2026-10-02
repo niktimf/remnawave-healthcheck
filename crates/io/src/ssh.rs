@@ -371,7 +371,7 @@ mod tests {
         let outcome = sut.gather("127.0.0.1", None).await;
 
         match outcome {
-            SshOutcome::Unreachable(reason) => assert!(!reason.is_empty()),
+            SshOutcome::Unreachable(reason) => assert_ne!(reason, ""),
             SshOutcome::Reached(_) => {
                 panic!("a host with no sshd is unreachable")
             }

@@ -1240,7 +1240,7 @@ mod tests {
 
         let channels = parse_rendered(&body).unwrap();
 
-        assert!(channels.is_empty());
+        assert_eq!(channels, Vec::<RenderedConfig>::new());
     }
 
     #[test]
