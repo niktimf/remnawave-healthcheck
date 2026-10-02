@@ -5,3 +5,6 @@
 cognitive-complexity-threshold = 15
 excessive-nesting-threshold = 4
 too-many-lines-threshold = 100
+# Product names spelled the way their owners spell them. `..` keeps clippy's
+# own default list.
+doc-valid-idents = ["YouTube", "NotebookLM", "ChatGPT", "OpenAI", ".."]

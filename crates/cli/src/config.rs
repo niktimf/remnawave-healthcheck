@@ -106,6 +106,9 @@ pub struct Args {
     pub xray_cache: PathBuf,
     #[arg(long, env = "REMNAWAVE_PANEL_TIMEOUT_SECS", default_value_t = 30)]
     pub panel_timeout_secs: u64,
+    /// Per request to an AI service or YouTube, asked through a tunnel
+    #[arg(long, env = "REMNAWAVE_SERVICE_TIMEOUT_SECS", default_value_t = 15)]
+    pub service_timeout_secs: u64,
 
     /// Skip node-side checks over SSH
     #[arg(long, env = "REMNAWAVE_NO_SSH")]
@@ -119,6 +122,9 @@ pub struct Args {
     /// Skip xhttp path probes
     #[arg(long, env = "REMNAWAVE_NO_XHTTP")]
     pub no_xhttp: bool,
+    /// Skip asking AI services and YouTube Premium through a tunnel per exit
+    #[arg(long, env = "REMNAWAVE_NO_SERVICES")]
+    pub no_services: bool,
     /// Skip looking up the panel's newest release on GitHub
     #[arg(long, env = "REMNAWAVE_NO_UPSTREAM")]
     pub no_upstream: bool,
@@ -153,11 +159,13 @@ pub struct Config {
     pub geocheck_timeout: Duration,
     pub tls_timeout: Duration,
     pub xhttp_timeout: Duration,
+    pub service_timeout: Duration,
     pub judge: Judge,
     pub no_ssh: bool,
     pub no_channels: bool,
     pub no_geocheck: bool,
     pub no_xhttp: bool,
+    pub no_services: bool,
     pub no_upstream: bool,
     pub github_token: Option<String>,
     pub run_url: Option<String>,
@@ -224,6 +232,7 @@ impl Config {
             geocheck_timeout: Duration::from_secs(args.geocheck_timeout_secs),
             tls_timeout: Duration::from_secs(10),
             xhttp_timeout: Duration::from_secs(6),
+            service_timeout: Duration::from_secs(args.service_timeout_secs),
             judge: Judge {
                 panel: PanelChecker {
                     config_warn_days: args.config_warn_days,
@@ -244,6 +253,7 @@ impl Config {
             no_channels: args.no_channels,
             no_geocheck: args.no_geocheck,
             no_xhttp: args.no_xhttp,
+            no_services: args.no_services,
             no_upstream: args.no_upstream,
             github_token: non_empty(args.github_token),
             run_url: github_run_url(|k| std::env::var(k).ok()),

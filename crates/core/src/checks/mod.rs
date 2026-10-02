@@ -50,5 +50,6 @@ impl Verdict {
 pub mod channel;
 pub mod geo;
 pub mod panel;
+pub mod services;
 pub mod ssh;
 pub mod tls;

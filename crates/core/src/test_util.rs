@@ -59,8 +59,9 @@ pub(crate) fn geocheck_report() -> Value {
         "findings": [],
         "reputation": geocheck_reputation(),
         "consensus": {"ipv4": geocheck_consensus()},
-        "geo": {"services": [], "geoip": [], "cdn": []},
+        "geo": {"services": geocheck_services(), "geoip": [], "cdn": []},
         "connectivity_checks": geocheck_portal(),
+        "stash_checks": geocheck_access(),
         "connectivity": geocheck_routing(),
     })
 }
@@ -96,6 +97,32 @@ fn geocheck_consensus() -> Value {
         {"code": "DE", "country": "Germany", "count": 11, "total": 18, "percent": 61.11},
         {"code": "US", "country": "United States", "count": 6, "total": 18, "percent": 33.33},
         {"code": "RU", "country": "Russia", "count": 1, "total": 18, "percent": 5.56}
+    ])
+}
+
+/// `geo.services`: what each service thinks of the address. A `country`
+/// entry carries the ISO code in `value` and the full name in `country`.
+fn geocheck_services() -> Value {
+    json!([
+        {"id": "google", "name": "Google", "kind": "country",
+         "ipv4": {"value": "DE", "country": "Germany"}},
+        {"id": "youtube", "name": "YouTube", "kind": "country",
+         "ipv4": {"value": "DE", "country": "Germany"}},
+        {"id": "google_captcha", "name": "Google Search captcha",
+         "kind": "blocked", "ipv4": {"value": "no"}}
+    ])
+}
+
+/// `stash_checks`: whether a service serves the address, one of
+/// `available`, `restricted`, `blocked` or `error` in `state`.
+fn geocheck_access() -> Value {
+    json!([
+        {"id": "gemini_access", "name": "Gemini", "state": "available",
+         "region": "DEU", "rtt_ms": 210.5},
+        {"id": "youtube_premium_access", "name": "YouTube Premium",
+         "state": "available", "rtt_ms": 180.1},
+        {"id": "chatgpt_web", "name": "ChatGPT (web)", "state": "available",
+         "rtt_ms": 95.3}
     ])
 }
 

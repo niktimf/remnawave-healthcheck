@@ -128,32 +128,9 @@ async fn attempt(
     timeout: Duration,
     echo_url: &str,
 ) -> Result<ProbeOutcome, String> {
-    // 0700 dir, 0600 file: the config carries the subscription's live credentials.
-    let mut builder = tempfile::Builder::new();
-    builder
-        .prefix("rwhc-")
-        .permissions(std::fs::Permissions::from_mode(0o700));
-    let dir = match scratch_base {
-        Some(base) => builder.tempdir_in(base),
-        None => builder.tempdir(),
-    }
-    .map_err(|e| format!("scratch dir: {e}"))?;
-    let port = free_port().map_err(|e| format!("free port: {e}"))?;
-    let cfg_path = dir.path().join("config.json");
-    write_private(&cfg_path, &build_config(outbound, port).to_string())
-        .map_err(|e| format!("writing config: {e}"))?;
-
-    let client =
-        socks_client(port).map_err(|e| format!("socks client: {e}"))?;
-    let mut child = tokio::process::Command::new(xray_bin)
-        .arg("run")
-        .arg("-c")
-        .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawning xray: {e}"))?;
+    let xray = Xray::start_in(scratch_base, xray_bin, outbound)?;
+    let client = socks_client(xray.port(), Duration::from_secs(8))
+        .map_err(|e| format!("socks client: {e}"))?;
 
     let deadline = Instant::now() + timeout;
     let mut exit_ip = None;
@@ -164,20 +141,99 @@ async fn attempt(
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    let _ = child.kill().await;
+    let stderr = xray.stop().await;
     let mut stderr_tail = String::new();
     if exit_ip.is_none() {
-        if let Some(mut err) = child.stderr.take() {
-            let mut buf = String::new();
-            let _ = err.read_to_string(&mut buf).await;
-            stderr_tail = tail(&buf, 3, 200);
-            tracing::debug!(stderr = %buf, "xray stderr");
-        }
+        stderr_tail = tail(&stderr, 3, 200);
+        tracing::debug!(%stderr, "xray stderr");
     }
     Ok(ProbeOutcome {
         exit_ip,
         stderr_tail,
     })
+}
+
+/// A running Xray with one subscription outbound behind a local SOCKS port.
+/// Killed when dropped, and its scratch directory, which holds the config
+/// with the subscription's live credentials, is removed with it.
+pub struct Xray {
+    child: tokio::process::Child,
+    port: u16,
+    _scratch: tempfile::TempDir,
+}
+
+impl Xray {
+    pub fn start(xray_bin: &Path, outbound: &Value) -> Result<Self, String> {
+        Self::start_in(None, xray_bin, outbound)
+    }
+
+    fn start_in(
+        scratch_base: Option<&Path>,
+        xray_bin: &Path,
+        outbound: &Value,
+    ) -> Result<Self, String> {
+        // 0700 dir, 0600 file: the config carries the subscription's live
+        // credentials.
+        let mut builder = tempfile::Builder::new();
+        builder
+            .prefix("rwhc-")
+            .permissions(std::fs::Permissions::from_mode(0o700));
+        let scratch = match scratch_base {
+            Some(base) => builder.tempdir_in(base),
+            None => builder.tempdir(),
+        }
+        .map_err(|e| format!("scratch dir: {e}"))?;
+        let port = free_port().map_err(|e| format!("free port: {e}"))?;
+        let cfg_path = scratch.path().join("config.json");
+        write_private(&cfg_path, &build_config(outbound, port).to_string())
+            .map_err(|e| format!("writing config: {e}"))?;
+        let child = tokio::process::Command::new(xray_bin)
+            .arg("run")
+            .arg("-c")
+            .arg(&cfg_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("spawning xray: {e}"))?;
+        Ok(Self {
+            child,
+            port,
+            _scratch: scratch,
+        })
+    }
+
+    /// The local SOCKS port the outbound is reachable through.
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Wait until Xray accepts connections on its SOCKS port. A request sent
+    /// before that fails at the local hop and would be blamed on the far
+    /// end.
+    pub async fn listening(&self, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+                .await
+                .is_ok()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// Kill Xray and return what it wrote to stderr.
+    pub async fn stop(mut self) -> String {
+        let _ = self.child.kill().await;
+        let mut buf = String::new();
+        if let Some(mut err) = self.child.stderr.take() {
+            let _ = err.read_to_string(&mut buf).await;
+        }
+        buf
+    }
 }
 
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
@@ -190,12 +246,20 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     f.write_all(text.as_bytes())
 }
 
-/// `socks5h`: names are resolved at the far end, never locally.
-fn socks_client(port: u16) -> reqwest::Result<reqwest::Client> {
+fn socks_client(
+    port: u16,
+    timeout: Duration,
+) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
-        .timeout(Duration::from_secs(8))
+        .proxy(socks_proxy(port)?)
+        .timeout(timeout)
         .build()
+}
+
+/// The proxy for an Xray's local SOCKS port. `socks5h`: names are resolved
+/// at the far end, never locally, so DNS answers come from the exit too.
+pub(crate) fn socks_proxy(port: u16) -> reqwest::Result<reqwest::Proxy> {
+    reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))
 }
 
 /// One question to the echo endpoint. `None` for every way of not getting a
@@ -210,7 +274,7 @@ async fn ask_echo(client: &reqwest::Client, echo_url: &str) -> Option<IpAddr> {
 
 /// Last non-empty lines of xray's stderr: where the real reason for a dead
 /// tunnel is, short enough that one channel cannot fill an alert.
-fn tail(text: &str, lines: usize, chars: usize) -> String {
+pub(crate) fn tail(text: &str, lines: usize, chars: usize) -> String {
     let kept: Vec<&str> = text
         .lines()
         .map(str::trim)

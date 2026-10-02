@@ -59,6 +59,7 @@ impl GeoChecker {
                 ("connectivity", geo.connectivity()),
                 ("geocheck findings", geo.findings()),
                 ("routing", geo.routing()),
+                ("services direct", geo.services_direct()),
             ])
             .map(named)
             .collect()
@@ -209,6 +210,80 @@ impl Geo<'_> {
         let floor = path["latency_floor_ms"].as_f64().unwrap_or_default();
         Verdict::ok(format!("score {score}/100, floor {floor:.1} ms"))
     }
+    /// Which country Google and YouTube place the node's own address in, and
+    /// which services refuse it (`geo.services` and `stash_checks`). Always
+    /// OK: clients may reach a service by another route than the direct
+    /// address, and the `services` row, asked through a tunnel, is the one
+    /// that judges that. This line explains why such a route is needed.
+    fn services_direct(&self) -> Verdict {
+        let seen = commas(
+            [("google", "Google"), ("youtube", "YouTube")]
+                .into_iter()
+                .filter_map(|(id, label)| {
+                    let country = service_country(self.report(), id)?;
+                    Some(format!("{label} sees {country}"))
+                }),
+        );
+        let access = &self.report()["stash_checks"];
+        let parts: Vec<String> = std::iter::once(seen)
+            .chain(
+                [
+                    ("blocked", "blocked"),
+                    ("restricted", "restricted"),
+                    ("error", "unknown"),
+                ]
+                .into_iter()
+                .filter_map(|(state, title)| {
+                    let ids = commas(access_in_state(access, state));
+                    (!ids.is_empty()).then(|| format!("{title}: {ids}"))
+                }),
+            )
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() {
+            Verdict::ok("no service data")
+        } else {
+            Verdict::ok(parts.join("; "))
+        }
+    }
+}
+
+/// The country a `geo.services` entry of the country kind reports for the
+/// node's address, IPv4 first.
+fn service_country(report: &Value, id: &str) -> Option<String> {
+    let entry = report["geo"]["services"]
+        .as_array()?
+        .iter()
+        .find(|e| e.get("id").and_then(Value::as_str) == Some(id))?;
+    ["ipv4", "ipv6"].into_iter().find_map(|family| {
+        entry[family]
+            .get("value")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_uppercase)
+    })
+}
+
+/// `stash_checks` entries in `state`, by id without geocheck's `_access`
+/// suffix, with the region when geocheck read one.
+fn access_in_state(access: &Value, state: &str) -> Vec<String> {
+    let Some(items) = access.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|i| i.get("state").and_then(Value::as_str) == Some(state))
+        .filter_map(|i| {
+            let id = i.get("id").and_then(Value::as_str)?;
+            let id = id.strip_suffix("_access").unwrap_or(id);
+            Some(match i.get("region").and_then(Value::as_str) {
+                Some(region) if !region.is_empty() => {
+                    format!("{id} ({region})")
+                }
+                _ => id.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// `schema` is the one field that can tell these checks they are reading a
@@ -455,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn a_healthy_report_is_six_ok_results_in_order() {
+    fn a_healthy_report_is_seven_ok_results_in_order() {
         let outcome = done(geocheck_report());
         let sut = checker();
 
@@ -471,12 +546,72 @@ mod tests {
                 "node beta / reputation",
                 "node beta / connectivity",
                 "node beta / geocheck findings",
-                "node beta / routing"
+                "node beta / routing",
+                "node beta / services direct"
             ]
         );
         assert!(
             results.iter().all(|r| r.severity == Severity::Ok),
             "{results:?}"
+        );
+    }
+
+    #[test]
+    fn the_direct_address_line_names_the_country_google_sees() {
+        let outcome = done(geocheck_report());
+        let sut = checker();
+
+        let results = sut.check_node(&node("beta", "DE"), &outcome);
+
+        assert_eq!(
+            by_aspect(&results, "services direct").detail,
+            "Google sees DE, YouTube sees DE"
+        );
+    }
+
+    /// An exit whose own address Google places in Russia, while its users
+    /// reach Gemini by another route. The line explains why that route is
+    /// needed and raises nothing.
+    #[test]
+    fn services_refusing_the_direct_address_are_listed_but_not_alarmed() {
+        let mut report = geocheck_report();
+        report["geo"]["services"][0]["ipv4"]["value"] = json!("RU");
+        report["geo"]["services"][1]["ipv4"]["value"] = json!("RU");
+        report["stash_checks"] = json!([
+            {"id": "gemini_access", "name": "Gemini", "state": "blocked"},
+            {"id": "youtube_premium_access", "name": "YouTube Premium",
+             "state": "blocked"},
+            {"id": "claude_access", "name": "Claude", "state": "error",
+             "error": "timeout"},
+            {"id": "chatgpt_web", "name": "ChatGPT (web)",
+             "state": "available"}
+        ]);
+        let sut = checker();
+
+        let results = sut.check_node(&node("beta", "DE"), &done(report));
+
+        let line = by_aspect(&results, "services direct");
+        assert_eq!(line.severity, Severity::Ok);
+        assert_eq!(
+            line.detail,
+            "Google sees RU, YouTube sees RU; blocked: gemini, youtube_premium; unknown: claude"
+        );
+    }
+
+    /// geocheck leaves `stash_checks` out when it ran none: no field is no
+    /// data, not an error.
+    #[test]
+    fn a_report_without_service_sections_says_there_is_no_data() {
+        let mut report = geocheck_report();
+        report.as_object_mut().unwrap().remove("stash_checks");
+        report["geo"]["services"] = json!([]);
+        let sut = checker();
+
+        let results = sut.check_node(&node("beta", "DE"), &done(report));
+
+        assert_eq!(
+            by_aspect(&results, "services direct").detail,
+            "no service data"
         );
     }
 

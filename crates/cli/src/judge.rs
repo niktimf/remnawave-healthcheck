@@ -7,6 +7,7 @@ use remnawave_healthcheck_core::checks::geo::GeoChecker;
 use remnawave_healthcheck_core::checks::panel::{
     self as panel_checks, PanelChecker,
 };
+use remnawave_healthcheck_core::checks::services::{self, ExitServices};
 use remnawave_healthcheck_core::checks::ssh::{self, SshChecker};
 use remnawave_healthcheck_core::checks::tls;
 use remnawave_healthcheck_core::model::{
@@ -25,6 +26,9 @@ pub struct Collected {
     pub probes: ProbeStage,
     /// The newest stable panel release upstream, when it was looked up.
     pub upstream: Reported,
+    /// What the services stage found per exit, by node name. Empty when no
+    /// tunnel ran, since then no exit can be shown reachable.
+    pub services: Vec<(String, ExitServices)>,
 }
 
 /// Why a family produced nothing is worth a line in the report, so the stages
@@ -100,6 +104,11 @@ impl Judge {
             channel::xhttp(&snapshot.channels[*idx], facts, snapshot)
         }));
         results.extend(channels(snapshot, c.probes, &egress));
+        results.extend(
+            c.services
+                .iter()
+                .map(|(exit, outcome)| services::verdict(exit, outcome)),
+        );
         results
     }
 
@@ -160,23 +169,30 @@ fn channels(
     tunnels.into_iter().chain(selectors).collect()
 }
 
-/// The channels whose tunnel came out somewhere. `None` when no tunnel ran at
-/// all: a balancer is then judged by its size alone rather than declared dead.
-fn alive_channels(probes: &ProbeStage) -> Option<HashSet<usize>> {
+/// Where each probed channel's tunnel came out, by channel index. `None` when
+/// no tunnel ran at all.
+pub(crate) fn tunnel_exits(
+    probes: &ProbeStage,
+) -> Option<HashMap<usize, IpAddr>> {
     let ProbeStage::Done(list) = probes else {
         return None;
     };
     Some(
         list.iter()
-            .filter(|(_, result)| match result {
+            .filter_map(|(idx, result)| match result {
                 ProbeResult::Probed { outcome, .. } => {
-                    outcome.exit_ip.is_some()
+                    Some((*idx, outcome.exit_ip?))
                 }
-                ProbeResult::Decided(_) => false,
+                ProbeResult::Decided(_) => None,
             })
-            .map(|(idx, _)| *idx)
             .collect(),
     )
+}
+
+/// The channels whose tunnel came out somewhere. `None` when no tunnel ran at
+/// all: a balancer is then judged by its size alone rather than declared dead.
+fn alive_channels(probes: &ProbeStage) -> Option<HashSet<usize>> {
+    tunnel_exits(probes).map(|exits| exits.into_keys().collect())
 }
 
 /// The exit a tunnel came out of, against the egress its expected node was
@@ -203,7 +219,7 @@ fn channel_verdict(
 
 /// The address each enabled node's completed geocheck saw it leave from. A job
 /// that never completed contributes nothing rather than an absent address.
-fn egress_by_node<'a>(
+pub(crate) fn egress_by_node<'a>(
     snapshot: &'a Snapshot,
     geo: &HashMap<String, GeoOutcome>,
 ) -> HashMap<&'a str, IpAddr> {
@@ -285,6 +301,7 @@ mod tests {
             )],
             probes: probed("192.0.2.20"),
             upstream: Reported::NotRead,
+            services: Vec::new(),
         };
         let sut = judge();
 
@@ -328,6 +345,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::SetupFailed("obtaining xray: boom".into()),
             upstream: Reported::NotRead,
+            services: Vec::new(),
         };
         let sut = judge();
 
@@ -363,6 +381,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::Skipped,
             upstream: Reported::NotRead,
+            services: Vec::new(),
         };
         let sut = judge();
 
@@ -385,6 +404,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::Skipped,
             upstream: Reported::Known("3.4.3".into()),
+            services: Vec::new(),
         };
         let sut = judge();
 
@@ -420,6 +440,7 @@ mod tests {
             xhttp: vec![],
             probes: probed("192.0.2.20"),
             upstream: Reported::NotRead,
+            services: Vec::new(),
         };
         let sut = judge();
 
@@ -443,6 +464,42 @@ mod tests {
         );
     }
 
+    /// The services stage's findings are verdicts like any other: a refusal
+    /// through the exit fails the run.
+    #[test]
+    fn a_service_refused_through_an_exit_fails_the_run() {
+        use remnawave_healthcheck_core::checks::services::{Access, Service};
+        let s = snapshot();
+        let collected = Collected {
+            geo: HashMap::new(),
+            ssh: SshStage::Skipped,
+            tls: vec![],
+            xhttp: vec![],
+            probes: ProbeStage::Skipped,
+            upstream: Reported::NotRead,
+            services: vec![(
+                "beta".to_string(),
+                ExitServices::Checked {
+                    via: "beta direct".into(),
+                    answers: vec![(
+                        Service::Gemini,
+                        Access::Blocked {
+                            region: Some("RUS".into()),
+                        },
+                    )],
+                },
+            )],
+        };
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        let row = by_name(&results, "node beta / services");
+        assert_eq!(row.severity, Severity::Fail);
+        assert_eq!(row.detail, "blocked: gemini (RUS)");
+        assert_eq!(Report::of(&results).outcome(), Outcome::Failed);
+    }
+
     /// Without geocheck there is no address to compare the tunnel's exit
     /// against, and an unverified exit is not a passing one.
     #[test]
@@ -455,6 +512,7 @@ mod tests {
             xhttp: vec![],
             probes: probed("192.0.2.20"),
             upstream: Reported::NotRead,
+            services: Vec::new(),
         };
         let sut = judge();
 

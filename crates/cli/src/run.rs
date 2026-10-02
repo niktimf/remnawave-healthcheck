@@ -1,12 +1,17 @@
 //! One run: panel → panel checks → (geocheck ∥ ssh ∥ tls ∥ xhttp ∥ tunnels)
-//! → classify → report → deliver. Families run concurrently; the tunnels
-//! need geocheck's egress addresses only at classification time.
+//! → services → classify → report → deliver. Families run concurrently; the
+//! tunnels need geocheck's egress addresses only at classification time. The
+//! services stage waits for both: it asks through a tunnel already shown to
+//! come out at its exit's egress address.
 
 use crate::config::Config;
-use crate::judge::{Collected, ProbeResult, ProbeStage, SshStage};
+use crate::judge::{self, Collected, ProbeResult, ProbeStage, SshStage};
 use crate::telegram::Notifier;
 use anyhow::Result;
 use chrono::Utc;
+use remnawave_healthcheck_core::checks::services::{
+    self as service_checks, ExitPlan, ExitServices,
+};
 use remnawave_healthcheck_core::checks::{self, channel::Precheck};
 use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Reported, Snapshot, SshOutcome,
@@ -14,10 +19,11 @@ use remnawave_healthcheck_core::model::{
 };
 use remnawave_healthcheck_core::report::{self, Outcome, Report};
 use remnawave_healthcheck_io::{
-    PanelClient, SshRunner, probe, tls, upstream, xhttp,
+    PanelClient, SshRunner, probe, services, tls, upstream, xhttp,
 };
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -64,6 +70,7 @@ pub async fn run(config: Config) -> Result<Outcome> {
         probe_all(&snapshot, &config),
         upstream_release(&config),
     );
+    let services = services_all(&snapshot, &config, &probes, &geo).await;
     let collected = Collected {
         geo,
         ssh,
@@ -71,6 +78,7 @@ pub async fn run(config: Config) -> Result<Outcome> {
         xhttp,
         probes,
         upstream,
+        services,
     };
     let results = config.judge.verdicts(&snapshot, now, collected);
 
@@ -241,21 +249,10 @@ async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
     if snapshot.hwid_stub {
         return ProbeStage::SetupFailed(checks::HWID_STUB_DETAIL.to_string());
     }
-    let Some(version) = checks::channel::required_xray_version(snapshot) else {
-        return ProbeStage::SetupFailed(
-            "no node reported an Xray version, so no binary can be chosen"
-                .to_string(),
-        );
-    };
-    let binary = match probe::ensure_xray(&version, &config.xray_cache).await {
+    let binary = match xray_binary(snapshot, config).await {
         Ok(b) => b,
-        Err(e) => {
-            return ProbeStage::SetupFailed(format!(
-                "obtaining xray {version}: {e:#}"
-            ));
-        }
+        Err(why) => return ProbeStage::SetupFailed(why),
     };
-    info!(%version, "xray ready");
     let limit = Arc::new(Semaphore::new(config.concurrency));
     let mut list = Vec::new();
     let mut set = JoinSet::new();
@@ -292,6 +289,105 @@ async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
     list.extend(collect(set).await);
     info!(channels = list.len(), "probe: done");
     ProbeStage::Done(list)
+}
+
+/// The Xray the nodes run, downloaded on first use. The services stage asks
+/// again after the tunnels, and is answered from the cache.
+async fn xray_binary(
+    snapshot: &Snapshot,
+    config: &Config,
+) -> Result<PathBuf, String> {
+    let Some(version) = checks::channel::required_xray_version(snapshot) else {
+        return Err(
+            "no node reported an Xray version, so no binary can be chosen"
+                .to_string(),
+        );
+    };
+    let binary = probe::ensure_xray(&version, &config.xray_cache)
+        .await
+        .map_err(|e| format!("obtaining xray {version}: {e:#}"))?;
+    info!(%version, "xray ready");
+    Ok(binary)
+}
+
+/// Every exit asked about the services, each through its own Xray, the exits
+/// in parallel. Runs only once the tunnels are in: which tunnel an exit is
+/// asked through depends on where they came out. Nothing when no tunnel ran.
+async fn services_all(
+    snapshot: &Snapshot,
+    config: &Config,
+    probes: &ProbeStage,
+    geo: &HashMap<String, GeoOutcome>,
+) -> Vec<(String, ExitServices)> {
+    let Some(tunnels) = judge::tunnel_exits(probes) else {
+        return Vec::new();
+    };
+    let egress = judge::egress_by_node(snapshot, geo);
+    let plans = service_checks::plan(snapshot, &tunnels, &egress);
+    if config.no_services {
+        return plans
+            .iter()
+            .map(|p| (p.exit().name.clone(), ExitServices::Disabled))
+            .collect();
+    }
+    let mut out = Vec::new();
+    let mut asked = Vec::new();
+    for plan in plans {
+        match plan {
+            ExitPlan::Skip { exit, why } => {
+                out.push((exit.name.clone(), ExitServices::Skipped(why)));
+            }
+            ExitPlan::Probe { exit, channel } => asked.push((exit, channel)),
+        }
+    }
+    if asked.is_empty() {
+        return out;
+    }
+    let binary = match xray_binary(snapshot, config).await {
+        Ok(b) => b,
+        Err(reason) => {
+            out.extend(asked.into_iter().map(|(exit, channel)| {
+                let via = channel.remark.clone();
+                let failed = ExitServices::TunnelFailed {
+                    via,
+                    reason: reason.clone(),
+                };
+                (exit.name.clone(), failed)
+            }));
+            return out;
+        }
+    };
+    let limit = Arc::new(Semaphore::new(config.concurrency));
+    let mut set = JoinSet::new();
+    for (exit, channel) in asked {
+        let outbound = channel
+            .served
+            .outbound()
+            .cloned()
+            .expect("a channel whose tunnel came out carries an outbound");
+        let (limit, binary, timeout) =
+            (Arc::clone(&limit), binary.clone(), config.service_timeout);
+        let (exit, via) = (exit.name.clone(), channel.remark.clone());
+        set.spawn(async move {
+            let _permit = limit
+                .acquire_owned()
+                .await
+                .expect("the semaphore is never closed");
+            let started = Instant::now();
+            let outcome =
+                match services::check(&binary, &outbound, timeout).await {
+                    Ok(answers) => ExitServices::Checked { via, answers },
+                    Err(reason) => {
+                        warn!(node = %exit, "services: {reason}");
+                        ExitServices::TunnelFailed { via, reason }
+                    }
+                };
+            info!(node = %exit, elapsed = ?started.elapsed(), "services: done");
+            (exit, outcome)
+        });
+    }
+    out.extend(collect(set).await);
+    out
 }
 
 /// One tunnel, retried once when it came up dead. A wrong exit is
@@ -355,6 +451,8 @@ fn write_step_summary(results: &[CheckResult]) {
 mod tests {
     use super::*;
     use crate::test_util::{config, snapshot};
+    use remnawave_healthcheck_core::checks::services::Skip;
+    use remnawave_healthcheck_core::model::{GeoFacts, ProbeOutcome, parse_ip};
 
     #[tokio::test]
     #[should_panic(expected = "boom")]
@@ -363,6 +461,78 @@ mod tests {
         set.spawn(async { panic!("boom") });
 
         let _: Vec<()> = collect(set).await;
+    }
+
+    fn tunnel_out_at(exit: &str) -> ProbeStage {
+        ProbeStage::Done(vec![(
+            0,
+            ProbeResult::Probed {
+                expect: "beta".into(),
+                outcome: ProbeOutcome {
+                    exit_ip: parse_ip(exit),
+                    stderr_tail: String::new(),
+                },
+            },
+        )])
+    }
+
+    fn geo_at(egress: &str) -> HashMap<String, GeoOutcome> {
+        HashMap::from([(
+            "beta".to_string(),
+            GeoOutcome::Done(GeoFacts {
+                egress: parse_ip(egress),
+                report: serde_json::Value::Null,
+            }),
+        )])
+    }
+
+    /// `--no-services` keeps the rows in the report, so switching the stage
+    /// off is visible rather than read as a clean bill.
+    #[tokio::test]
+    async fn switched_off_services_still_name_every_exit() {
+        let mut config = config();
+        config.no_services = true;
+
+        let out = services_all(
+            &snapshot(),
+            &config,
+            &tunnel_out_at("192.0.2.20"),
+            &geo_at("192.0.2.20"),
+        )
+        .await;
+
+        assert_eq!(out, [("beta".to_string(), ExitServices::Disabled)]);
+    }
+
+    /// No tunnel out at the exit's egress address means no Xray is started
+    /// for it: the row says why instead.
+    #[tokio::test]
+    async fn an_exit_no_tunnel_reached_is_skipped_without_starting_xray() {
+        let out = services_all(
+            &snapshot(),
+            &config(),
+            &tunnel_out_at("198.51.100.7"),
+            &geo_at("192.0.2.20"),
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            [("beta".to_string(), ExitServices::Skipped(Skip::NoTunnel))]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_tunnels_the_services_stage_has_nothing_to_say() {
+        let out = services_all(
+            &snapshot(),
+            &config(),
+            &ProbeStage::Skipped,
+            &geo_at("192.0.2.20"),
+        )
+        .await;
+
+        assert!(out.is_empty());
     }
 
     #[tokio::test]

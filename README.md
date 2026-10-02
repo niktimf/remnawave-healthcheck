@@ -51,6 +51,18 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 - **Through a real Xray tunnel** — every channel of the monitoring user's subscription, run with the
   exact outbound the panel served, its exit compared with the expected node's egress address by
   following the routing graph of the config profiles (cascades included).
+- **Services through the exit** — Gemini, NotebookLM, YouTube Premium,
+  ChatGPT, Claude, Copilot, Grok and the OpenAI, Anthropic and xAI APIs,
+  asked once per exit node through a fresh Xray with the first channel whose
+  tunnel came out at that exit's egress address. The answer is the one
+  clients get under the exit profile's routing rules (direct, WARP or a
+  cascade to another exit). A positive refusal fails the row, and a page
+  without a known marker (a Cloudflare challenge, new markup) warns. Exits in
+  RU are skipped. Next to it, `services direct` repeats what geocheck found
+  for the node's own address (which country Google sees, which services
+  refuse it). That line is always OK. `--no-services` switches the
+  stage off and keeps the rows, marked as disabled;
+  `REMNAWAVE_SERVICE_TIMEOUT_SECS` bounds each request (15 s).
 - **Auto-select entries** — a host whose XRAY-JSON template injects other hosts (`remnawave.
   injectHosts`) is served a balancer instead of an outbound of its own, so it has no exit to compare
   and its address is a placeholder. It is checked as what it is: the injector must have selected

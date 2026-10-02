@@ -4,6 +4,7 @@
 pub mod geocheck;
 pub mod panel;
 pub mod probe;
+pub mod services;
 pub mod ssh;
 pub mod tls;
 pub mod upstream;
