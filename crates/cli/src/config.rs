@@ -7,6 +7,7 @@ use clap::Parser;
 use remnawave_healthcheck_core::checks::geo::GeoChecker;
 use remnawave_healthcheck_core::checks::panel::PanelChecker;
 use remnawave_healthcheck_core::checks::ssh::SshChecker;
+use remnawave_healthcheck_core::checks::usage::{DropRatio, UsageChecker};
 use remnawave_healthcheck_core::checks::youtube::ExpectedYoutube;
 use remnawave_healthcheck_io::probe::{DOWNLOAD_SILENCE, DownloadTarget};
 use remnawave_healthcheck_io::{Hwid, SshConfig};
@@ -119,6 +120,28 @@ pub struct Args {
     pub xray_cache: PathBuf,
     #[arg(long, env = "REMNAWAVE_PANEL_TIMEOUT_SECS", default_value_t = 30)]
     pub panel_timeout_secs: u64,
+    /// Warn when yesterday fell below this share of the median of the seven
+    /// days before it (users on a node clients enter, traffic on every node)
+    #[arg(long, env = "REMNAWAVE_USAGE_DROP_RATIO", default_value_t = 0.5)]
+    pub usage_drop_ratio: f64,
+    /// Users a node must usually have for a drop in them to be judged
+    #[arg(long, env = "REMNAWAVE_USAGE_MIN_USERS", default_value_t = 10)]
+    pub usage_min_users: u64,
+    /// Bytes a node must usually carry a day for a drop to be judged (1 GiB)
+    #[arg(
+        long,
+        env = "REMNAWAVE_USAGE_MIN_BYTES",
+        default_value_t = 1_073_741_824
+    )]
+    pub usage_min_bytes: u64,
+    /// Bytes a user must use on a node in a day to count there (10 MiB):
+    /// leaves out the monitoring user and stray connections
+    #[arg(
+        long,
+        env = "REMNAWAVE_USAGE_USER_MIN_BYTES",
+        default_value_t = 10_485_760
+    )]
+    pub usage_user_min_bytes: u64,
     /// Per request to an AI service or YouTube, asked through a tunnel
     #[arg(long, env = "REMNAWAVE_SERVICE_TIMEOUT_SECS", default_value_t = 15)]
     pub service_timeout_secs: u64,
@@ -146,6 +169,9 @@ pub struct Args {
     /// Skip asking AI services and YouTube Premium through a tunnel per exit
     #[arg(long, env = "REMNAWAVE_NO_SERVICES")]
     pub no_services: bool,
+    /// Skip the usage trend from the panel's per-day history
+    #[arg(long, env = "REMNAWAVE_NO_USAGE")]
+    pub no_usage: bool,
     /// Skip looking up the panel's newest release on GitHub
     #[arg(long, env = "REMNAWAVE_NO_UPSTREAM")]
     pub no_upstream: bool,
@@ -183,12 +209,14 @@ pub struct Config {
     pub tls_timeout: Duration,
     pub xhttp_timeout: Duration,
     pub service_timeout: Duration,
+    pub usage_user_min_bytes: u64,
     pub judge: Judge,
     pub no_ssh: bool,
     pub no_channels: bool,
     pub no_geocheck: bool,
     pub no_xhttp: bool,
     pub no_services: bool,
+    pub no_usage: bool,
     pub no_upstream: bool,
     pub github_token: Option<String>,
     pub run_url: Option<String>,
@@ -228,6 +256,8 @@ impl Config {
             .expected_youtube
             .parse::<ExpectedYoutube>()
             .context("REMNAWAVE_EXPECTED_YOUTUBE")?;
+        let drop_ratio = DropRatio::try_from(args.usage_drop_ratio)
+            .context("REMNAWAVE_USAGE_DROP_RATIO")?;
         let ssh_private_key = non_empty(args.ssh_private_key);
         // An explicit key without a user means a bare CI runner: root is the
         // only sensible login. Neither set -> ssh's own config decides.
@@ -262,6 +292,7 @@ impl Config {
             tls_timeout: Duration::from_secs(10),
             xhttp_timeout: Duration::from_secs(6),
             service_timeout: Duration::from_secs(args.service_timeout_secs),
+            usage_user_min_bytes: args.usage_user_min_bytes,
             judge: Judge {
                 panel: PanelChecker {
                     config_warn_days: args.config_warn_days,
@@ -276,6 +307,11 @@ impl Config {
                     container: args.node_container,
                     acme_dir: args.acme_dir,
                 },
+                usage: UsageChecker {
+                    drop_ratio,
+                    min_users: args.usage_min_users,
+                    min_bytes: args.usage_min_bytes,
+                },
                 cert_warn_days: args.cert_warn_days,
                 expected_youtube,
                 download_url: args.download_url,
@@ -285,6 +321,7 @@ impl Config {
             no_geocheck: args.no_geocheck,
             no_xhttp: args.no_xhttp,
             no_services: args.no_services,
+            no_usage: args.no_usage,
             no_upstream: args.no_upstream,
             github_token: non_empty(args.github_token),
             run_url: github_run_url(|k| std::env::var(k).ok()),
@@ -455,6 +492,40 @@ mod tests {
             err.to_string()
                 .starts_with("REMNAWAVE_DOWNLOAD_URL is not a URL"),
             "{err:#}"
+        );
+    }
+
+    #[rstest]
+    #[case::zero("0")]
+    #[case::above_one("1.5")]
+    fn a_drop_ratio_outside_zero_to_one_is_refused_by_name(
+        #[case] value: &str,
+    ) {
+        let args = args(&["--usage-drop-ratio", value]);
+
+        let err = Config::from_args(args).unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "REMNAWAVE_USAGE_DROP_RATIO: {value} is not above 0 and at most 1"
+            )
+        );
+    }
+
+    #[test]
+    fn a_bare_run_counts_users_over_ten_mebibytes() {
+        let args = args(&[]);
+
+        let config = Config::from_args(args).unwrap();
+
+        assert_eq!(
+            (
+                config.usage_user_min_bytes,
+                config.judge.usage.min_users,
+                config.judge.usage.min_bytes
+            ),
+            (10_485_760, 10, 1_073_741_824)
         );
     }
 

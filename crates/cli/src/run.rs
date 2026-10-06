@@ -1,5 +1,6 @@
-//! One run: panel → panel checks → (geocheck ∥ ssh ∥ tls ∥ xhttp ∥ tunnels)
-//! → services → classify → report → deliver. Families run concurrently; the
+//! One run: panel -> panel checks -> (geocheck, ssh, tls, xhttp, tunnels,
+//! usage history) -> services -> classify -> report -> deliver. Families run
+//! concurrently; the
 //! tunnels need geocheck's egress addresses only at classification time. The
 //! services stage waits for both: it asks through a tunnel already shown to
 //! come out at its exit's egress address.
@@ -8,10 +9,11 @@ use crate::config::Config;
 use crate::judge::{self, Collected, ProbeResult, ProbeStage, SshStage};
 use crate::telegram::Notifier;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use remnawave_healthcheck_core::checks::services::{
     self as service_checks, ExitPlan, ExitServices,
 };
+use remnawave_healthcheck_core::checks::usage::UsageOutcome;
 use remnawave_healthcheck_core::checks::{self, channel::Precheck};
 use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Reported, Snapshot, SshOutcome,
@@ -62,13 +64,14 @@ pub async fn run(config: Config) -> Result<Outcome> {
     );
     let now = Utc::now();
 
-    let (geo, ssh, tls, xhttp, probes, upstream) = tokio::join!(
+    let (geo, ssh, tls, xhttp, probes, upstream, usage) = tokio::join!(
         geocheck_all(&panel, &snapshot, &config),
         ssh_all(&snapshot, &config),
         tls_all(&snapshot, &config),
         xhttp_all(&snapshot, &config),
         probe_all(&snapshot, &config),
         upstream_release(&config),
+        usage_all(&panel, &snapshot, &config, now.date_naive()),
     );
     let services = services_all(&snapshot, &config, &probes, &geo).await;
     let collected = Collected {
@@ -79,6 +82,7 @@ pub async fn run(config: Config) -> Result<Outcome> {
         probes,
         upstream,
         services,
+        usage,
     };
     let results = config.judge.verdicts(&snapshot, now, collected);
 
@@ -240,6 +244,35 @@ async fn upstream_release(config: &Config) -> Reported {
         Reported::NotRead => {}
     }
     reported
+}
+
+/// The panel's per-day history of every node, as of `today` in UTC, the
+/// calendar the panel buckets it by. A history that cannot be read is a
+/// verdict, not the end of the run.
+async fn usage_all(
+    panel: &Arc<PanelClient>,
+    snapshot: &Snapshot,
+    config: &Config,
+    today: NaiveDate,
+) -> UsageOutcome {
+    if config.no_usage {
+        return UsageOutcome::Disabled;
+    }
+    let nodes: Vec<String> =
+        snapshot.nodes.iter().map(|n| n.uuid.clone()).collect();
+    match panel
+        .usage_history(&nodes, today, config.usage_user_min_bytes)
+        .await
+    {
+        Ok(history) => {
+            info!(dates = history.dates.len(), "usage history read");
+            UsageOutcome::Read(history)
+        }
+        Err(e) => {
+            warn!("usage history: {e:#}");
+            UsageOutcome::Failed(format!("{e:#}"))
+        }
+    }
 }
 
 async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
@@ -546,6 +579,59 @@ mod tests {
         .await;
 
         assert_eq!(out, Vec::<(String, ExitServices)>::new());
+    }
+
+    fn panel_at(url: &str) -> Arc<PanelClient> {
+        let timeout = std::time::Duration::from_secs(5);
+        Arc::new(PanelClient::new(url, "tok", timeout, None).unwrap())
+    }
+
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, 6).unwrap()
+    }
+
+    /// `--no-usage` asks the panel nothing: the address below answers no
+    /// request, and the stage still ends at once.
+    #[tokio::test]
+    async fn switched_off_usage_asks_the_panel_nothing() {
+        let mut config = config();
+        config.no_usage = true;
+
+        let out = usage_all(
+            &panel_at("http://127.0.0.1:1"),
+            &snapshot(),
+            &config,
+            today(),
+        )
+        .await;
+
+        assert_eq!(out, UsageOutcome::Disabled);
+    }
+
+    /// A token without the scope fails the stage, and the run goes on.
+    #[tokio::test]
+    async fn a_refused_history_is_a_failed_stage() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/bandwidth-stats/nodes"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let out = usage_all(
+            &panel_at(&server.uri()),
+            &snapshot(),
+            &config(),
+            today(),
+        )
+        .await;
+
+        assert!(
+            matches!(&out, UsageOutcome::Failed(why) if why.contains("403")),
+            "{out:?}"
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ use remnawave_healthcheck_core::checks::panel::{
 use remnawave_healthcheck_core::checks::services::{self, ExitServices};
 use remnawave_healthcheck_core::checks::ssh::{self, SshChecker};
 use remnawave_healthcheck_core::checks::tls;
+use remnawave_healthcheck_core::checks::usage::{UsageChecker, UsageOutcome};
 use remnawave_healthcheck_core::checks::youtube::{self, ExpectedYoutube};
 use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Reported, Snapshot, SshOutcome,
@@ -30,6 +31,8 @@ pub struct Collected {
     /// What the services stage found per exit, by node name. Empty when no
     /// tunnel ran, since then no exit can be shown reachable.
     pub services: Vec<(String, ExitServices)>,
+    /// The panel's per-day traffic and users, or why it was not read.
+    pub usage: UsageOutcome,
 }
 
 /// Why a family produced nothing is worth a line in the report, so the stages
@@ -81,6 +84,7 @@ pub struct Judge {
     pub panel: PanelChecker,
     pub geo: GeoChecker,
     pub ssh: SshChecker,
+    pub usage: UsageChecker,
     pub cert_warn_days: u32,
     pub expected_youtube: ExpectedYoutube,
     /// Named in the one row that stands in for the channels when the
@@ -102,6 +106,7 @@ impl Judge {
             .push(panel_checks::version(&snapshot.panel_version, &c.upstream));
         results.extend(ssh_setup(&c.ssh));
         results.extend(self.per_node(snapshot, now, &c));
+        results.extend(self.usage.all(snapshot, now.date_naive(), &c.usage));
         results.extend(c.tls.iter().map(|(host, facts)| {
             tls::check(host, facts, now, self.cert_warn_days)
         }));
@@ -284,6 +289,7 @@ pub(crate) fn egress_by_node<'a>(
 mod tests {
     use super::*;
     use crate::test_util::{by_name, judge, snapshot};
+    use remnawave_healthcheck_core::checks::usage::UsageOutcome;
     use remnawave_healthcheck_core::model::{
         Download, GeoFacts, HostFacts, Served, Severity, parse_ip,
     };
@@ -348,6 +354,7 @@ mod tests {
             )],
             probes: probed("192.0.2.20"),
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: Vec::new(),
         };
         let sut = judge();
@@ -392,6 +399,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::SetupFailed("obtaining xray: boom".into()),
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: Vec::new(),
         };
         let sut = judge();
@@ -428,6 +436,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::Skipped,
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: Vec::new(),
         };
         let sut = judge();
@@ -451,6 +460,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::Skipped,
             upstream: Reported::Known("3.4.3".into()),
+            usage: UsageOutcome::Disabled,
             services: Vec::new(),
         };
         let sut = judge();
@@ -487,6 +497,7 @@ mod tests {
             xhttp: vec![],
             probes: probed("192.0.2.20"),
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: Vec::new(),
         };
         let sut = judge();
@@ -527,6 +538,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::Skipped,
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: vec![(
                 "beta".to_string(),
                 ExitServices::Checked {
@@ -573,6 +585,7 @@ mod tests {
             xhttp: vec![],
             probes: ProbeStage::Skipped,
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: vec![(
                 "beta".to_string(),
                 ExitServices::Checked {
@@ -632,6 +645,7 @@ mod tests {
                 (1, probed(second)),
             ]),
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: Vec::new(),
         };
         (s, collected)
@@ -713,6 +727,39 @@ mod tests {
         assert!(results.iter().all(|r| r.name != "download target"));
     }
 
+    /// A token without the history scopes costs one warning: the nodes get
+    /// no trend rows and the run is not failed.
+    #[test]
+    fn an_unread_usage_history_is_one_warning_in_place_of_the_trends() {
+        let s = snapshot();
+        let collected = Collected {
+            geo: HashMap::new(),
+            ssh: SshStage::Skipped,
+            tls: vec![],
+            xhttp: vec![],
+            probes: ProbeStage::Skipped,
+            upstream: Reported::NotRead,
+            usage: UsageOutcome::Failed(
+                "GET /api/bandwidth-stats/nodes returned 403 Forbidden".into(),
+            ),
+            services: Vec::new(),
+        };
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        let history = by_name(&results, "panel / usage history");
+        assert_eq!(
+            (history.severity, history.detail.as_str()),
+            (
+                Severity::Warn,
+                "not read: GET /api/bandwidth-stats/nodes returned 403 Forbidden"
+            )
+        );
+        assert!(results.iter().all(|r| !r.name.ends_with("/ usage trend")));
+        assert_eq!(Report::of(&results).outcome(), Outcome::Ok);
+    }
+
     /// Without geocheck there is no address to compare the tunnel's exit
     /// against, and an unverified exit is not a passing one.
     #[test]
@@ -725,6 +772,7 @@ mod tests {
             xhttp: vec![],
             probes: probed("192.0.2.20"),
             upstream: Reported::NotRead,
+            usage: UsageOutcome::Disabled,
             services: Vec::new(),
         };
         let sut = judge();

@@ -78,6 +78,15 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
   expected in RU that refusal is listed under `not counted` and leaves the
   `services` row alone. A malformed list is a configuration error (exit code
   2).
+- **From the panel's history** — yesterday's traffic of every enabled node,
+  and on a node clients connect to also its users, against the median of
+  the seven days before: a `usage trend` row per node that warns when
+  yesterday fell below `REMNAWAVE_USAGE_DROP_RATIO` (0.5) of that median.
+  A user counts on a day after `REMNAWAVE_USAGE_USER_MIN_BYTES` (10 MiB) on
+  that node, so the monitoring user and stray connections do not. A
+  baseline under `REMNAWAVE_USAGE_MIN_USERS` (10) users or
+  `REMNAWAVE_USAGE_MIN_BYTES` (1 GiB) a day is too small to judge and stays
+  OK. Days are UTC, as the panel counts them; `--no-usage` skips the check.
 - **Auto-select entries** — a host whose XRAY-JSON template injects other hosts (`remnawave.
   injectHosts`) is served a balancer instead of an outbound of its own, so it has no exit to compare
   and its address is a placeholder. It is checked as what it is: the injector must have selected
@@ -90,6 +99,8 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 - An API token (not an admin login JWT) with the `nodes`, `config-profiles`, `by-id`, `raw`, `geocheck`
   and `geocheck-result` scopes, plus `metadata` for the version check — without it that one check warns
   and the rest of the run is unaffected.
+  The usage trend needs `nodes-usage` and `node-usage` as well; without
+  them only that check warns (`panel / usage history`).
 - Optionally `GITHUB_TOKEN` for the release lookup: unauthenticated GitHub allows 60 requests an hour
   per address, and a hosted runner shares its address. Every Actions run already has the token.
 - A monitoring user whose subscription includes every squad you want checked. If the panel limits devices
