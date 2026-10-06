@@ -271,16 +271,24 @@ async fn probe_all(snapshot: &Snapshot, config: &Config) -> ProbeStage {
                     .cloned()
                     .expect("a probeable channel carries an outbound");
                 let expect = expect.name.clone();
-                let (timeout, echo) =
-                    (config.probe_timeout, config.echo_url.clone());
+                let (timeout, echo, download) = (
+                    config.probe_timeout,
+                    config.echo_url.clone(),
+                    config.download.clone(),
+                );
                 set.spawn(async move {
                     let _permit = limit
                         .acquire_owned()
                         .await
                         .expect("the semaphore is never closed");
-                    let outcome =
-                        probe_retrying(&binary, &outbound, timeout, &echo)
-                            .await;
+                    let outcome = probe_retrying(
+                        &binary,
+                        &outbound,
+                        timeout,
+                        &echo,
+                        download.as_ref(),
+                    )
+                    .await;
                     (idx, ProbeResult::Probed { expect, outcome })
                 });
             }
@@ -392,18 +400,20 @@ async fn services_all(
 
 /// One tunnel, retried once when it came up dead. A wrong exit is
 /// deterministic and re-running would only report the same address, so a
-/// missing one is the only outcome worth a second attempt.
+/// missing one is the only outcome worth a second attempt. A download that
+/// went wrong behind a live exit is a finding, not a reason to retry.
 async fn probe_retrying(
     binary: &std::path::Path,
     outbound: &serde_json::Value,
     timeout: std::time::Duration,
     echo: &str,
+    download: Option<&probe::DownloadTarget>,
 ) -> ProbeOutcome {
-    let outcome = probe::probe(binary, outbound, timeout, echo).await;
+    let outcome = probe::probe(binary, outbound, timeout, echo, download).await;
     if outcome.exit_ip.is_some() {
         return outcome;
     }
-    probe::probe(binary, outbound, timeout, echo).await
+    probe::probe(binary, outbound, timeout, echo, download).await
 }
 
 /// The panel is the only source of truth: failing to read it means nothing

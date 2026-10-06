@@ -2,9 +2,11 @@
 //! traffic comes out. The outbound is used verbatim: this tool checks what the
 //! panel handed the client.
 
+use crate::panel::error_chain;
 use anyhow::{Context, Result};
 use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{Download, ProbeOutcome, parse_ip};
+use reqwest::Url;
 use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -103,15 +105,33 @@ fn free_port() -> std::io::Result<u16> {
         .port())
 }
 
+/// How long a download may go without a byte before it counts as stalled.
+/// A freeze keeps the connection open and sends nothing, so it shows as
+/// silence long before the total bound runs out.
+pub const DOWNLOAD_SILENCE: Duration = Duration::from_secs(10);
+
+/// What to download through a tunnel once it is shown to come out, and the
+/// bounds on that download.
+#[derive(Debug, Clone)]
+pub struct DownloadTarget {
+    pub url: Url,
+    /// The whole download.
+    pub total: Duration,
+    /// The longest wait for the next byte.
+    pub silence: Duration,
+}
+
 /// Run Xray with the outbound, ask the echo endpoint through the local SOCKS
-/// port, kill Xray. Nothing is left running or on disk when this returns.
+/// port, download `download` when the echo answered, kill Xray. Nothing is
+/// left running or on disk when this returns.
 pub async fn probe(
     xray_bin: &Path,
     outbound: &Value,
     timeout: Duration,
     echo_url: &str,
+    download: Option<&DownloadTarget>,
 ) -> ProbeOutcome {
-    match attempt(None, xray_bin, outbound, timeout, echo_url).await {
+    match attempt(None, xray_bin, outbound, timeout, echo_url, download).await {
         Ok(outcome) => outcome,
         // The reason takes the place xray's stderr would have had.
         Err(reason) => ProbeOutcome {
@@ -128,6 +148,7 @@ async fn attempt(
     outbound: &Value,
     timeout: Duration,
     echo_url: &str,
+    download: Option<&DownloadTarget>,
 ) -> Result<ProbeOutcome, String> {
     let xray = Xray::start_in(scratch_base, xray_bin, outbound)?;
     let client = socks_client(xray.port(), Duration::from_secs(8))
@@ -142,6 +163,11 @@ async fn attempt(
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    // Only a tunnel that came out has a path worth timing.
+    let download = match (exit_ip, download) {
+        (Some(_), Some(target)) => fetch(&client, target).await,
+        _ => Download::NotRun,
+    };
     let stderr = xray.stop().await;
     let mut stderr_tail = String::new();
     if exit_ip.is_none() {
@@ -151,8 +177,68 @@ async fn attempt(
     Ok(ProbeOutcome {
         exit_ip,
         stderr_tail,
-        download: Download::NotRun,
+        download,
     })
+}
+
+/// Read `target` to the end, counting bytes. Stops at the first `silence`
+/// without a byte, and at `total`, whichever comes first. A body without a
+/// `Content-Length` is complete when the server ends it.
+pub(crate) async fn fetch(
+    client: &reqwest::Client,
+    target: &DownloadTarget,
+) -> Download {
+    let started = tokio::time::Instant::now();
+    let deadline = started + target.total;
+    // Past both bounds below, so reqwest's own timeout never decides first.
+    let request = client
+        .get(target.url.clone())
+        .timeout(target.total.saturating_add(target.silence))
+        .send();
+    let mut response = match tokio::time::timeout(target.silence, request).await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => return Download::Failed(error_chain(e)),
+        Err(_) => {
+            return Download::Failed(format!(
+                "no answer within {}s",
+                target.silence.as_secs()
+            ));
+        }
+    };
+    if !response.status().is_success() {
+        return Download::Failed(format!(
+            "HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let of = response.content_length();
+    let mut bytes: u64 = 0;
+    loop {
+        let wake = (tokio::time::Instant::now() + target.silence).min(deadline);
+        match tokio::time::timeout_at(wake, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                bytes = bytes.saturating_add(chunk.len() as u64);
+            }
+            Ok(Ok(None)) => {
+                let elapsed = started.elapsed();
+                return Download::Complete { bytes, elapsed };
+            }
+            // A body that broke off stopped short, as a silent one does.
+            Ok(Err(e)) => {
+                tracing::debug!("download: {}", error_chain(e));
+                let after = started.elapsed();
+                return Download::Stalled { bytes, of, after };
+            }
+            Err(_) if wake >= deadline => {
+                return Download::TimedOut { bytes, of };
+            }
+            Err(_) => {
+                let after = started.elapsed();
+                return Download::Stalled { bytes, of, after };
+            }
+        }
+    }
 }
 
 /// A running Xray with one subscription outbound behind a local SOCKS port.
@@ -320,6 +406,7 @@ mod tests {
             &json!({"protocol": "vless"}),
             Duration::from_millis(50),
             "https://echo.example.com",
+            None,
         )
         .await;
 
@@ -327,6 +414,163 @@ mod tests {
         let leftovers: Vec<_> =
             std::fs::read_dir(base.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A server on a loopback port that answers one request with `head`,
+    /// then writes each chunk and waits its pause after it, then closes.
+    async fn serve(head: &str, chunks: Vec<(Vec<u8>, Duration)>) -> Url {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(answer(listener, head.to_string(), chunks));
+        url.parse().unwrap()
+    }
+
+    async fn answer(
+        listener: tokio::net::TcpListener,
+        head: String,
+        chunks: Vec<(Vec<u8>, Duration)>,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let (mut socket, _) = listener.accept().await?;
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await?;
+        socket.write_all(head.as_bytes()).await?;
+        for (chunk, pause) in chunks {
+            socket.write_all(&chunk).await?;
+            tokio::time::sleep(pause).await;
+        }
+        Ok(())
+    }
+
+    fn target(url: Url, total: Duration, silence: Duration) -> DownloadTarget {
+        DownloadTarget {
+            url,
+            total,
+            silence,
+        }
+    }
+
+    const MIB: usize = 1_048_576;
+
+    #[tokio::test]
+    async fn a_file_read_to_its_length_is_complete() {
+        let url = serve(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n",
+            vec![(vec![0; MIB], Duration::ZERO)],
+        )
+        .await;
+        let sut = target(url, Duration::from_secs(5), Duration::from_secs(2));
+
+        let download = fetch(&reqwest::Client::new(), &sut).await;
+
+        assert!(
+            matches!(
+                download,
+                Download::Complete {
+                    bytes: 1_048_576,
+                    ..
+                }
+            ),
+            "{download:?}"
+        );
+    }
+
+    /// Without a `Content-Length` there is no size to fall short of: the
+    /// server ending the body is the end of the file.
+    #[tokio::test]
+    async fn a_body_without_a_length_is_complete_when_the_server_ends_it() {
+        let url = serve(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            vec![(vec![0; 300 * 1024], Duration::ZERO)],
+        )
+        .await;
+        let sut = target(url, Duration::from_secs(5), Duration::from_secs(2));
+
+        let download = fetch(&reqwest::Client::new(), &sut).await;
+
+        assert!(
+            matches!(download, Download::Complete { bytes: 307_200, .. }),
+            "{download:?}"
+        );
+    }
+
+    /// The freeze: 20 KB, then nothing while the connection stays open.
+    #[tokio::test]
+    async fn a_body_that_goes_silent_is_stalled_where_it_stopped() {
+        let url = serve(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n",
+            vec![(vec![0; 20 * 1024], Duration::from_secs(5))],
+        )
+        .await;
+        let sut =
+            target(url, Duration::from_secs(5), Duration::from_millis(300));
+
+        let download = fetch(&reqwest::Client::new(), &sut).await;
+
+        assert!(
+            matches!(
+                download,
+                Download::Stalled {
+                    bytes: 20_480,
+                    of: Some(1_048_576),
+                    ..
+                }
+            ),
+            "{download:?}"
+        );
+    }
+
+    /// Bytes keep coming, too slowly to finish: throttled, not frozen.
+    #[tokio::test]
+    async fn a_body_still_trickling_at_the_bound_has_timed_out() {
+        let trickle = (0..100)
+            .map(|_| (vec![0; 1024], Duration::from_millis(50)))
+            .collect();
+        let url = serve(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n",
+            trickle,
+        )
+        .await;
+        let sut =
+            target(url, Duration::from_millis(400), Duration::from_secs(2));
+
+        let download = fetch(&reqwest::Client::new(), &sut).await;
+
+        assert!(
+            matches!(
+                download,
+                Download::TimedOut { bytes, of: Some(1_048_576) } if bytes > 0
+            ),
+            "{download:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_status_is_a_failed_download() {
+        let url = serve(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            vec![],
+        )
+        .await;
+        let sut = target(url, Duration::from_secs(5), Duration::from_secs(2));
+
+        let download = fetch(&reqwest::Client::new(), &sut).await;
+
+        assert_eq!(download, Download::Failed("HTTP 503".into()));
+    }
+
+    #[tokio::test]
+    async fn a_target_nobody_listens_on_is_a_failed_download() {
+        let sut = target(
+            "http://127.0.0.1:1/".parse().unwrap(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        );
+
+        let download = fetch(&reqwest::Client::new(), &sut).await;
+
+        assert!(matches!(download, Download::Failed(_)), "{download:?}");
     }
 
     #[test]

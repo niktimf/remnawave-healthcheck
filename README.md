@@ -51,6 +51,12 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
 - **Through a real Xray tunnel** — every channel of the monitoring user's subscription, run with the
   exact outbound the panel served, its exit compared with the expected node's egress address by
   following the routing graph of the config profiles (cascades included).
+  Once a tunnel shows its exit, a 1 MB file (`REMNAWAVE_DOWNLOAD_URL`) is
+  downloaded through it: a download with no byte for 10 s or still running
+  after `REMNAWAVE_DOWNLOAD_TIMEOUT_SECS` (30 s) warns, and one that stops
+  at 14-34 KB is named as the freeze it looks like. When the file reaches
+  no channel at all, the channels stay green and one `download target` row
+  warns. That is about 1 MB per channel per run; `--no-download` skips it.
 - **Services through the exit** — Gemini, NotebookLM, YouTube Premium,
   ChatGPT, Claude, Copilot, Grok and the OpenAI, Anthropic and xAI APIs,
   asked once per exit node through a fresh Xray with the first channel whose

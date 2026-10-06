@@ -8,6 +8,7 @@ use remnawave_healthcheck_core::checks::geo::GeoChecker;
 use remnawave_healthcheck_core::checks::panel::PanelChecker;
 use remnawave_healthcheck_core::checks::ssh::SshChecker;
 use remnawave_healthcheck_core::checks::youtube::ExpectedYoutube;
+use remnawave_healthcheck_io::probe::{DOWNLOAD_SILENCE, DownloadTarget};
 use remnawave_healthcheck_io::{Hwid, SshConfig};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -79,6 +80,17 @@ pub struct Args {
         default_value = "https://api.ipify.org"
     )]
     pub echo_url: String,
+    /// File downloaded through each tunnel that came out, to catch a path
+    /// that freezes or throttles a transfer after its first packets
+    #[arg(
+        long,
+        env = "REMNAWAVE_DOWNLOAD_URL",
+        default_value = "https://speed.cloudflare.com/__down?bytes=1048576"
+    )]
+    pub download_url: String,
+    /// Bound on each whole download; one with no byte for 10 s stops sooner
+    #[arg(long, env = "REMNAWAVE_DOWNLOAD_TIMEOUT_SECS", default_value_t = 30)]
+    pub download_timeout_secs: u64,
     /// Container the node's Xray runs in
     #[arg(long, env = "REMNAWAVE_NODE_CONTAINER", default_value = "remnanode")]
     pub node_container: String,
@@ -128,6 +140,9 @@ pub struct Args {
     /// expected, a YouTube Premium refusal is not counted
     #[arg(long, env = "REMNAWAVE_EXPECTED_YOUTUBE", default_value = "")]
     pub expected_youtube: String,
+    /// Skip the download through each tunnel
+    #[arg(long, env = "REMNAWAVE_NO_DOWNLOAD")]
+    pub no_download: bool,
     /// Skip asking AI services and YouTube Premium through a tunnel per exit
     #[arg(long, env = "REMNAWAVE_NO_SERVICES")]
     pub no_services: bool,
@@ -160,6 +175,8 @@ pub struct Config {
     pub concurrency: usize,
     pub probe_timeout: Duration,
     pub echo_url: String,
+    /// `None` with `--no-download`.
+    pub download: Option<DownloadTarget>,
     pub xray_cache: PathBuf,
     pub panel_timeout: Duration,
     pub geocheck_timeout: Duration,
@@ -183,6 +200,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
+        let download = download(&args)?;
         let telegram = match (
             non_empty(args.telegram_bot_token),
             non_empty(args.telegram_chat_id),
@@ -237,6 +255,7 @@ impl Config {
             concurrency: args.concurrency,
             probe_timeout: Duration::from_secs(args.probe_timeout_secs),
             echo_url: args.echo_url,
+            download,
             xray_cache: args.xray_cache,
             panel_timeout: Duration::from_secs(args.panel_timeout_secs),
             geocheck_timeout: Duration::from_secs(args.geocheck_timeout_secs),
@@ -259,6 +278,7 @@ impl Config {
                 },
                 cert_warn_days: args.cert_warn_days,
                 expected_youtube,
+                download_url: args.download_url,
             },
             no_ssh: args.no_ssh,
             no_channels: args.no_channels,
@@ -270,6 +290,19 @@ impl Config {
             run_url: github_run_url(|k| std::env::var(k).ok()),
         })
     }
+}
+
+/// What to download through each tunnel, or `None` with `--no-download`.
+/// The URL is checked either way, so a typo surfaces the run it is made in.
+fn download(args: &Args) -> Result<Option<DownloadTarget>> {
+    let url = reqwest::Url::parse(&args.download_url).with_context(|| {
+        format!("REMNAWAVE_DOWNLOAD_URL is not a URL: {}", args.download_url)
+    })?;
+    Ok((!args.no_download).then(|| DownloadTarget {
+        url,
+        total: Duration::from_secs(args.download_timeout_secs),
+        silence: DOWNLOAD_SILENCE,
+    }))
 }
 
 /// The URL GitHub Actions describes its own run with, when all three variables
@@ -388,6 +421,41 @@ mod tests {
 
         let expected = config.judge.expected_youtube.get("node-a");
         assert_eq!(expected.map(|c| c.to_string()), Some("RU".to_string()));
+    }
+
+    #[test]
+    fn a_bare_run_downloads_a_megabyte_within_thirty_seconds() {
+        let args = args(&[]);
+
+        let config = Config::from_args(args).unwrap();
+
+        let download = config.download.unwrap();
+        assert_eq!(
+            (download.url.as_str(), download.total.as_secs()),
+            ("https://speed.cloudflare.com/__down?bytes=1048576", 30)
+        );
+    }
+
+    #[test]
+    fn no_download_leaves_nothing_to_download() {
+        let args = args(&["--no-download"]);
+
+        let config = Config::from_args(args).unwrap();
+
+        assert!(config.download.is_none());
+    }
+
+    #[test]
+    fn a_download_url_that_is_not_a_url_is_refused_by_name() {
+        let args = args(&["--download-url", "not a url"]);
+
+        let err = Config::from_args(args).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("REMNAWAVE_DOWNLOAD_URL is not a URL"),
+            "{err:#}"
+        );
     }
 
     fn github_env(k: &str) -> Option<String> {

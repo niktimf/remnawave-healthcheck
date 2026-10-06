@@ -83,6 +83,9 @@ pub struct Judge {
     pub ssh: SshChecker,
     pub cert_warn_days: u32,
     pub expected_youtube: ExpectedYoutube,
+    /// Named in the one row that stands in for the channels when the
+    /// download target answered none of them.
+    pub download_url: String,
 }
 
 impl Judge {
@@ -105,7 +108,12 @@ impl Judge {
         results.extend(c.xhttp.iter().map(|(idx, facts)| {
             channel::xhttp(&snapshot.channels[*idx], facts, snapshot)
         }));
-        results.extend(channels(snapshot, c.probes, &egress));
+        results.extend(channels(
+            snapshot,
+            c.probes,
+            &egress,
+            &self.download_url,
+        ));
         for (exit, outcome) in &c.services {
             let expected = self.expected_youtube.get(exit);
             results.push(services::verdict(exit, expected, outcome));
@@ -146,12 +154,14 @@ fn ssh_setup(stage: &SshStage) -> Option<CheckResult> {
 }
 
 /// One verdict per channel: what the tunnel did, or why none was run — then
-/// one per selector, which has no tunnel of its own and is judged by the
-/// candidates it routes through.
+/// the download target when it answered no channel, then one per selector,
+/// which has no tunnel of its own and is judged by the candidates it routes
+/// through.
 fn channels(
     snapshot: &Snapshot,
     probes: ProbeStage,
     egress: &HashMap<&str, IpAddr>,
+    download_url: &str,
 ) -> Vec<CheckResult> {
     let alive = alive_channels(&probes);
     let liveness = alive.as_ref().map_or(Liveness::NotRun, Liveness::Alive);
@@ -171,7 +181,11 @@ fn channels(
             })
             .collect(),
     };
-    tunnels.into_iter().chain(selectors).collect()
+    tunnels
+        .into_iter()
+        .chain(target.verdict(download_url))
+        .chain(selectors)
+        .collect()
 }
 
 /// Where each probed channel's tunnel came out, by channel index. `None` when
@@ -589,6 +603,114 @@ mod tests {
             Severity::Ok
         );
         assert_eq!(Report::of(&results).outcome(), Outcome::Ok);
+    }
+
+    /// Two channels out at the right exit, each with its own download.
+    fn two_downloads(
+        first: Download,
+        second: Download,
+    ) -> (Snapshot, Collected) {
+        let mut s = snapshot();
+        let mut second_channel = s.channels[0].clone();
+        second_channel.remark = "beta backup".into();
+        s.channels.push(second_channel);
+        let probed = |download| ProbeResult::Probed {
+            expect: "beta".into(),
+            outcome: ProbeOutcome {
+                exit_ip: parse_ip("192.0.2.20"),
+                stderr_tail: String::new(),
+                download,
+            },
+        };
+        let collected = Collected {
+            geo: HashMap::from([("beta".to_string(), healthy_geo())]),
+            ssh: SshStage::Skipped,
+            tls: vec![],
+            xhttp: vec![],
+            probes: ProbeStage::Done(vec![
+                (0, probed(first)),
+                (1, probed(second)),
+            ]),
+            upstream: Reported::NotRead,
+            services: Vec::new(),
+        };
+        (s, collected)
+    }
+
+    /// A target that answered nobody is one finding about the target, not
+    /// one per channel.
+    #[test]
+    fn a_target_no_channel_could_download_is_one_row() {
+        let (s, collected) = two_downloads(
+            Download::Failed("HTTP 503".into()),
+            Download::Failed("HTTP 503".into()),
+        );
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        let target = by_name(&results, "download target");
+        assert_eq!(
+            (target.severity, target.detail.as_str()),
+            (
+                Severity::Warn,
+                "https://speed.cloudflare.com/__down?bytes=1048576 answered no channel: HTTP 503"
+            )
+        );
+        assert_eq!(
+            by_name(&results, "channel beta backup (beta.example.com:443)")
+                .severity,
+            Severity::Ok
+        );
+    }
+
+    /// The target answered one channel, so the other channel's failure is
+    /// that channel's own.
+    #[test]
+    fn a_target_that_answered_some_channels_leaves_the_failure_on_its_channel()
+    {
+        let (s, collected) = two_downloads(
+            Download::Complete {
+                bytes: 1_048_576,
+                elapsed: std::time::Duration::from_secs(2),
+            },
+            Download::Failed("connection reset".into()),
+        );
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        assert!(results.iter().all(|r| r.name != "download target"));
+        let failed =
+            by_name(&results, "channel beta backup (beta.example.com:443)");
+        assert_eq!(
+            (failed.severity, failed.detail.as_str()),
+            (Severity::Warn, "exit ok, download failed: connection reset")
+        );
+    }
+
+    /// A channel that came out at the wrong exit says nothing about the
+    /// target: only a channel at the right exit could have reached it.
+    #[test]
+    fn a_failed_download_behind_a_wrong_exit_does_not_condemn_the_target() {
+        let (s, mut collected) = two_downloads(
+            Download::Failed("HTTP 503".into()),
+            Download::Failed("HTTP 503".into()),
+        );
+        let ProbeStage::Done(list) = &mut collected.probes else {
+            unreachable!()
+        };
+        for (_, result) in list {
+            let ProbeResult::Probed { outcome, .. } = result else {
+                unreachable!()
+            };
+            outcome.exit_ip = parse_ip("192.0.2.99");
+        }
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        assert!(results.iter().all(|r| r.name != "download target"));
     }
 
     /// Without geocheck there is no address to compare the tunnel's exit
