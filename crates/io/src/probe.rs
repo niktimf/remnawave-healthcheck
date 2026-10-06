@@ -195,10 +195,13 @@ pub(crate) async fn fetch(
         .get(target.url.clone())
         .timeout(target.total.saturating_add(target.silence))
         .send();
-    let mut response = match tokio::time::timeout(target.silence, request).await
-    {
+    let wake = (started + target.silence).min(deadline);
+    let mut response = match tokio::time::timeout_at(wake, request).await {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => return Download::Failed(error_chain(e)),
+        Err(_) if wake >= deadline => {
+            return Download::TimedOut { bytes: 0, of: None };
+        }
         Err(_) => {
             return Download::Failed(format!(
                 "no answer within {}s",
@@ -493,6 +496,23 @@ mod tests {
             matches!(download, Download::Complete { bytes: 307_200, .. }),
             "{download:?}"
         );
+    }
+
+    /// A server that accepts and never sends headers is cut at the total
+    /// bound when that comes before the silence bound.
+    #[tokio::test]
+    async fn a_server_that_never_sends_headers_times_out_at_the_total_bound() {
+        let url = serve("", vec![(Vec::new(), Duration::from_secs(5))]).await;
+        let sut = target(url, Duration::from_millis(300), Duration::from_secs(3));
+        let started = std::time::Instant::now();
+
+        let download = fetch(&reqwest::Client::new(), &sut).await;
+
+        assert!(
+            matches!(download, Download::TimedOut { bytes: 0, of: None }),
+            "{download:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// The freeze: 20 KB, then nothing while the connection stays open.
