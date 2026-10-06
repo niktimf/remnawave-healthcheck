@@ -73,7 +73,8 @@ pub enum Unread {
     Status(u16),
     /// A page without the wording looked for.
     NoMarker,
-    /// A Gemini page without the region Google embeds in it.
+    /// A page without the region the service embeds in it (Gemini, the
+    /// YouTube home page).
     NoRegion,
     /// A service that answers with a redirect did not.
     NoRedirect,
@@ -118,11 +119,11 @@ impl std::fmt::Display for Silence {
     }
 }
 
-const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
-const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+pub(super) const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+pub(super) const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
 const CURL_UA: &str = "curl/8.5.0";
 
-const BROWSER: &[(&str, &str)] = &[
+pub(super) const BROWSER: &[(&str, &str)] = &[
     ("user-agent", CHROME_UA),
     ("accept-language", ACCEPT_LANGUAGE),
 ];
@@ -259,9 +260,7 @@ impl Answer<'_> {
     }
 
     fn challenged(self) -> bool {
-        ["just a moment", "cf_chl", "cf-browser-verification"]
-            .iter()
-            .any(|marker| self.body.contains(marker))
+        is_challenge(self.body)
     }
 
     /// Why the answer could not be read: a challenge first, then a status
@@ -277,6 +276,14 @@ impl Answer<'_> {
         };
         Access::Unrecognized(why)
     }
+}
+
+/// Whether a lowercased body is a Cloudflare challenge rather than the page
+/// asked for.
+pub(super) fn is_challenge(body: &str) -> bool {
+    ["just a moment", "cf_chl", "cf-browser-verification"]
+        .iter()
+        .any(|marker| body.contains(marker))
 }
 
 /// A browser-facing page that refuses with a 403 carrying `refusal` and
