@@ -1,9 +1,8 @@
 //! One run: panel -> panel checks -> (geocheck, ssh, tls, xhttp, tunnels,
 //! usage history) -> services -> classify -> report -> deliver. Families run
-//! concurrently; the
-//! tunnels need geocheck's egress addresses only at classification time. The
-//! services stage waits for both: it asks through a tunnel already shown to
-//! come out at its exit's egress address.
+//! concurrently; the tunnels need geocheck's egress addresses only at
+//! classification time. The services stage waits for both: it asks through a
+//! tunnel already shown to come out at its exit's egress address.
 
 use crate::config::Config;
 use crate::judge::{self, Collected, ProbeResult, ProbeStage, SshStage};
