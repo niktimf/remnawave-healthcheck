@@ -12,6 +12,7 @@
 
 use super::channel::{Precheck, precheck};
 use super::commas;
+use super::youtube::Country;
 use crate::model::{Channel, CheckResult, Node, Snapshot, node_check};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -519,13 +520,21 @@ pub fn plan<'a>(
 // The verdict.
 // ---------------------------------------------------------------------------
 
+/// Everything one tunnel was asked: each service, then the country the
+/// YouTube home page placed the exit in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answers {
+    pub services: Vec<(Service, Access)>,
+    pub youtube: Country,
+}
+
 /// What the services stage ended with for one exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitServices {
     /// Every service was asked through the tunnel of channel `via`.
     Checked {
         via: String,
-        answers: Vec<(Service, Access)>,
+        answers: Answers,
     },
     /// The tunnel through `via` could not be brought up for the stage.
     TunnelFailed {
@@ -542,7 +551,9 @@ pub enum ExitServices {
 pub fn verdict(exit: &str, outcome: &ExitServices) -> CheckResult {
     let name = node_check(exit, "services");
     match outcome {
-        ExitServices::Checked { via, answers } => checked(name, via, answers),
+        ExitServices::Checked { via, answers } => {
+            checked(name, via, &answers.services)
+        }
         ExitServices::TunnelFailed { via, reason } => CheckResult::warn(
             name,
             format!(
@@ -1040,10 +1051,13 @@ mod tests {
 
     // -- verdict -----------------------------------------------------------
 
-    fn checked(answers: Vec<(Service, Access)>) -> ExitServices {
+    fn checked(services: Vec<(Service, Access)>) -> ExitServices {
         ExitServices::Checked {
             via: "de first".into(),
-            answers,
+            answers: Answers {
+                services,
+                youtube: Country::Seen("DE".parse().unwrap()),
+            },
         }
     }
 

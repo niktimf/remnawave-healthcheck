@@ -4,8 +4,9 @@
 
 use crate::probe::{Xray, socks_proxy, tail};
 use remnawave_healthcheck_core::checks::services::{
-    Access, Response, Service, Silence,
+    Access, Answers, Response, Service, Silence,
 };
+use remnawave_healthcheck_core::checks::youtube::{self, Country};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
@@ -13,15 +14,16 @@ use std::time::Duration;
 /// How long Xray gets to open its SOCKS port.
 const XRAY_START: Duration = Duration::from_secs(5);
 
-/// Every service, asked one after another through `outbound`. One after
-/// another, because a burst from one address is what gets a Cloudflare
-/// challenge in place of an answer. `Err` when the tunnel itself could not
-/// be brought up, so no answer can be blamed on a service.
+/// Every service, then the YouTube home page, asked one after another
+/// through `outbound`. One after another, because a burst from one address
+/// is what gets a Cloudflare challenge in place of an answer. `Err` when the
+/// tunnel itself could not be brought up, so no answer can be blamed on a
+/// service.
 pub async fn check(
     xray_bin: &Path,
     outbound: &Value,
     timeout: Duration,
-) -> Result<Vec<(Service, Access)>, String> {
+) -> Result<Answers, String> {
     let xray = Xray::start(xray_bin, outbound)?;
     if !xray.listening(XRAY_START).await {
         let stderr = xray.stop().await;
@@ -37,8 +39,12 @@ pub async fn check(
         let access = ask(&client, service, service.request().url).await;
         answers.push((service, access));
     }
+    let youtube = ask_country(&client, youtube::REQUEST.url).await;
     xray.stop().await;
-    Ok(answers)
+    Ok(Answers {
+        services: answers,
+        youtube,
+    })
 }
 
 /// Through the Xray at `socks_port`, or straight out in tests. No redirect
@@ -64,6 +70,18 @@ async fn ask(client: &reqwest::Client, service: Service, url: &str) -> Access {
         Err(e) => {
             tracing::debug!(service = service.label(), "{e:#}");
             Access::NoAnswer(short(&e))
+        }
+    }
+}
+
+/// The YouTube home page asked at `url`, which is YouTube's own except in
+/// tests.
+async fn ask_country(client: &reqwest::Client, url: &str) -> Country {
+    match fetch(client, url, youtube::REQUEST.headers).await {
+        Ok(response) => youtube::read(&response),
+        Err(e) => {
+            tracing::debug!("youtube country: {e:#}");
+            Country::NoAnswer(short(&e))
         }
     }
 }
@@ -162,6 +180,34 @@ mod tests {
         assert_eq!(access, Access::NoAnswer(Silence::Connection));
     }
 
+    /// The country comes from the page the tunnel was served, with the
+    /// browser headers YouTube answers a client with.
+    #[tokio::test]
+    async fn the_youtube_country_is_read_from_the_home_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("user-agent"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"countryCode":"RU"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let country = ask_country(&direct(), &server.uri()).await;
+
+        assert_eq!(country, Country::Seen("RU".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_youtube_that_does_not_answer_is_no_answer() {
+        let sut = client(None, Duration::from_millis(200)).unwrap();
+
+        let country = ask_country(&sut, "http://127.0.0.1:1").await;
+
+        assert_eq!(country, Country::NoAnswer(Silence::Connection));
+    }
+
     #[tokio::test]
     async fn a_missing_xray_is_a_tunnel_failure_not_ten_silent_services() {
         let outcome = check(
@@ -220,6 +266,7 @@ mod tests {
         println!("{answers:?}");
         assert!(
             answers
+                .services
                 .iter()
                 .any(|(_, a)| !matches!(a, Access::NoAnswer(_))),
             "{answers:?}"

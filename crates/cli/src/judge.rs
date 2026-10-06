@@ -468,7 +468,10 @@ mod tests {
     /// through the exit fails the run.
     #[test]
     fn a_service_refused_through_an_exit_fails_the_run() {
-        use remnawave_healthcheck_core::checks::services::{Access, Service};
+        use remnawave_healthcheck_core::checks::services::{
+            Access, Answers, Service,
+        };
+        use remnawave_healthcheck_core::checks::youtube::Country;
         let s = snapshot();
         let collected = Collected {
             geo: HashMap::new(),
@@ -481,12 +484,15 @@ mod tests {
                 "beta".to_string(),
                 ExitServices::Checked {
                     via: "beta direct".into(),
-                    answers: vec![(
-                        Service::Gemini,
-                        Access::Blocked {
-                            region: Some("RUS".into()),
-                        },
-                    )],
+                    answers: Answers {
+                        services: vec![(
+                            Service::Gemini,
+                            Access::Blocked {
+                                region: Some("RUS".into()),
+                            },
+                        )],
+                        youtube: Country::Seen("DE".parse().unwrap()),
+                    },
                 },
             )],
         };
