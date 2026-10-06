@@ -89,7 +89,7 @@ pub struct Judge {
     pub expected_youtube: ExpectedYoutube,
     /// Named in the one row that stands in for the channels when the
     /// download target answered none of them.
-    pub download_url: String,
+    pub download_url: reqwest::Url,
 }
 
 impl Judge {
@@ -166,7 +166,7 @@ fn channels(
     snapshot: &Snapshot,
     probes: ProbeStage,
     egress: &HashMap<&str, IpAddr>,
-    download_url: &str,
+    download_url: &reqwest::Url,
 ) -> Vec<CheckResult> {
     let alive = alive_channels(&probes);
     let liveness = alive.as_ref().map_or(Liveness::NotRun, Liveness::Alive);
@@ -188,7 +188,7 @@ fn channels(
     };
     tunnels
         .into_iter()
-        .chain(target.verdict(download_url))
+        .chain(target.verdict(download_url.as_str()))
         .chain(selectors)
         .collect()
 }
@@ -748,7 +748,7 @@ mod tests {
 
         let results = sut.verdicts(&s, Utc::now(), collected);
 
-        let history = by_name(&results, "panel / usage history");
+        let history = by_name(&results, "panel usage history");
         assert_eq!(
             (history.severity, history.detail.as_str()),
             (

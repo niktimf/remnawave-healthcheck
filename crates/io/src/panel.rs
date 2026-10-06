@@ -61,6 +61,15 @@ pub struct PanelClient {
     hwid: Option<Hwid>,
 }
 
+/// What a POST does with a 5xx answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerError {
+    /// The request may have taken effect, so it is not asked again.
+    Final,
+    /// The request only reads, so it is asked again like a GET.
+    Retried,
+}
+
 /// A request that may be worth repeating (transport error, 5xx) or not (4xx).
 #[derive(Debug)]
 enum RequestError {
@@ -237,23 +246,7 @@ impl PanelClient {
         path: &str,
         body: &Value,
     ) -> Result<T> {
-        let url = self.url(path);
-        let text = Self::with_retries("POST", || async {
-            let resp = self
-                .apply(self.http.post(&url).json(body), Auth::Token)
-                .send()
-                .await;
-            match Self::finish(&url, resp).await {
-                Err(RequestError::Transient(e)) if e.contains("returned 5") => {
-                    Err(RequestError::Final(e))
-                }
-                other => other,
-            }
-        })
-        .await?;
-        Ok(serde_json::from_str::<Envelope<T>>(&text)
-            .with_context(|| format!("parsing the response of {path}"))?
-            .response)
+        self.post(path, body, ServerError::Final).await
     }
 
     /// A POST that only reads: the panel takes some filters in the body. It
@@ -263,15 +256,33 @@ impl PanelClient {
         path: &str,
         body: &Value,
     ) -> Result<T> {
+        self.post(path, body, ServerError::Retried).await
+    }
+
+    async fn post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        on_5xx: ServerError,
+    ) -> Result<T> {
         let url = self.url(path);
         let text = Self::with_retries("POST", || async {
             let resp = self
                 .apply(self.http.post(&url).json(body), Auth::Token)
                 .send()
                 .await;
-            Self::finish(&url, resp).await
+            match Self::finish(&url, resp).await {
+                Err(RequestError::Transient(e))
+                    if on_5xx == ServerError::Final
+                        && e.contains("returned 5") =>
+                {
+                    Err(RequestError::Final(e))
+                }
+                other => other,
+            }
         })
         .await?;
+        tracing::debug!(path, bytes = text.len(), "panel response");
         Ok(serde_json::from_str::<Envelope<T>>(&text)
             .with_context(|| format!("parsing the response of {path}"))?
             .response)

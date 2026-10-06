@@ -279,14 +279,24 @@ mod tests {
             .and(path("/api/bandwidth-stats/nodes/usage"))
             .respond_with(ResponseTemplate::new(502))
             .up_to_n_times(1)
+            .expect(1)
             .mount(&server)
             .await;
         mount_users(&server, two_users_on_a()).await;
         let sut = Arc::new(client(&server));
 
-        let history = sut.usage_history(&nodes(), today(), 10_485_760).await;
+        let history = sut
+            .usage_history(&nodes(), today(), 10_485_760)
+            .await
+            .unwrap();
 
-        assert!(history.is_ok(), "{history:?}");
+        assert_eq!(
+            history.days[NODE_A][&date("2026-10-05")],
+            Day {
+                bytes: 1000,
+                users: 2
+            }
+        );
     }
 
     #[tokio::test]

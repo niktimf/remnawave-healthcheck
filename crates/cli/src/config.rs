@@ -135,7 +135,8 @@ pub struct Args {
     )]
     pub usage_min_bytes: u64,
     /// Bytes a user must use on a node in a day to count there (10 MiB):
-    /// leaves out the monitoring user and stray connections
+    /// leaves out stray connections; the monitoring user may count as one
+    /// user on nodes its channels enter
     #[arg(
         long,
         env = "REMNAWAVE_USAGE_USER_MIN_BYTES",
@@ -228,7 +229,8 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
-        let download = download(&args)?;
+        let download_url = parse_download_url(&args)?;
+        let download = download(&args, &download_url);
         let telegram = match (
             non_empty(args.telegram_bot_token),
             non_empty(args.telegram_chat_id),
@@ -314,7 +316,7 @@ impl Config {
                 },
                 cert_warn_days: args.cert_warn_days,
                 expected_youtube,
-                download_url: args.download_url,
+                download_url,
             },
             no_ssh: args.no_ssh,
             no_channels: args.no_channels,
@@ -330,16 +332,20 @@ impl Config {
 }
 
 /// What to download through each tunnel, or `None` with `--no-download`.
-/// The URL is checked either way, so a typo surfaces the run it is made in.
-fn download(args: &Args) -> Result<Option<DownloadTarget>> {
-    let url = reqwest::Url::parse(&args.download_url).with_context(|| {
-        format!("REMNAWAVE_DOWNLOAD_URL is not a URL: {}", args.download_url)
-    })?;
-    Ok((!args.no_download).then(|| DownloadTarget {
-        url,
+fn download(args: &Args, url: &reqwest::Url) -> Option<DownloadTarget> {
+    (!args.no_download).then(|| DownloadTarget {
+        url: url.clone(),
         total: Duration::from_secs(args.download_timeout_secs),
         silence: DOWNLOAD_SILENCE,
-    }))
+    })
+}
+
+/// The URL is checked even with `--no-download`, so a typo surfaces the run
+/// it is made in.
+fn parse_download_url(args: &Args) -> Result<reqwest::Url> {
+    reqwest::Url::parse(&args.download_url).with_context(|| {
+        format!("REMNAWAVE_DOWNLOAD_URL is not a URL: {}", args.download_url)
+    })
 }
 
 /// The URL GitHub Actions describes its own run with, when all three variables

@@ -158,7 +158,7 @@ pub struct UsageChecker {
 
 /// The one row that stands in for every node when there is nothing per
 /// node to say.
-const HISTORY: &str = "panel / usage history";
+const HISTORY: &str = "panel usage history";
 
 impl UsageChecker {
     /// One `usage trend` row per enabled node, or one `panel / usage
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(
             results,
             [CheckResult::warn(
-                "panel / usage history",
+                "panel usage history",
                 "not read: the panel returned no day before 2026-10-06"
             )]
         );
@@ -622,14 +622,14 @@ mod tests {
     #[rstest]
     #[case::disabled(
         UsageOutcome::Disabled,
-        CheckResult::ok("panel / usage history", "disabled by --no-usage")
+        CheckResult::ok("panel usage history", "disabled by --no-usage")
     )]
     #[case::refused(
         UsageOutcome::Failed(
             "GET /api/bandwidth-stats/nodes returned 403 Forbidden".into()
         ),
         CheckResult::warn(
-            "panel / usage history",
+            "panel usage history",
             "not read: GET /api/bandwidth-stats/nodes returned 403 Forbidden"
         )
     )]

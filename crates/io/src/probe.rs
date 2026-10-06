@@ -503,7 +503,8 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_never_sends_headers_times_out_at_the_total_bound() {
         let url = serve("", vec![(Vec::new(), Duration::from_secs(5))]).await;
-        let sut = target(url, Duration::from_millis(300), Duration::from_secs(3));
+        let sut =
+            target(url, Duration::from_millis(300), Duration::from_secs(3));
         let started = std::time::Instant::now();
 
         let download = fetch(&reqwest::Client::new(), &sut).await;
