@@ -4,9 +4,10 @@
 //! a change of it is worth a warning.
 
 use super::services::{
-    ACCEPT_LANGUAGE, CHROME_UA, Request, Response, Silence, Unread,
-    is_challenge,
+    self, ACCEPT_LANGUAGE, CHROME_UA, ExitServices, Request, Response, Silence,
+    Unread, is_challenge,
 };
+use crate::model::{CheckResult, node_check};
 
 /// A browser's headers plus `SOCS=CAI`, which declines the cookie-consent
 /// interstitial YouTube puts in front of the page for addresses it places in
@@ -90,6 +91,40 @@ pub fn read(response: &Response) -> Country {
         .map_or(Country::Unrecognized(Unread::NoRegion), Country::Seen)
 }
 
+/// The `youtube country` row of one exit. `expected` is the country the
+/// operator configured for it, if any. An exit no tunnel asked carries the
+/// reason and severity of its `services` row: both rows come from one
+/// request through one tunnel.
+pub fn verdict(
+    exit: &str,
+    expected: Option<CountryCode>,
+    outcome: &ExitServices,
+) -> CheckResult {
+    let name = node_check(exit, "youtube country");
+    let ExitServices::Checked { answers, .. } = outcome else {
+        let row = services::verdict(exit, expected, outcome);
+        return CheckResult::new(name, row.severity, row.detail);
+    };
+    match (answers.youtube, expected) {
+        (Country::Seen(seen), Some(want)) if seen == want => {
+            CheckResult::ok(name, format!("YouTube sees {seen} (expected)"))
+        }
+        (Country::Seen(seen), Some(want)) => CheckResult::warn(
+            name,
+            format!("YouTube sees {seen}, expected {want}"),
+        ),
+        (Country::Seen(seen), None) => {
+            CheckResult::ok(name, format!("YouTube sees {seen}"))
+        }
+        (Country::Unrecognized(why), _) => {
+            CheckResult::warn(name, format!("country not read: {why}"))
+        }
+        (Country::NoAnswer(why), _) => {
+            CheckResult::warn(name, format!("country not read: {why}"))
+        }
+    }
+}
+
 /// The code in the first `<key>XX"` of the body that holds one.
 fn quoted_after(body: &str, key: &str) -> Option<CountryCode> {
     body.match_indices(key).find_map(|(at, _)| {
@@ -105,6 +140,8 @@ fn quoted_after(body: &str, key: &str) -> Option<CountryCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checks::services::{Answers, Skip};
+    use crate::model::Severity;
     use rstest::rstest;
 
     fn page(status: u16, body: &str) -> Response {
@@ -181,5 +218,95 @@ mod tests {
 
         let got = parsed.as_ref().map(CountryCode::as_str).map_err(|_| ());
         assert_eq!(got, expected);
+    }
+
+    fn asked(youtube: Country) -> ExitServices {
+        ExitServices::Checked {
+            via: "exit-a direct".into(),
+            answers: Answers {
+                services: Vec::new(),
+                youtube,
+            },
+        }
+    }
+
+    #[rstest]
+    #[case::as_expected(
+        Country::Seen(CountryCode::RU),
+        Some("RU"),
+        Severity::Ok,
+        "YouTube sees RU (expected)"
+    )]
+    #[case::elsewhere(
+        Country::Seen(code("DE")),
+        Some("RU"),
+        Severity::Warn,
+        "YouTube sees DE, expected RU"
+    )]
+    #[case::nothing_expected(
+        Country::Seen(code("NL")),
+        None,
+        Severity::Ok,
+        "YouTube sees NL"
+    )]
+    #[case::unread(
+        Country::Unrecognized(Unread::Challenge),
+        Some("RU"),
+        Severity::Warn,
+        "country not read: challenge"
+    )]
+    #[case::silent(
+        Country::NoAnswer(Silence::Timeout),
+        None,
+        Severity::Warn,
+        "country not read: timeout"
+    )]
+    fn the_country_is_judged_against_the_expected_one(
+        #[case] youtube: Country,
+        #[case] expected: Option<&str>,
+        #[case] severity: Severity,
+        #[case] detail: &str,
+    ) {
+        let outcome = asked(youtube);
+
+        let result = verdict("exit-a", expected.map(code), &outcome);
+
+        assert_eq!(result.name, "node exit-a / youtube country");
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (severity, detail)
+        );
+    }
+
+    /// No tunnel asked YouTube, for the same reason no tunnel asked the
+    /// services: the row gives that reason at that severity.
+    #[rstest]
+    #[case::in_russia(
+        ExitServices::Skipped(Skip::InRussia),
+        Severity::Ok,
+        "skipped: the exit is in RU, where these services are closed"
+    )]
+    #[case::no_tunnel(
+        ExitServices::Skipped(Skip::NoTunnel),
+        Severity::Warn,
+        "not checked: no channel came out through exit-a"
+    )]
+    #[case::disabled(
+        ExitServices::Disabled,
+        Severity::Ok,
+        "disabled by --no-services"
+    )]
+    fn an_exit_not_asked_reads_like_its_services_row(
+        #[case] outcome: ExitServices,
+        #[case] severity: Severity,
+        #[case] detail: &str,
+    ) {
+        let result = verdict("exit-a", None, &outcome);
+
+        assert_eq!(result.name, "node exit-a / youtube country");
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (severity, detail)
+        );
     }
 }

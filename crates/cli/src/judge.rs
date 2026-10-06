@@ -9,7 +9,7 @@ use remnawave_healthcheck_core::checks::panel::{
 };
 use remnawave_healthcheck_core::checks::services::{self, ExitServices};
 use remnawave_healthcheck_core::checks::ssh::{self, SshChecker};
-use remnawave_healthcheck_core::checks::tls;
+use remnawave_healthcheck_core::checks::{tls, youtube};
 use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Reported, Snapshot, SshOutcome,
     TlsFacts, XhttpFacts,
@@ -104,11 +104,10 @@ impl Judge {
             channel::xhttp(&snapshot.channels[*idx], facts, snapshot)
         }));
         results.extend(channels(snapshot, c.probes, &egress));
-        results.extend(
-            c.services
-                .iter()
-                .map(|(exit, outcome)| services::verdict(exit, outcome)),
-        );
+        for (exit, outcome) in &c.services {
+            results.push(services::verdict(exit, None, outcome));
+            results.push(youtube::verdict(exit, None, outcome));
+        }
         results
     }
 

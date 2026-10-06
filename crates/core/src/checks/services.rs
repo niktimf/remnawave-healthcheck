@@ -12,7 +12,7 @@
 
 use super::channel::{Precheck, precheck};
 use super::commas;
-use super::youtube::Country;
+use super::youtube::{Country, CountryCode};
 use crate::model::{Channel, CheckResult, Node, Snapshot, node_check};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -547,12 +547,18 @@ pub enum ExitServices {
 }
 
 /// The row of one exit: FAIL when any service refused, WARN when any could
-/// not be read or did not answer, OK otherwise.
-pub fn verdict(exit: &str, outcome: &ExitServices) -> CheckResult {
+/// not be read or did not answer, OK otherwise. `expected` is the country
+/// the operator configured for the exit's YouTube, if any.
+pub fn verdict(
+    exit: &str,
+    expected: Option<CountryCode>,
+    outcome: &ExitServices,
+) -> CheckResult {
     let name = node_check(exit, "services");
     match outcome {
         ExitServices::Checked { via, answers } => {
-            checked(name, via, &answers.services)
+            let excuse_premium = expected == Some(CountryCode::RU);
+            checked(name, via, &answers.services, excuse_premium)
         }
         ExitServices::TunnelFailed { via, reason } => CheckResult::warn(
             name,
@@ -580,47 +586,94 @@ pub fn verdict(exit: &str, outcome: &ExitServices) -> CheckResult {
     }
 }
 
-/// The detail names only the services that deviate.
+/// The answers of one exit sorted by how they deviate.
+#[derive(Default)]
+struct Tally {
+    blocked: Vec<String>,
+    unrecognized: Vec<String>,
+    silent: Vec<String>,
+    /// Refusals the operator asked for: YouTube refuses Premium in RU, and
+    /// an exit configured to stay in RU for YouTube is meant to be refused.
+    not_counted: Vec<String>,
+}
+
+impl Tally {
+    fn of(answers: &[(Service, Access)], excuse_premium: bool) -> Self {
+        let mut tally = Self::default();
+        for (service, access) in answers {
+            let label = service.label();
+            match access {
+                Access::Available => {}
+                Access::Blocked { .. }
+                    if excuse_premium
+                        && *service == Service::YoutubePremium =>
+                {
+                    tally.not_counted.push(format!("{label} (RU expected)"));
+                }
+                Access::Blocked { region: None } => {
+                    tally.blocked.push(label.to_string());
+                }
+                Access::Blocked {
+                    region: Some(region),
+                } => tally.blocked.push(format!("{label} ({region})")),
+                Access::Unrecognized(why) => {
+                    tally.unrecognized.push(format!("{label} ({why})"));
+                }
+                Access::NoAnswer(why) => {
+                    tally.silent.push(format!("{label} ({why})"));
+                }
+            }
+        }
+        tally
+    }
+
+    /// One `title: items` part per non-empty group; the refusals not
+    /// counted come last, as a note.
+    fn parts(&self) -> Vec<String> {
+        [
+            ("blocked", &self.blocked),
+            ("unknown", &self.unrecognized),
+            ("no answer", &self.silent),
+            ("not counted", &self.not_counted),
+        ]
+        .iter()
+        .filter(|(_, items)| !items.is_empty())
+        .map(|(title, items)| format!("{title}: {}", commas(items.iter())))
+        .collect()
+    }
+
+    fn deviates(&self) -> bool {
+        !(self.blocked.is_empty()
+            && self.unrecognized.is_empty()
+            && self.silent.is_empty())
+    }
+}
+
+/// The detail names only the services that deviate, and a refusal that is
+/// not counted.
 fn checked(
     name: String,
     via: &str,
     answers: &[(Service, Access)],
+    excuse_premium: bool,
 ) -> CheckResult {
-    let mut blocked = Vec::new();
-    let mut unrecognized = Vec::new();
-    let mut silent = Vec::new();
-    for (service, access) in answers {
-        let label = service.label();
-        match access {
-            Access::Available => {}
-            Access::Blocked { region: None } => blocked.push(label.to_string()),
-            Access::Blocked {
-                region: Some(region),
-            } => blocked.push(format!("{label} ({region})")),
-            Access::Unrecognized(why) => {
-                unrecognized.push(format!("{label} ({why})"));
-            }
-            Access::NoAnswer(why) => silent.push(format!("{label} ({why})")),
-        }
-    }
-    let groups = [
-        ("blocked", &blocked),
-        ("unknown", &unrecognized),
-        ("no answer", &silent),
-    ];
-    let detail = groups
-        .iter()
-        .filter(|(_, items)| !items.is_empty())
-        .map(|(title, items)| format!("{title}: {}", commas(items.iter())))
-        .collect::<Vec<_>>()
-        .join("; ");
-    if !blocked.is_empty() {
-        CheckResult::fail(name, detail)
-    } else if !detail.is_empty() {
-        CheckResult::warn(name, detail)
+    let tally = Tally::of(answers, excuse_premium);
+    let parts = tally.parts();
+    if !tally.blocked.is_empty() {
+        CheckResult::fail(name, parts.join("; "))
+    } else if tally.deviates() {
+        CheckResult::warn(name, parts.join("; "))
     } else {
         let total = answers.len();
-        CheckResult::ok(name, format!("{total}/{total} available via {via}"))
+        let counted = total - tally.not_counted.len();
+        let summary = format!("{counted}/{total} available via {via}");
+        CheckResult::ok(
+            name,
+            std::iter::once(summary)
+                .chain(parts)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 }
 
@@ -1069,7 +1122,7 @@ mod tests {
     fn every_service_available_names_the_tunnel_it_was_asked_through() {
         let outcome = checked(all_available());
 
-        let result = verdict("de", &outcome);
+        let result = verdict("de", None, &outcome);
 
         assert_eq!(result.name, "node de / services");
         assert_eq!(result.severity, Severity::Ok);
@@ -1085,7 +1138,7 @@ mod tests {
         answers[2].1 = blocked();
         answers[5].1 = Access::Unrecognized(Unread::Challenge);
 
-        let result = verdict("de", &checked(answers));
+        let result = verdict("de", None, &checked(answers));
 
         assert_eq!(result.severity, Severity::Fail);
         assert_eq!(
@@ -1099,10 +1152,57 @@ mod tests {
         let mut answers = all_available();
         answers[8].1 = Access::NoAnswer(Silence::Timeout);
 
-        let result = verdict("de", &checked(answers));
+        let result = verdict("de", None, &checked(answers));
 
         assert_eq!(result.severity, Severity::Warn);
         assert_eq!(result.detail, "no answer: grok (timeout)");
+    }
+
+    /// YouTube refuses Premium in the country an exit is kept in for no
+    /// ads, so with RU expected that refusal is a note, not a failure.
+    #[test]
+    fn a_premium_refusal_is_not_counted_when_ru_is_expected() {
+        let mut answers = all_available();
+        answers[2].1 = blocked();
+
+        let result =
+            verdict("exit-a", Some(CountryCode::RU), &checked(answers));
+
+        assert_eq!(result.severity, Severity::Ok);
+        assert_eq!(
+            result.detail,
+            "9/10 available via de first; not counted: youtube premium (RU expected)"
+        );
+    }
+
+    #[test]
+    fn a_premium_refusal_still_fails_when_another_country_is_expected() {
+        let mut answers = all_available();
+        answers[2].1 = blocked();
+
+        let result =
+            verdict("exit-a", Some("DE".parse().unwrap()), &checked(answers));
+
+        assert_eq!(result.severity, Severity::Fail);
+        assert_eq!(result.detail, "blocked: youtube premium");
+    }
+
+    /// Only Premium is excused: NotebookLM refusing an exit kept in RU is
+    /// still a failure.
+    #[test]
+    fn with_ru_expected_another_refusal_still_fails_the_row() {
+        let mut answers = all_available();
+        answers[1].1 = blocked();
+        answers[2].1 = blocked();
+
+        let result =
+            verdict("exit-a", Some(CountryCode::RU), &checked(answers));
+
+        assert_eq!(result.severity, Severity::Fail);
+        assert_eq!(
+            result.detail,
+            "blocked: notebooklm; not counted: youtube premium (RU expected)"
+        );
     }
 
     #[rstest]
@@ -1121,7 +1221,7 @@ mod tests {
         #[case] outcome: ExitServices,
         #[case] expected: Severity,
     ) {
-        let result = verdict("de", &outcome);
+        let result = verdict("de", None, &outcome);
 
         assert_eq!(result.severity, expected, "{}", result.detail);
     }
