@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Duration;
 
 /// Severity of one check. A run's severity is the maximum over its results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -404,11 +405,41 @@ pub struct TlsFacts {
     pub error: Option<String>,
 }
 
-/// Where a tunnel's traffic came out, plus xray's complaint when it did not.
+/// Where a tunnel's traffic came out, plus xray's complaint when it did not,
+/// and how a download through it went.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeOutcome {
     pub exit_ip: Option<IpAddr>,
     pub stderr_tail: String,
+    pub download: Download,
+}
+
+/// A download through a tunnel that came out somewhere. The echo answer is
+/// a few dozen bytes; this is what shows a path that freezes or throttles a
+/// transfer after its first packets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Download {
+    /// No exit came out, or `--no-download`.
+    #[default]
+    NotRun,
+    Complete {
+        bytes: u64,
+        elapsed: Duration,
+    },
+    /// No byte for the silence bound, or the body broke off. `of` is the
+    /// `Content-Length`, when the server sent one.
+    Stalled {
+        bytes: u64,
+        of: Option<u64>,
+        after: Duration,
+    },
+    /// The whole download outran its time bound while bytes still came.
+    TimedOut {
+        bytes: u64,
+        of: Option<u64>,
+    },
+    /// Neither an answer nor a byte.
+    Failed(String),
 }
 
 /// HTTP status of the two xhttp path forms, or why there was none.

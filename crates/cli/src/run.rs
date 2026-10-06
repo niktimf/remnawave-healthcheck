@@ -452,7 +452,9 @@ mod tests {
     use super::*;
     use crate::test_util::{config, snapshot};
     use remnawave_healthcheck_core::checks::services::Skip;
-    use remnawave_healthcheck_core::model::{GeoFacts, ProbeOutcome, parse_ip};
+    use remnawave_healthcheck_core::model::{
+        Download, GeoFacts, ProbeOutcome, parse_ip,
+    };
 
     #[tokio::test]
     #[should_panic(expected = "boom")]
@@ -471,6 +473,7 @@ mod tests {
                 outcome: ProbeOutcome {
                     exit_ip: parse_ip(exit),
                     stderr_tail: String::new(),
+                    download: Download::NotRun,
                 },
             },
         )])

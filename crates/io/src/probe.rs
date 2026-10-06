@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use backon::{ExponentialBuilder, Retryable};
-use remnawave_healthcheck_core::model::{ProbeOutcome, parse_ip};
+use remnawave_healthcheck_core::model::{Download, ProbeOutcome, parse_ip};
 use serde_json::{Value, json};
 use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -117,6 +117,7 @@ pub async fn probe(
         Err(reason) => ProbeOutcome {
             exit_ip: None,
             stderr_tail: reason,
+            download: Download::NotRun,
         },
     }
 }
@@ -150,6 +151,7 @@ async fn attempt(
     Ok(ProbeOutcome {
         exit_ip,
         stderr_tail,
+        download: Download::NotRun,
     })
 }
 

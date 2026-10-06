@@ -1,8 +1,9 @@
 //! Everything about one channel that is decided without opening a tunnel, and
 //! the verdict once the tunnel has answered.
 
+use super::{KIB, size};
 use crate::model::{
-    Channel, CheckResult, Node, ProbeOutcome, Snapshot, XhttpFacts,
+    Channel, CheckResult, Download, Node, ProbeOutcome, Snapshot, XhttpFacts,
 };
 use crate::topology::Resolver;
 use serde_json::Value;
@@ -52,12 +53,14 @@ pub fn precheck<'a>(channel: &Channel, snapshot: &'a Snapshot) -> Precheck<'a> {
 
 /// Compare where the tunnel came out with where the exit node says it leaves.
 /// An unknown expected address downgrades to WARN: the report never claims a
-/// verification it did not perform.
+/// verification it did not perform. The download is judged only behind a
+/// right exit.
 pub fn classify(
     channel: &Channel,
     expect: &Node,
     expect_ip: Option<IpAddr>,
     outcome: &ProbeOutcome,
+    target: &Target,
 ) -> CheckResult {
     let name = channel.name();
     match (outcome.exit_ip, expect_ip) {
@@ -77,12 +80,108 @@ pub fn classify(
             ),
         ),
         (Some(got), Some(want)) if got == want => {
-            CheckResult::ok(name, format!("exit {got} ({})", expect.name))
+            let exit = format!("exit {got} ({})", expect.name);
+            downloaded(name, exit, &outcome.download, target)
         }
         (Some(got), Some(want)) => CheckResult::fail(
             name,
             format!("wrong exit {got} (want {want} = {})", expect.name),
         ),
+    }
+}
+
+/// Where a freeze on a filtered path stops a TCP transfer: after the first
+/// 16-20 KB, widened for the window sizes either side.
+const FREEZE: std::ops::RangeInclusive<u64> = 14 * KIB..=34 * KIB;
+
+/// A right exit, with what the download through it showed. A failed download
+/// from a target that answered no channel at all says nothing about this
+/// tunnel; the `download target` row names it instead.
+fn downloaded(
+    name: String,
+    exit: String,
+    download: &Download,
+    target: &Target,
+) -> CheckResult {
+    match download {
+        Download::NotRun => CheckResult::ok(name, exit),
+        Download::Failed(_) if target.is_unreachable() => {
+            CheckResult::ok(name, exit)
+        }
+        Download::Complete { bytes, elapsed } => CheckResult::ok(
+            name,
+            format!(
+                "{exit}, {} in {:.1} s",
+                size(*bytes),
+                elapsed.as_secs_f64()
+            ),
+        ),
+        Download::Stalled { bytes, of, .. } => CheckResult::warn(
+            name,
+            format!("exit ok, download stalled at {}", progress(*bytes, *of)),
+        ),
+        Download::TimedOut { bytes, of } => CheckResult::warn(
+            name,
+            format!("exit ok, download timed out at {}", progress(*bytes, *of)),
+        ),
+        Download::Failed(why) => {
+            CheckResult::warn(name, format!("exit ok, download failed: {why}"))
+        }
+    }
+}
+
+/// How far a download got, and whether that is where a freeze stops one.
+fn progress(bytes: u64, of: Option<u64>) -> String {
+    let total = of.map(|of| format!(" of {}", size(of))).unwrap_or_default();
+    let freeze = if FREEZE.contains(&bytes) {
+        " (matches the 16-20 KB freeze)"
+    } else {
+        ""
+    };
+    format!("{}{total}{freeze}", size(bytes))
+}
+
+/// Whether the download target answered at all. Judged over every channel
+/// whose exit was right before any one of them is judged: a target that
+/// answers none of them says nothing about the tunnels, and would otherwise
+/// turn every channel yellow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Answering,
+    /// Every download failed; `first` is the reason the first one gave.
+    Unreachable {
+        first: String,
+    },
+}
+
+impl Target {
+    /// From the downloads of the channels whose exit was right. No download
+    /// at all is no evidence against the target.
+    pub fn of<'a>(downloads: impl IntoIterator<Item = &'a Download>) -> Self {
+        let mut first = None;
+        for download in downloads {
+            let Download::Failed(why) = download else {
+                return Self::Answering;
+            };
+            first.get_or_insert_with(|| why.clone());
+        }
+        first.map_or(Self::Answering, |first| Self::Unreachable { first })
+    }
+
+    pub const fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Unreachable { .. })
+    }
+
+    /// The one row that stands in for every failed download when the target
+    /// itself answered nobody.
+    pub fn verdict(&self, url: &str) -> Option<CheckResult> {
+        match self {
+            Self::Answering => None,
+            Self::Unreachable { first } => Some(CheckResult::warn(
+                "download target",
+                format!("{url} answered no channel: {first}"),
+            )),
+        }
     }
 }
 
@@ -289,6 +388,7 @@ mod tests {
     use rstest::rstest;
     use serde_json::{Value, json};
     use std::collections::HashSet;
+    use std::time::Duration;
 
     fn snapshot(outbound: Value) -> Snapshot {
         let served = if outbound.is_null() {
@@ -549,6 +649,7 @@ mod tests {
         let outcome = ProbeOutcome {
             exit_ip: got.and_then(parse_ip),
             stderr_tail: stderr.into(),
+            download: Download::NotRun,
         };
 
         let result = classify(
@@ -556,11 +657,171 @@ mod tests {
             &s.nodes[0],
             want.and_then(parse_ip),
             &outcome,
+            &Target::Answering,
         );
 
         assert_eq!(result.name, "channel beta direct (beta.example.com:443)");
         assert_eq!(result.severity, expected);
         assert_eq!(result.detail, detail);
+    }
+
+    const MIB: u64 = 1_048_576;
+
+    fn right_exit(download: Download, target: &Target) -> CheckResult {
+        let s = snapshot(json!({"protocol": "vless"}));
+        let outcome = ProbeOutcome {
+            exit_ip: parse_ip("192.0.2.20"),
+            stderr_tail: String::new(),
+            download,
+        };
+        classify(
+            &s.channels[0],
+            &s.nodes[0],
+            parse_ip("192.0.2.20"),
+            &outcome,
+            target,
+        )
+    }
+
+    #[rstest]
+    #[case::complete(
+        Download::Complete { bytes: MIB, elapsed: Duration::from_millis(2400) },
+        Severity::Ok,
+        "exit 192.0.2.20 (beta), 1.0 MB in 2.4 s"
+    )]
+    #[case::not_run(Download::NotRun, Severity::Ok, "exit 192.0.2.20 (beta)")]
+    #[case::stalled_at_the_freeze(
+        Download::Stalled { bytes: 17 * 1024, of: Some(MIB), after: Duration::from_secs(10) },
+        Severity::Warn,
+        "exit ok, download stalled at 17 KB of 1.0 MB (matches the 16-20 KB freeze)"
+    )]
+    #[case::stalled_past_the_freeze(
+        Download::Stalled { bytes: 300 * 1024, of: Some(MIB), after: Duration::from_secs(12) },
+        Severity::Warn,
+        "exit ok, download stalled at 300 KB of 1.0 MB"
+    )]
+    #[case::stalled_without_a_length(
+        Download::Stalled { bytes: 17 * 1024, of: None, after: Duration::from_secs(10) },
+        Severity::Warn,
+        "exit ok, download stalled at 17 KB (matches the 16-20 KB freeze)"
+    )]
+    #[case::timed_out(
+        Download::TimedOut { bytes: 600 * 1024, of: Some(MIB) },
+        Severity::Warn,
+        "exit ok, download timed out at 600 KB of 1.0 MB"
+    )]
+    #[case::failed(
+        Download::Failed("HTTP 503".into()),
+        Severity::Warn,
+        "exit ok, download failed: HTTP 503"
+    )]
+    fn a_right_exit_is_judged_by_its_download(
+        #[case] download: Download,
+        #[case] expected: Severity,
+        #[case] detail: &str,
+    ) {
+        let result = right_exit(download, &Target::Answering);
+
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (expected, detail)
+        );
+    }
+
+    #[test]
+    fn a_failed_download_from_an_unreachable_target_leaves_the_exit_ok() {
+        let target = Target::Unreachable {
+            first: "HTTP 503".into(),
+        };
+
+        let result = right_exit(Download::Failed("HTTP 503".into()), &target);
+
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (Severity::Ok, "exit 192.0.2.20 (beta)")
+        );
+    }
+
+    /// A wrong exit fails on its own; how the download went behind it is
+    /// not evidence about the channel that was meant.
+    #[test]
+    fn a_wrong_exit_is_not_judged_by_its_download() {
+        let s = snapshot(json!({"protocol": "vless"}));
+        let outcome = ProbeOutcome {
+            exit_ip: parse_ip("203.0.113.7"),
+            stderr_tail: String::new(),
+            download: Download::Stalled {
+                bytes: 17 * 1024,
+                of: None,
+                after: Duration::from_secs(10),
+            },
+        };
+
+        let result = classify(
+            &s.channels[0],
+            &s.nodes[0],
+            parse_ip("192.0.2.20"),
+            &outcome,
+            &Target::Answering,
+        );
+
+        assert_eq!(
+            result.detail,
+            "wrong exit 203.0.113.7 (want 192.0.2.20 = beta)"
+        );
+    }
+
+    #[test]
+    fn a_target_every_channel_failed_to_download_is_unreachable() {
+        let downloads = [
+            Download::Failed("connection refused".into()),
+            Download::Failed("timeout".into()),
+        ];
+
+        let target = Target::of(&downloads);
+
+        assert_eq!(
+            target,
+            Target::Unreachable {
+                first: "connection refused".into()
+            }
+        );
+        assert_eq!(
+            target
+                .verdict("https://dl.example.com/1m")
+                .map(|r| (r.name, r.severity, r.detail)),
+            Some((
+                "download target".to_string(),
+                Severity::Warn,
+                "https://dl.example.com/1m answered no channel: connection refused"
+                    .to_string()
+            ))
+        );
+    }
+
+    /// One channel downloading is proof the target answers: the channels
+    /// that failed are each a finding of their own.
+    #[test]
+    fn a_target_that_answered_some_channels_is_answering() {
+        let downloads = [
+            Download::Failed("connection reset".into()),
+            Download::Complete {
+                bytes: MIB,
+                elapsed: Duration::from_secs(2),
+            },
+        ];
+
+        let target = Target::of(&downloads);
+
+        assert_eq!(target, Target::Answering);
+        assert_eq!(target.verdict("https://dl.example.com/1m"), None);
+    }
+
+    #[test]
+    fn no_download_at_all_is_no_evidence_against_the_target() {
+        let target = Target::of(&[Download::NotRun]);
+
+        assert_eq!(target, Target::Answering);
     }
 
     /// A snapshot whose exit inbound declares an xhttp path.

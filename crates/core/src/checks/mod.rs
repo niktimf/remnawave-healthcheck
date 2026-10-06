@@ -18,6 +18,24 @@ pub(crate) fn commas(
         .join(", ")
 }
 
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+const GIB: u64 = 1024 * MIB;
+
+/// A byte count as a person reads it: whole KB below a megabyte, MB to one
+/// decimal, whole GB.
+// Shown to one decimal at most, far inside what an f64 holds exactly.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn size(bytes: u64) -> String {
+    if bytes < MIB {
+        format!("{} KB", bytes / KIB)
+    } else if bytes < GIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{:.0} GB", bytes as f64 / GIB as f64)
+    }
+}
+
 /// A verdict without a name. Checks that share one context produce these, and
 /// the context names them in one place — so an aspect is spelled once rather
 /// than at every return point inside a check.
@@ -44,6 +62,25 @@ impl Verdict {
 
     pub fn fail(detail: impl Into<String>) -> Self {
         Self::new(Severity::Fail, detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::kilobytes(17 * 1024, "17 KB")]
+    #[case::megabyte(1_048_576, "1.0 MB")]
+    #[case::gigabytes(42 * 1024 * 1024 * 1024, "42 GB")]
+    fn a_size_is_shown_in_the_unit_that_fits(
+        #[case] bytes: u64,
+        #[case] expected: &str,
+    ) {
+        let shown = size(bytes);
+
+        assert_eq!(shown, expected);
     }
 }
 

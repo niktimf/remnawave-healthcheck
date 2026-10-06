@@ -2,7 +2,7 @@
 //! whole module is a function of the snapshot and what the families gathered.
 
 use chrono::{DateTime, Utc};
-use remnawave_healthcheck_core::checks::channel::{self, Liveness};
+use remnawave_healthcheck_core::checks::channel::{self, Liveness, Target};
 use remnawave_healthcheck_core::checks::geo::GeoChecker;
 use remnawave_healthcheck_core::checks::panel::{
     self as panel_checks, PanelChecker,
@@ -155,6 +155,7 @@ fn channels(
 ) -> Vec<CheckResult> {
     let alive = alive_channels(&probes);
     let liveness = alive.as_ref().map_or(Liveness::NotRun, Liveness::Alive);
+    let target = download_target(&probes, egress);
     let selectors = snapshot
         .channels
         .iter()
@@ -165,7 +166,9 @@ fn channels(
         ProbeStage::SetupFailed(detail) => vec![channel::setup_failed(detail)],
         ProbeStage::Done(list) => list
             .into_iter()
-            .map(|(idx, result)| channel_verdict(snapshot, idx, result, egress))
+            .map(|(idx, result)| {
+                channel_verdict(snapshot, idx, result, egress, &target)
+            })
             .collect(),
     };
     tunnels.into_iter().chain(selectors).collect()
@@ -197,6 +200,26 @@ fn alive_channels(probes: &ProbeStage) -> Option<HashSet<usize>> {
     tunnel_exits(probes).map(|exits| exits.into_keys().collect())
 }
 
+/// The download target, judged over the channels whose exit was right:
+/// only their downloads could have reached it.
+fn download_target(
+    probes: &ProbeStage,
+    egress: &HashMap<&str, IpAddr>,
+) -> Target {
+    let ProbeStage::Done(list) = probes else {
+        return Target::Answering;
+    };
+    Target::of(list.iter().filter_map(|(_, result)| match result {
+        ProbeResult::Probed { expect, outcome }
+            if outcome.exit_ip.is_some()
+                && outcome.exit_ip == egress.get(expect.as_str()).copied() =>
+        {
+            Some(&outcome.download)
+        }
+        ProbeResult::Probed { .. } | ProbeResult::Decided(_) => None,
+    }))
+}
+
 /// The exit a tunnel came out of, against the egress its expected node was
 /// seen at.
 fn channel_verdict(
@@ -204,6 +227,7 @@ fn channel_verdict(
     idx: usize,
     result: ProbeResult,
     egress: &HashMap<&str, IpAddr>,
+    target: &Target,
 ) -> CheckResult {
     match result {
         ProbeResult::Decided(decided) => decided,
@@ -214,7 +238,13 @@ fn channel_verdict(
                 .find(|n| n.name == expect)
                 .expect("the expected exit came out of this snapshot");
             let want = egress.get(expect.as_str()).copied();
-            channel::classify(&snapshot.channels[idx], node, want, &outcome)
+            channel::classify(
+                &snapshot.channels[idx],
+                node,
+                want,
+                &outcome,
+                target,
+            )
         }
     }
 }
@@ -241,7 +271,7 @@ mod tests {
     use super::*;
     use crate::test_util::{by_name, judge, snapshot};
     use remnawave_healthcheck_core::model::{
-        GeoFacts, HostFacts, Served, Severity, parse_ip,
+        Download, GeoFacts, HostFacts, Served, Severity, parse_ip,
     };
     use remnawave_healthcheck_core::report::{Outcome, Report};
     use serde_json::json;
@@ -272,6 +302,7 @@ mod tests {
                 outcome: ProbeOutcome {
                     exit_ip: parse_ip(exit),
                     stderr_tail: String::new(),
+                    download: Download::NotRun,
                 },
             },
         )])
