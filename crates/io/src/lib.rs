@@ -8,6 +8,7 @@ pub mod services;
 pub mod ssh;
 pub mod tls;
 pub mod upstream;
+pub mod usage;
 pub mod xhttp;
 
 #[cfg(test)]

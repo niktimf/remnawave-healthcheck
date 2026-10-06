@@ -256,6 +256,27 @@ impl PanelClient {
             .response)
     }
 
+    /// A POST that only reads: the panel takes some filters in the body. It
+    /// changes nothing, so it is retried like a GET, 5xx included.
+    pub(crate) async fn post_read<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T> {
+        let url = self.url(path);
+        let text = Self::with_retries("POST", || async {
+            let resp = self
+                .apply(self.http.post(&url).json(body), Auth::Token)
+                .send()
+                .await;
+            Self::finish(&url, resp).await
+        })
+        .await?;
+        Ok(serde_json::from_str::<Envelope<T>>(&text)
+            .with_context(|| format!("parsing the response of {path}"))?
+            .response)
+    }
+
     /// Everything one run needs, in six requests.
     pub async fn snapshot(&self, user_id: u64) -> Result<Snapshot> {
         let user: UserDto = self
@@ -506,7 +527,7 @@ struct MetadataDto {
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn to_u64(n: f64) -> u64 {
+pub(crate) fn to_u64(n: f64) -> u64 {
     if n.is_finite() && n > 0.0 {
         n as u64
     } else {
