@@ -63,6 +63,15 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
   refuse it). That line is always OK. `--no-services` switches the
   stage off and keeps the rows, marked as disabled;
   `REMNAWAVE_SERVICE_TIMEOUT_SECS` bounds each request (15 s).
+- **YouTube country per exit** — the same tunnel then asks the YouTube home
+  page which country it serves the exit's content for (`countryCode`, or
+  `INNERTUBE_CONTEXT_GL` where the page lacks it): one `youtube country` row
+  per exit. `REMNAWAVE_EXPECTED_YOUTUBE` (`node-a=RU,node-b=RU`, node names
+  as the panel shows them) sets the country an exit should stay in, and any
+  other country warns. YouTube refuses Premium in RU, so for an exit
+  expected in RU that refusal is listed under `not counted` and leaves the
+  `services` row alone. A malformed list is a configuration error (exit code
+  2).
 - **Auto-select entries** — a host whose XRAY-JSON template injects other hosts (`remnawave.
   injectHosts`) is served a balancer instead of an outbound of its own, so it has no exit to compare
   and its address is a placeholder. It is checked as what it is: the injector must have selected

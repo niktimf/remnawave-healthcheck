@@ -2,11 +2,12 @@
 //! variable; `--help` prints the whole table with defaults.
 
 use crate::judge::Judge;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use remnawave_healthcheck_core::checks::geo::GeoChecker;
 use remnawave_healthcheck_core::checks::panel::PanelChecker;
 use remnawave_healthcheck_core::checks::ssh::SshChecker;
+use remnawave_healthcheck_core::checks::youtube::ExpectedYoutube;
 use remnawave_healthcheck_io::{Hwid, SshConfig};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -122,6 +123,11 @@ pub struct Args {
     /// Skip xhttp path probes
     #[arg(long, env = "REMNAWAVE_NO_XHTTP")]
     pub no_xhttp: bool,
+    /// Country YouTube should place each exit in: `<node>=<code>` pairs
+    /// separated by commas, node names as the panel shows them. With RU
+    /// expected, a YouTube Premium refusal is not counted
+    #[arg(long, env = "REMNAWAVE_EXPECTED_YOUTUBE", default_value = "")]
+    pub expected_youtube: String,
     /// Skip asking AI services and YouTube Premium through a tunnel per exit
     #[arg(long, env = "REMNAWAVE_NO_SERVICES")]
     pub no_services: bool,
@@ -200,6 +206,10 @@ impl Config {
             os_version: args.device_os_version.clone(),
             model: args.device_model.clone(),
         });
+        let expected_youtube = args
+            .expected_youtube
+            .parse::<ExpectedYoutube>()
+            .context("REMNAWAVE_EXPECTED_YOUTUBE")?;
         let ssh_private_key = non_empty(args.ssh_private_key);
         // An explicit key without a user means a bare CI runner: root is the
         // only sensible login. Neither set -> ssh's own config decides.
@@ -248,6 +258,7 @@ impl Config {
                     acme_dir: args.acme_dir,
                 },
                 cert_warn_days: args.cert_warn_days,
+                expected_youtube,
             },
             no_ssh: args.no_ssh,
             no_channels: args.no_channels,
@@ -353,6 +364,30 @@ mod tests {
             (hwid.hwid.as_str(), hwid.os.as_str(), hwid.model.as_str()),
             ("dev-1", "linux", "phone")
         );
+    }
+
+    /// A malformed list stops the run before it starts (exit code 2), and
+    /// the message names the variable to fix.
+    #[test]
+    fn a_malformed_youtube_expectation_is_refused_by_name() {
+        let args = args(&["--expected-youtube", "node-a=RUS"]);
+
+        let err = Config::from_args(args).unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            "REMNAWAVE_EXPECTED_YOUTUBE: 'node-a=RUS': 'RUS' is not a two-letter country code"
+        );
+    }
+
+    #[test]
+    fn a_youtube_expectation_reaches_the_judge() {
+        let args = args(&["--expected-youtube", "node-a=ru"]);
+
+        let config = Config::from_args(args).unwrap();
+
+        let expected = config.judge.expected_youtube.get("node-a");
+        assert_eq!(expected.map(|c| c.to_string()), Some("RU".to_string()));
     }
 
     fn github_env(k: &str) -> Option<String> {

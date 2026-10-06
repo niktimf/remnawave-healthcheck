@@ -8,6 +8,7 @@ use super::services::{
     Unread, is_challenge,
 };
 use crate::model::{CheckResult, node_check};
+use std::collections::BTreeMap;
 
 /// A browser's headers plus `SOCS=CAI`, which declines the cookie-consent
 /// interstitial YouTube puts in front of the page for addresses it places in
@@ -62,6 +63,54 @@ impl std::str::FromStr for CountryCode {
 impl std::fmt::Display for CountryCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.pad(self.as_str())
+    }
+}
+
+/// The country YouTube is expected to place each exit in, by node name as
+/// the panel shows it. Written `node-a=RU,node-b=RU`; empty expects
+/// nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExpectedYoutube(BTreeMap<String, CountryCode>);
+
+impl ExpectedYoutube {
+    pub fn get(&self, node: &str) -> Option<CountryCode> {
+        self.0.get(node).copied()
+    }
+}
+
+/// Why a list of expectations was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExpectationError {
+    #[error("'{0}' is not <node name>=<country code>")]
+    NotAPair(String),
+    #[error("'{entry}': {why}")]
+    BadCountry { entry: String, why: NotACountry },
+    /// Two codes for one node: whichever won would be a silent choice.
+    #[error("node '{0}' is given more than once")]
+    Repeated(String),
+}
+
+impl std::str::FromStr for ExpectedYoutube {
+    type Err = ExpectationError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let mut expected = BTreeMap::new();
+        for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (node, code) = entry
+                .split_once('=')
+                .map(|(node, code)| (node.trim(), code.trim()))
+                .filter(|(node, _)| !node.is_empty())
+                .ok_or_else(|| ExpectationError::NotAPair(entry.to_string()))?;
+            let code =
+                code.parse().map_err(|why| ExpectationError::BadCountry {
+                    entry: entry.to_string(),
+                    why,
+                })?;
+            if expected.insert(node.to_string(), code).is_some() {
+                return Err(ExpectationError::Repeated(node.to_string()));
+            }
+        }
+        Ok(Self(expected))
     }
 }
 
@@ -218,6 +267,43 @@ mod tests {
 
         let got = parsed.as_ref().map(CountryCode::as_str).map_err(|_| ());
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn expectations_are_read_by_node_name() {
+        let sut: ExpectedYoutube = " node-a=RU, node-b = nl ,".parse().unwrap();
+
+        let got = (sut.get("node-a"), sut.get("node-b"), sut.get("node-c"));
+
+        assert_eq!(got, (Some(CountryCode::RU), Some(code("NL")), None));
+    }
+
+    #[test]
+    fn an_empty_value_expects_nothing() {
+        let parsed = "".parse::<ExpectedYoutube>();
+
+        assert_eq!(parsed, Ok(ExpectedYoutube::default()));
+    }
+
+    #[rstest]
+    #[case::no_equals("node-a", "'node-a' is not <node name>=<country code>")]
+    #[case::no_name("=RU", "'=RU' is not <node name>=<country code>")]
+    #[case::three_letters(
+        "node-a=RUS",
+        "'node-a=RUS': 'RUS' is not a two-letter country code"
+    )]
+    #[case::repeated(
+        "node-a=RU,node-a=DE",
+        "node 'node-a' is given more than once"
+    )]
+    fn a_malformed_expectation_is_refused_by_entry(
+        #[case] text: &str,
+        #[case] message: &str,
+    ) {
+        let parsed = text.parse::<ExpectedYoutube>();
+
+        let err = parsed.unwrap_err();
+        assert_eq!(err.to_string(), message);
     }
 
     fn asked(youtube: Country) -> ExitServices {

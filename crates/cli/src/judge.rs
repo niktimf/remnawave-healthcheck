@@ -9,7 +9,8 @@ use remnawave_healthcheck_core::checks::panel::{
 };
 use remnawave_healthcheck_core::checks::services::{self, ExitServices};
 use remnawave_healthcheck_core::checks::ssh::{self, SshChecker};
-use remnawave_healthcheck_core::checks::{tls, youtube};
+use remnawave_healthcheck_core::checks::tls;
+use remnawave_healthcheck_core::checks::youtube::{self, ExpectedYoutube};
 use remnawave_healthcheck_core::model::{
     CheckResult, GeoOutcome, ProbeOutcome, Reported, Snapshot, SshOutcome,
     TlsFacts, XhttpFacts,
@@ -74,13 +75,14 @@ fn done_egress(outcome: &GeoOutcome) -> Option<IpAddr> {
 
 /// Everything needed to turn facts into verdicts, and nothing else. `Config`
 /// carries two dozen settings — panel URL, tokens, timeouts, Telegram — of
-/// which exactly these four decide a verdict.
+/// which exactly these decide a verdict.
 #[derive(Debug, Clone)]
 pub struct Judge {
     pub panel: PanelChecker,
     pub geo: GeoChecker,
     pub ssh: SshChecker,
     pub cert_warn_days: u32,
+    pub expected_youtube: ExpectedYoutube,
 }
 
 impl Judge {
@@ -105,8 +107,9 @@ impl Judge {
         }));
         results.extend(channels(snapshot, c.probes, &egress));
         for (exit, outcome) in &c.services {
-            results.push(services::verdict(exit, None, outcome));
-            results.push(youtube::verdict(exit, None, outcome));
+            let expected = self.expected_youtube.get(exit);
+            results.push(services::verdict(exit, expected, outcome));
+            results.push(youtube::verdict(exit, expected, outcome));
         }
         results
     }
@@ -503,6 +506,58 @@ mod tests {
         assert_eq!(row.severity, Severity::Fail);
         assert_eq!(row.detail, "blocked: gemini (RUS)");
         assert_eq!(Report::of(&results).outcome(), Outcome::Failed);
+    }
+
+    /// An exit kept in RU for YouTube: the country row confirms it, and the
+    /// Premium refusal that follows from it does not fail the run.
+    #[test]
+    fn an_exit_expected_in_ru_reports_the_country_and_passes_premium() {
+        use crate::config::Config;
+        use crate::test_util::args;
+        use remnawave_healthcheck_core::checks::services::{
+            Access, Answers, Service,
+        };
+        use remnawave_healthcheck_core::checks::youtube::{
+            Country, CountryCode,
+        };
+        let s = snapshot();
+        let collected = Collected {
+            geo: HashMap::new(),
+            ssh: SshStage::Skipped,
+            tls: vec![],
+            xhttp: vec![],
+            probes: ProbeStage::Skipped,
+            upstream: Reported::NotRead,
+            services: vec![(
+                "beta".to_string(),
+                ExitServices::Checked {
+                    via: "beta direct".into(),
+                    answers: Answers {
+                        services: vec![(
+                            Service::YoutubePremium,
+                            Access::Blocked { region: None },
+                        )],
+                        youtube: Country::Seen(CountryCode::RU),
+                    },
+                },
+            )],
+        };
+        let sut = Config::from_args(args(&["--expected-youtube", "beta=RU"]))
+            .unwrap()
+            .judge;
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        let country = by_name(&results, "node beta / youtube country");
+        assert_eq!(
+            (country.severity, country.detail.as_str()),
+            (Severity::Ok, "YouTube sees RU (expected)")
+        );
+        assert_eq!(
+            by_name(&results, "node beta / services").severity,
+            Severity::Ok
+        );
+        assert_eq!(Report::of(&results).outcome(), Outcome::Ok);
     }
 
     /// Without geocheck there is no address to compare the tunnel's exit
