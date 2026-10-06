@@ -90,4 +90,5 @@ pub mod panel;
 pub mod services;
 pub mod ssh;
 pub mod tls;
+pub mod usage;
 pub mod youtube;
