@@ -3,15 +3,17 @@
 //! that failure is the fact reported.
 
 use chrono::{DateTime, Utc};
-use remnawave_healthcheck_core::model::TlsFacts;
+use remnawave_healthcheck_core::model::{Endpoint, TlsFacts};
 use rustls::pki_types::ServerName;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-pub async fn inspect(host: &str, port: u16, timeout: Duration) -> TlsFacts {
-    match tokio::time::timeout(timeout, handshake(host, port)).await {
+/// Connects to the endpoint's host and presents its name, the edge's own on a
+/// fronted channel.
+pub async fn inspect(endpoint: &Endpoint, timeout: Duration) -> TlsFacts {
+    match tokio::time::timeout(timeout, handshake(endpoint)).await {
         Err(_) => TlsFacts {
             not_after: None,
             error: Some(format!("timeout after {}s", timeout.as_secs())),
@@ -28,10 +30,9 @@ pub async fn inspect(host: &str, port: u16, timeout: Duration) -> TlsFacts {
 }
 
 async fn handshake(
-    host: &str,
-    port: u16,
+    endpoint: &Endpoint,
 ) -> Result<Option<DateTime<Utc>>, String> {
-    let tcp = TcpStream::connect((host, port))
+    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
         .await
         .map_err(|e| e.to_string())?;
     let mut roots = rustls::RootCertStore::empty();
@@ -43,8 +44,8 @@ async fn handshake(
     .map_err(|e| e.to_string())?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    let name =
-        ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
+    let name = ServerName::try_from(endpoint.presented_name().to_string())
+        .map_err(|e| e.to_string())?;
     let stream = TlsConnector::from(Arc::new(config))
         .connect(name, tcp)
         .await
@@ -90,7 +91,13 @@ mod tests {
             .unwrap()
             .port();
 
-        let facts = inspect("127.0.0.1", port, Duration::from_secs(2)).await;
+        let endpoint = Endpoint {
+            host: "127.0.0.1".into(),
+            port,
+            server_name: None,
+        };
+
+        let facts = inspect(&endpoint, Duration::from_secs(2)).await;
 
         assert!(facts.not_after.is_none());
         assert!(facts.error.is_some(), "{facts:?}");
@@ -99,7 +106,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs the network"]
     async fn a_public_host_presents_a_certificate_with_an_expiry() {
-        let facts = inspect("example.com", 443, Duration::from_secs(10)).await;
+        let endpoint = Endpoint {
+            host: "example.com".into(),
+            port: 443,
+            server_name: None,
+        };
+
+        let facts = inspect(&endpoint, Duration::from_secs(10)).await;
 
         assert!(facts.error.is_none(), "{facts:?}");
         assert!(facts.not_after.unwrap() > Utc::now());

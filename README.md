@@ -43,8 +43,11 @@ do its job (bad configuration, unreadable panel, undelivered Telegram message).
   from the panel; these checks read the `schema: 1` of
   [remnawave/geocheck](https://github.com/remnawave/geocheck) v0.3.0 and say so when a node
   answers with anything else.
-- **From the runner** — TLS certificates of the panel and of the subscription host; both path forms of
-  every xhttp inbound answer `400` (guards xray #6307).
+- **From the runner** — TLS certificates of the panel, of the subscription host and of every served
+  TLS channel, each checked once per address, port and presented name. A fronted channel presents
+  the edge's name, so the certificate checked is the edge's: when it expires, the channel goes down
+  while every certificate of the installation is still valid. Both path forms of every xhttp
+  inbound answer `400` (guards xray #6307).
 - **Over SSH** (only what the API cannot tell) — containers running and healthy, inbound ports actually
   listening on a public address, node certificate expiry, and whether acme.sh renewal still works. A node
   that refuses SSH is one warning, not a wall of red.

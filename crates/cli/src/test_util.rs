@@ -92,10 +92,12 @@ pub(crate) fn snapshot() -> Snapshot {
         panel: Endpoint {
             host: "panel.example.com".into(),
             port: 443,
+            server_name: None,
         },
         sub: Some(Endpoint {
             host: "sub.example.com".into(),
             port: 443,
+            server_name: None,
         }),
         ..Default::default()
     }

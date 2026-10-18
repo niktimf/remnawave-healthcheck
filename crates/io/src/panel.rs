@@ -151,6 +151,7 @@ impl PanelClient {
         Endpoint {
             host: self.base.host_str().unwrap_or_default().to_string(),
             port: self.base.port_or_known_default().unwrap_or(HTTPS_PORT),
+            server_name: None,
         }
     }
 
@@ -487,6 +488,8 @@ struct ResolvedDto {
     port: u16,
     #[serde(default)]
     transport: Option<String>,
+    #[serde(default)]
+    security: Option<String>,
     /// `ResolvedProxyConfigSchema` is an intersection of four schemas, and only
     /// the shared fields sit at the top level: `path` and `host` belong to the
     /// transport, `serverName` to the security. Reading them one level too high
@@ -633,6 +636,7 @@ fn channel_of(r: ResolvedDto, served: Served) -> Channel {
         .filter(|s| !s.is_empty());
     Channel {
         served,
+        security: r.security.filter(|s| !s.is_empty()),
         sni: server_name,
         host: transport.host.filter(|s| !s.is_empty()),
         remark: r.final_remark,
@@ -743,6 +747,7 @@ fn endpoint_of(url: &str) -> Option<Endpoint> {
     Some(Endpoint {
         host: url.host_str()?.to_string(),
         port: url.port_or_known_default().unwrap_or(HTTPS_PORT),
+        server_name: None,
     })
 }
 
@@ -1092,6 +1097,19 @@ mod tests {
         let snapshot = sut.snapshot(42).await.unwrap();
 
         assert_eq!(snapshot.channels[0].sni, None);
+    }
+
+    /// Reality answers with someone else's certificate, so which security a
+    /// channel uses decides whether its certificate is ours to check.
+    #[tokio::test]
+    async fn a_channel_carries_the_security_the_panel_resolved() {
+        let server = MockServer::start().await;
+        mount_all(&server, rendered_fixture()).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert_eq!(snapshot.channels[0].security.as_deref(), Some("tls"));
     }
 
     #[tokio::test]

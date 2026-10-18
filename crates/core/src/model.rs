@@ -103,17 +103,31 @@ pub const HTTPS_PORT: u16 = 443;
 pub struct Endpoint {
     pub host: String,
     pub port: u16,
+    /// The name presented in the handshake when it is not `host`. A fronted
+    /// channel connects to its own address and presents the edge's name, and
+    /// the certificate that answers is the edge's.
+    pub server_name: Option<String>,
 }
 
 impl Endpoint {
     /// What the check is named after: the bare host on the standard port, and
-    /// `host:port` anywhere else, so two endpoints never share a row.
+    /// `host:port` anywhere else, so two endpoints never share a row. A
+    /// presented name of its own goes first, `name via host`.
     pub fn label(&self) -> String {
-        if self.port == HTTPS_PORT {
+        let at = if self.port == HTTPS_PORT {
             self.host.clone()
         } else {
             format!("{}:{}", self.host, self.port)
+        };
+        match &self.server_name {
+            Some(name) => format!("{name} via {at}"),
+            None => at,
         }
+    }
+
+    /// The name the handshake presents.
+    pub fn presented_name(&self) -> &str {
+        self.server_name.as_deref().unwrap_or(&self.host)
     }
 }
 
@@ -205,6 +219,8 @@ pub struct Channel {
     pub transport: Option<String>,
     /// xhttp/ws path, when the transport has one.
     pub path: Option<String>,
+    /// Security as `/raw` names it (`tls`, `reality`, `none`).
+    pub security: Option<String>,
     /// TLS name to present when probing the inbound directly
     /// (`securityOptions.serverName`).
     pub sni: Option<String>,
@@ -282,6 +298,24 @@ impl Channel {
         self.transport
             .as_deref()
             .is_some_and(|t| t.eq_ignore_ascii_case("xhttp"))
+    }
+
+    /// Where a client's handshake for this channel lands and the name it
+    /// presents there, for a plain-TLS channel only: Reality answers with
+    /// someone else's certificate, so its expiry is not ours to report.
+    pub fn tls_endpoint(&self) -> Option<Endpoint> {
+        let tls = self
+            .security
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("tls"));
+        if !tls {
+            return None;
+        }
+        Some(Endpoint {
+            host: self.address.clone(),
+            port: self.port,
+            server_name: self.sni.clone().filter(|name| *name != self.address),
+        })
     }
 }
 
@@ -575,6 +609,69 @@ mod tests {
         let name = sut.name();
 
         assert_eq!(name, "channel beta direct (beta.example.com:8443)");
+    }
+
+    fn tls_channel(sni: &str) -> Channel {
+        Channel {
+            security: Some("tls".into()),
+            sni: Some(sni.into()),
+            ..channel()
+        }
+    }
+
+    #[test]
+    fn a_fronted_endpoint_is_named_after_the_presented_name_and_its_address() {
+        let sut = Endpoint {
+            host: "front.example.com".into(),
+            port: HTTPS_PORT,
+            server_name: Some("edge.example.net".into()),
+        };
+
+        let label = sut.label();
+
+        assert_eq!(label, "edge.example.net via front.example.com");
+    }
+
+    #[test]
+    fn a_tls_channel_is_checked_where_it_connects_under_the_name_it_presents() {
+        let sut = tls_channel("edge.example.net");
+
+        let endpoint = sut.tls_endpoint();
+
+        assert_eq!(
+            endpoint,
+            Some(Endpoint {
+                host: "beta.example.com".into(),
+                port: 8443,
+                server_name: Some("edge.example.net".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_channel_presenting_its_own_address_carries_no_separate_name() {
+        let sut = tls_channel("beta.example.com");
+
+        let endpoint = sut.tls_endpoint();
+
+        assert_eq!(endpoint.map(|e| e.server_name), Some(None));
+    }
+
+    #[rstest]
+    #[case::reality(Some("reality"))]
+    #[case::plain(Some("none"))]
+    #[case::unknown(None)]
+    fn a_channel_without_plain_tls_has_no_certificate_to_check(
+        #[case] security: Option<&str>,
+    ) {
+        let sut = Channel {
+            security: security.map(String::from),
+            ..tls_channel("edge.example.net")
+        };
+
+        let endpoint = sut.tls_endpoint();
+
+        assert_eq!(endpoint, None);
     }
 
     #[test]

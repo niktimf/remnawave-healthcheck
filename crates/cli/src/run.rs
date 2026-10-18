@@ -183,14 +183,11 @@ async fn tls_all(
     snapshot: &Snapshot,
     config: &Config,
 ) -> Vec<(String, TlsFacts)> {
-    let endpoints =
-        std::iter::once(snapshot.panel.clone()).chain(snapshot.sub.clone());
     let mut set = JoinSet::new();
-    for endpoint in endpoints {
+    for endpoint in checks::tls::endpoints(snapshot) {
         let timeout = config.tls_timeout;
         set.spawn(async move {
-            let facts =
-                tls::inspect(&endpoint.host, endpoint.port, timeout).await;
+            let facts = tls::inspect(&endpoint, timeout).await;
             let label = endpoint.label();
             info!(%label, ?facts, "tls");
             (label, facts)

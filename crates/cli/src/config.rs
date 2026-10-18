@@ -98,7 +98,7 @@ pub struct Args {
     /// Directory acme.sh keeps its per-domain configuration in
     #[arg(long, env = "REMNAWAVE_ACME_DIR", default_value = "/root/.acme.sh")]
     pub acme_dir: String,
-    /// Warn this many days before a certificate expires (nodes, panel, subscription host)
+    /// Warn this many days before a certificate expires (nodes, panel, subscription host, TLS channels)
     #[arg(long, env = "REMNAWAVE_CERT_WARN_DAYS", default_value_t = 14)]
     pub cert_warn_days: u32,
     /// Warn when xray has run this many days without a config push

@@ -1,7 +1,29 @@
 //! Verdict on one endpoint's certificate, from a handshake `io::tls` performed.
 
-use crate::model::{CheckResult, TlsFacts};
+use crate::model::{CheckResult, Endpoint, Snapshot, TlsFacts};
 use chrono::{DateTime, Utc};
+
+/// Every endpoint whose certificate is checked: the panel, the subscription,
+/// and each distinct handshake a served TLS channel makes. A fronted channel
+/// presents the edge's name, and when that certificate expires the channel
+/// goes down while every certificate of ours is still valid.
+pub fn endpoints(snapshot: &Snapshot) -> Vec<Endpoint> {
+    let channels = snapshot
+        .channels
+        .iter()
+        .filter(|channel| channel.served.outbound().is_some())
+        .filter_map(crate::model::Channel::tls_endpoint);
+    let mut checked: Vec<Endpoint> = Vec::new();
+    for endpoint in std::iter::once(snapshot.panel.clone())
+        .chain(snapshot.sub.clone())
+        .chain(channels)
+    {
+        if !checked.contains(&endpoint) {
+            checked.push(endpoint);
+        }
+    }
+    checked
+}
 
 pub fn check(
     host: &str,
@@ -34,9 +56,10 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Severity;
+    use crate::model::{Channel, Served, Severity, Snapshot};
     use chrono::TimeZone;
     use rstest::rstest;
+    use serde_json::json;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap()
@@ -47,6 +70,72 @@ mod tests {
             not_after: days_from_now.map(|d| now() + chrono::Duration::days(d)),
             error: error.map(String::from),
         }
+    }
+
+    fn panel() -> Endpoint {
+        Endpoint {
+            host: "panel.example.com".into(),
+            port: 443,
+            server_name: None,
+        }
+    }
+
+    fn fronted(address: &str, served: Served) -> Channel {
+        Channel {
+            address: address.into(),
+            port: 443,
+            security: Some("tls".into()),
+            sni: Some("edge.example.net".into()),
+            served,
+            ..Default::default()
+        }
+    }
+
+    fn outbound() -> Served {
+        Served::Direct(json!({"protocol": "vless"}))
+    }
+
+    #[test]
+    fn channels_sharing_one_front_are_checked_once_after_the_panel() {
+        let snapshot = Snapshot {
+            panel: panel(),
+            channels: vec![
+                fronted("front.example.com", outbound()),
+                fronted("front.example.com", outbound()),
+            ],
+            ..Default::default()
+        };
+
+        let checked = endpoints(&snapshot);
+
+        assert_eq!(
+            checked,
+            vec![
+                panel(),
+                Endpoint {
+                    host: "front.example.com".into(),
+                    port: 443,
+                    server_name: Some("edge.example.net".into()),
+                },
+            ]
+        );
+    }
+
+    /// A selector's `address:port` is a placeholder no node listens on.
+    #[test]
+    fn a_selector_is_not_checked() {
+        let snapshot = Snapshot {
+            panel: panel(),
+            channels: vec![fronted(
+                "auto.example.com",
+                Served::Selector(vec![]),
+            )],
+            ..Default::default()
+        };
+
+        let checked = endpoints(&snapshot);
+
+        assert_eq!(checked, vec![panel()]);
     }
 
     #[rstest]
