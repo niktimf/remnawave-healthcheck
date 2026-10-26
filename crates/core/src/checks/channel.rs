@@ -3,7 +3,8 @@
 
 use super::{KIB, size};
 use crate::model::{
-    Channel, CheckResult, Download, Node, ProbeOutcome, Snapshot, XhttpFacts,
+    Channel, CheckResult, Download, Node, PathForms, ProbeOutcome, Snapshot,
+    XhttpFacts,
 };
 use crate::topology::Resolver;
 use serde_json::Value;
@@ -286,69 +287,58 @@ pub fn setup_failed(detail: impl Into<String>) -> CheckResult {
     CheckResult::fail("channels setup", detail)
 }
 
-/// Both path forms of an xhttp inbound must answer 400 (path accepted, session
-/// invalid). 404 without the slash is xray #6307: node and client versions skew.
 /// What a live xhttp inbound answers a probe that is not a real client: xray
-/// read the request and refused its contents. Both path forms must give this,
-/// so here it is the healthy status rather than a complaint.
+/// read the request and refused its contents. Every path form clients request
+/// must give this, so here it is the healthy status rather than a complaint.
 const XHTTP_ALIVE: u16 = 400;
 
-/// What a node running xray from before XTLS/Xray-core#6307 answers for the
-/// form without the trailing slash, while the slash form still works.
+/// What the path without the trailing slash gets from a node running xray
+/// from before XTLS/Xray-core#6307, while the slash form still works.
 const XHTTP_STALE_PATH: u16 = 404;
 
-/// The path configured on the inbound that serves `channel`.
-///
-/// xray matches an xhttp request by prefix. With `sessionID` and `seq` left in
-/// the path — the default — it appends a slash to that prefix itself, so an
-/// inbound configured as `/p` answers `404` to a bare `/p` and `400` to `/p/`:
-/// correct, not a fault. An inbound whose configured path already ends in a
-/// slash takes both forms, and a `404` there is the skew of xray #6307.
-fn inbound_xhttp_path<'a>(
-    channel: &Channel,
-    snapshot: &'a Snapshot,
-) -> Option<&'a str> {
-    let profile = snapshot.profiles.get(channel.profile_uuid.as_deref()?)?;
-    profile.config["inbounds"]
-        .as_array()?
-        .iter()
-        .find(|i| {
-            i.get("tag").and_then(Value::as_str) == Some(&channel.inbound_tag)
-        })?
-        .pointer("/streamSettings/xhttpSettings/path")?
-        .as_str()
-}
-
-pub fn xhttp(
-    channel: &Channel,
-    facts: &XhttpFacts,
-    snapshot: &Snapshot,
-) -> CheckResult {
+pub fn xhttp(channel: &Channel, facts: &XhttpFacts) -> CheckResult {
     // The full channel name, not just the remark: a remark template can
     // collapse several hosts onto one name, and two such rows would otherwise
     // be indistinguishable in the report.
     let name = format!("{} / xhttp path", channel.name());
-    let slash_is_part_of_the_prefix = inbound_xhttp_path(channel, snapshot)
-        .is_some_and(|path| !path.ends_with('/'));
+    match channel.xhttp_path_forms() {
+        PathForms::WithSlash => with_slash_only(name, facts),
+        PathForms::WithAndWithoutSlash => with_and_without_slash(name, facts),
+    }
+}
+
+/// Clients request only the path with the trailing slash: what the path
+/// without it answers never reaches them.
+fn with_slash_only(name: String, facts: &XhttpFacts) -> CheckResult {
+    match &facts.with_slash {
+        Ok(XHTTP_ALIVE) => CheckResult::ok(
+            name,
+            format!(
+                "{XHTTP_ALIVE} with the trailing slash, the only path form clients request here"
+            ),
+        ),
+        Ok(status) => CheckResult::fail(
+            name,
+            format!(
+                "{status} with the trailing slash, the only path form clients request here (want {XHTTP_ALIVE})"
+            ),
+        ),
+        Err(e) => CheckResult::fail(name, format!("request failed: {e}")),
+    }
+}
+
+/// Clients on xray 26.7.11+ request the path as written, older ones with the
+/// slash appended: both forms have to reach xray.
+fn with_and_without_slash(name: String, facts: &XhttpFacts) -> CheckResult {
     match (&facts.without_slash, &facts.with_slash) {
         (Ok(XHTTP_ALIVE), Ok(XHTTP_ALIVE)) => CheckResult::ok(
             name,
             format!("both path forms answer {XHTTP_ALIVE}"),
         ),
-        (Ok(XHTTP_STALE_PATH), Ok(XHTTP_ALIVE))
-            if slash_is_part_of_the_prefix =>
-        {
-            CheckResult::ok(
-                name,
-                format!(
-                    "{XHTTP_ALIVE} with the trailing slash; the inbound keeps the session in the path, so xray takes that slash as part of its prefix and {XHTTP_STALE_PATH} without it is expected"
-                ),
-            )
-        }
         (Ok(XHTTP_STALE_PATH), Ok(XHTTP_ALIVE)) => CheckResult::fail(
             name,
             format!(
-                "{XHTTP_STALE_PATH} without the trailing slash, {XHTTP_ALIVE} with it, though the inbound path is a prefix that should take both: xray #6307 (client/node version skew), update xray on the node"
+                "{XHTTP_STALE_PATH} without the trailing slash, {XHTTP_ALIVE} with it, and clients on xray 26.7.11+ request this path without the slash: xray #6307 on a node older than 26.7.11, or an inbound path or a proxy in front of it that takes only the slash form"
             ),
         ),
         (Ok(a), Ok(b)) => CheckResult::fail(
@@ -384,7 +374,9 @@ pub fn required_xray_version(snapshot: &Snapshot) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Profile, Served, Severity, parse_ip};
+    use crate::model::{
+        Placement, Profile, Served, Severity, XhttpPlacements, parse_ip,
+    };
     use rstest::rstest;
     use serde_json::{Value, json};
     use std::collections::HashSet;
@@ -824,49 +816,101 @@ mod tests {
         assert_eq!(target, Target::Answering);
     }
 
-    /// A snapshot whose exit inbound declares an xhttp path.
-    fn snapshot_with_xhttp_path(inbound_path: &str) -> Snapshot {
-        let mut s = snapshot(json!({"protocol": "vless"}));
-        let profile = s.profiles.get_mut("p-exit").unwrap();
-        profile.config["inbounds"][0]["streamSettings"] = json!({
-            "network": "xhttp",
-            "xhttpSettings": {"path": inbound_path, "mode": "auto"}
-        });
-        s
+    fn xhttp_channel(
+        path: &str,
+        session_id: Placement,
+        seq: Placement,
+    ) -> Channel {
+        Channel {
+            remark: "beta direct".into(),
+            address: "beta.example.com".into(),
+            port: 443,
+            path: Some(path.into()),
+            xhttp_placements: XhttpPlacements { session_id, seq },
+            ..Default::default()
+        }
     }
 
-    /// With sessionID and seq in the path — the default — xray appends the
-    /// slash to its own prefix, so the bare form cannot match it and 404 is
-    /// what a healthy inbound answers.
+    /// A path ending in a slash is the only form its clients request: what
+    /// the path without it answers never reaches them, so a 404 from a proxy
+    /// that routes only the slash form is no fault.
+    #[rstest]
+    #[case::not_found_without_the_slash(
+        Ok(404),
+        Ok(400),
+        Severity::Ok,
+        "400 with the trailing slash"
+    )]
+    #[case::landing_page_without_the_slash(
+        Ok(200),
+        Ok(400),
+        Severity::Ok,
+        "400 with the trailing slash"
+    )]
+    #[case::no_answer_without_the_slash(
+        Err("timeout".to_string()),
+        Ok(400),
+        Severity::Ok,
+        "400 with the trailing slash"
+    )]
+    #[case::not_found_with_the_slash(
+        Ok(400),
+        Ok(404),
+        Severity::Fail,
+        "404 with the trailing slash"
+    )]
+    #[case::no_answer_with_the_slash(
+        Ok(404),
+        Err("reset".to_string()),
+        Severity::Fail,
+        "request failed: reset"
+    )]
+    fn a_path_ending_in_a_slash_is_judged_by_its_slash_form_alone(
+        #[case] without_slash: Result<u16, String>,
+        #[case] with_slash: Result<u16, String>,
+        #[case] expected: Severity,
+        #[case] mentions: &str,
+    ) {
+        let channel = xhttp_channel(
+            "/video/download/",
+            Placement::Elsewhere,
+            Placement::Elsewhere,
+        );
+        let facts = XhttpFacts {
+            without_slash,
+            with_slash,
+        };
+
+        let result = xhttp(&channel, &facts);
+
+        assert_eq!(result.severity, expected, "{}", result.detail);
+        assert!(
+            result.detail.contains(mentions),
+            "detail missing '{}': {}",
+            mentions,
+            result.detail
+        );
+    }
+
+    /// With the session ID in the path, the default, every client appends
+    /// the slash itself, and xray takes it as part of its prefix: the 404
+    /// to the path without it is what a healthy inbound answers.
     #[test]
-    fn a_bare_path_404_is_expected_when_the_inbound_path_has_no_slash() {
-        let s = snapshot_with_xhttp_path("/api/v1/vless/de");
+    fn a_bare_path_404_is_no_fault_when_the_session_id_goes_in_the_path() {
+        let channel =
+            xhttp_channel("/api/v1/vless/de", Placement::Path, Placement::Path);
         let facts = XhttpFacts {
             without_slash: Ok(404),
             with_slash: Ok(400),
         };
 
-        let result = xhttp(&s.channels[0], &facts, &s);
+        let result = xhttp(&channel, &facts);
 
         assert_eq!(result.severity, Severity::Ok, "{}", result.detail);
     }
 
-    /// A prefix path ending in a slash accepts both forms, so a 404 there is
-    /// the skew of xray #6307 and breaks clients that omit the slash.
-    #[test]
-    fn a_bare_path_404_is_a_failure_when_the_inbound_path_ends_in_a_slash() {
-        let s = snapshot_with_xhttp_path("/api/v1/traces/");
-        let facts = XhttpFacts {
-            without_slash: Ok(404),
-            with_slash: Ok(400),
-        };
-
-        let result = xhttp(&s.channels[0], &facts, &s);
-
-        assert_eq!(result.severity, Severity::Fail);
-        assert!(result.detail.contains("#6307"), "{}", result.detail);
-    }
-
+    /// Clients of a slashless path with the session ID and seq out of it
+    /// request both forms, and each form has to reach xray.
     #[rstest]
     #[case::healthy(
         Ok(400),
@@ -888,19 +932,23 @@ mod tests {
         Severity::Fail,
         "request failed: reset"
     )]
-    fn xhttp_table(
+    fn both_path_forms_are_judged_when_clients_request_both(
         #[case] without_slash: Result<u16, String>,
         #[case] with_slash: Result<u16, String>,
         #[case] expected: Severity,
         #[case] mentions: &str,
     ) {
-        let s = snapshot(json!({"protocol": "vless"}));
+        let channel = xhttp_channel(
+            "/api/v1/telemetry/ingest",
+            Placement::Elsewhere,
+            Placement::Elsewhere,
+        );
         let facts = XhttpFacts {
             without_slash,
             with_slash,
         };
 
-        let result = xhttp(&s.channels[0], &facts, &s);
+        let result = xhttp(&channel, &facts);
 
         assert_eq!(
             result.name,

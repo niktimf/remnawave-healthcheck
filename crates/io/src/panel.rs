@@ -5,8 +5,8 @@
 use anyhow::{Context, Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
 use remnawave_healthcheck_core::model::{
-    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Profile, Reported, Served,
-    Snapshot, Unserved, UnservedHost,
+    Channel, Endpoint, HTTPS_PORT, HostStats, Node, Placement, Profile,
+    Reported, Served, Snapshot, Unserved, UnservedHost, XhttpPlacements,
 };
 use remnawave_healthcheck_core::topology;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -502,8 +502,8 @@ struct ResolvedDto {
     metadata: MetadataDto,
 }
 
-/// Only the parts the checks need; a transport that carries neither leaves both
-/// absent.
+/// Only the parts the checks need; a transport that carries none of them
+/// leaves them absent.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TransportOptionsDto {
@@ -511,6 +511,42 @@ struct TransportOptionsDto {
     path: Option<String>,
     #[serde(default)]
     host: Option<String>,
+    /// xhttp only: the settings beyond path, host and mode, `null` when
+    /// neither the host nor its inbound sets any. The panel stores it
+    /// unchecked, so it is kept as the JSON it holds.
+    #[serde(default)]
+    extra: Option<Value>,
+}
+
+/// The placements the `extra` of host `remark` gives its clients. xray
+/// refuses to load an outbound whose `extra` is not an object or holds a
+/// placement that is not a string, and the tunnel of that channel reports
+/// it; here either counts as unset and is logged with the host.
+fn xhttp_placements(extra: Option<&Value>, remark: &str) -> XhttpPlacements {
+    if let Some(other) = extra.filter(|extra| !extra.is_object()) {
+        tracing::warn!(
+            host = remark,
+            extra = %other,
+            "xhttp extra: not an object, placements read as unset"
+        );
+    }
+    let read = |key: &str| match extra.and_then(|extra| extra.get(key)) {
+        None | Some(Value::Null) => Placement::from_setting(None),
+        Some(Value::String(setting)) => Placement::from_setting(Some(setting)),
+        Some(other) => {
+            tracing::warn!(
+                host = remark,
+                key,
+                value = %other,
+                "xhttp extra: placement is not a string, read as unset"
+            );
+            Placement::from_setting(None)
+        }
+    };
+    XhttpPlacements {
+        session_id: read("sessionIDPlacement"),
+        seq: read("seqPlacement"),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -630,6 +666,8 @@ fn config_entry(config: &Value) -> Option<RenderedConfig> {
 
 fn channel_of(r: ResolvedDto, served: Served) -> Channel {
     let transport = r.transport_options.unwrap_or_default();
+    let xhttp_placements =
+        xhttp_placements(transport.extra.as_ref(), &r.final_remark);
     let server_name = r
         .security_options
         .and_then(|s| s.server_name)
@@ -646,6 +684,7 @@ fn channel_of(r: ResolvedDto, served: Served) -> Channel {
         port: r.port,
         transport: r.transport,
         path: transport.path.filter(|s| !s.is_empty()),
+        xhttp_placements,
     }
 }
 
@@ -853,6 +892,7 @@ mod tests {
     use super::*;
     use crate::test_util::{client, client_with, envelope, hwid};
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::net::IpAddr;
@@ -1097,6 +1137,90 @@ mod tests {
         let snapshot = sut.snapshot(42).await.unwrap();
 
         assert_eq!(snapshot.channels[0].sni, None);
+    }
+
+    /// Which path forms xhttp clients request depends on where they carry
+    /// the session ID and seq, and a host keeps that in its `extra`. Each
+    /// case sets one of the two, so neither can be read in place of the
+    /// other.
+    #[rstest]
+    #[case::session_id(
+        json!({"sessionIDPlacement": "cookie"}),
+        Placement::Elsewhere,
+        Placement::Path
+    )]
+    #[case::seq(
+        json!({"seqPlacement": "query"}),
+        Placement::Path,
+        Placement::Elsewhere
+    )]
+    #[tokio::test]
+    async fn the_placements_of_an_xhttp_host_come_from_its_extra(
+        #[case] extra: Value,
+        #[case] session_id: Placement,
+        #[case] seq: Placement,
+    ) {
+        let server = MockServer::start().await;
+        let mut raw = raw_body();
+        raw["response"]["resolvedProxyConfigs"][0]["transportOptions"]["extra"] =
+            extra;
+        mount_all_with_raw(&server, rendered_fixture(), raw).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert_eq!(
+            snapshot.channels[0].xhttp_placements,
+            XhttpPlacements { session_id, seq }
+        );
+    }
+
+    /// The panel stores `extra` unchecked. A placement xray cannot read
+    /// breaks only its own channel, whose tunnel fails on the same outbound;
+    /// the rest of the run goes on.
+    #[tokio::test]
+    async fn a_placement_that_is_not_a_string_is_read_as_unset() {
+        let server = MockServer::start().await;
+        let mut raw = raw_body();
+        raw["response"]["resolvedProxyConfigs"][0]["transportOptions"]["extra"] =
+            json!({"sessionIDPlacement": 1, "seqPlacement": "query"});
+        mount_all_with_raw(&server, rendered_fixture(), raw).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert_eq!(
+            snapshot.channels[0].xhttp_placements,
+            XhttpPlacements {
+                session_id: Placement::Path,
+                seq: Placement::Elsewhere,
+            }
+        );
+    }
+
+    /// The panel's editor saves a quoted string as it is, and the panel
+    /// passes any non-empty `extra` on. One that is not an object holds no
+    /// placements, whatever its elements are, and the run goes on.
+    #[rstest]
+    #[case::double_encoded(json!(r#"{"sessionIDPlacement":"cookie"}"#))]
+    #[case::array(json!(["cookie", "query"]))]
+    #[tokio::test]
+    async fn an_extra_that_is_not_an_object_holds_no_placements(
+        #[case] extra: Value,
+    ) {
+        let server = MockServer::start().await;
+        let mut raw = raw_body();
+        raw["response"]["resolvedProxyConfigs"][0]["transportOptions"]["extra"] =
+            extra;
+        mount_all_with_raw(&server, rendered_fixture(), raw).await;
+        let sut = client_with(&server, Some(hwid()));
+
+        let snapshot = sut.snapshot(42).await.unwrap();
+
+        assert_eq!(
+            snapshot.channels[0].xhttp_placements,
+            XhttpPlacements::default()
+        );
     }
 
     /// Reality answers with someone else's certificate, so which security a

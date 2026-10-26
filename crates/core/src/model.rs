@@ -219,6 +219,9 @@ pub struct Channel {
     pub transport: Option<String>,
     /// xhttp/ws path, when the transport has one.
     pub path: Option<String>,
+    /// Where xhttp clients carry the session ID and seq
+    /// (`transportOptions.extra`).
+    pub xhttp_placements: XhttpPlacements,
     /// Security as `/raw` names it (`tls`, `reality`, `none`).
     pub security: Option<String>,
     /// TLS name to present when probing the inbound directly
@@ -317,6 +320,70 @@ impl Channel {
             server_name: self.sni.clone().filter(|name| *name != self.address),
         })
     }
+
+    /// The forms of the xhttp path this channel's clients request. No client
+    /// removes a slash the path ends in, and a channel without a path is
+    /// requested at `/`.
+    pub fn xhttp_path_forms(&self) -> PathForms {
+        let ends_in_slash =
+            self.path.as_deref().is_none_or(|path| path.ends_with('/'));
+        if self.xhttp_placements.appends_slash() || ends_in_slash {
+            PathForms::WithSlash
+        } else {
+            PathForms::WithAndWithoutSlash
+        }
+    }
+}
+
+/// Where an xhttp client carries the session ID or seq. Only the path matters
+/// to the path forms, so a header, a cookie and the query are one variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// After a slash in the path, xray's choice for an unset placement.
+    #[default]
+    Path,
+    Elsewhere,
+}
+
+impl Placement {
+    /// The value naming the path in a `sessionIDPlacement` or `seqPlacement`.
+    const PATH_SETTING: &str = "path";
+
+    /// The placement xray takes from a `sessionIDPlacement` or `seqPlacement`
+    /// value: an unset or empty one is the path.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            None | Some("" | Self::PATH_SETTING) => Self::Path,
+            Some(_) => Self::Elsewhere,
+        }
+    }
+}
+
+/// Where an xhttp client carries the session ID and seq.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct XhttpPlacements {
+    pub session_id: Placement,
+    pub seq: Placement,
+}
+
+impl XhttpPlacements {
+    /// Whether clients from xray 26.7.11 on append the slash to the path
+    /// (XTLS/Xray-core#6307): only when the session ID or seq goes in it.
+    /// Older clients always append it.
+    fn appends_slash(self) -> bool {
+        self.session_id == Placement::Path || self.seq == Placement::Path
+    }
+}
+
+/// The forms of an xhttp path clients request. The probe asks for both; the
+/// answer to a form no client requests reaches no client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathForms {
+    /// Only the path with the trailing slash.
+    WithSlash,
+    /// The path with the trailing slash from clients before xray 26.7.11, the
+    /// path without it from the later ones.
+    WithAndWithoutSlash,
 }
 
 /// A version string, or the reason it is not in hand. The three states are
@@ -681,6 +748,79 @@ mod tests {
         let xhttp = sut.is_xhttp();
 
         assert!(xhttp);
+    }
+
+    fn xhttp_channel(
+        path: Option<&str>,
+        session_id: Placement,
+        seq: Placement,
+    ) -> Channel {
+        Channel {
+            path: path.map(String::from),
+            xhttp_placements: XhttpPlacements { session_id, seq },
+            ..channel()
+        }
+    }
+
+    /// From xray 26.7.11 on a client appends the slash to its path only when
+    /// the session ID or seq goes in the path, and never removes one; older
+    /// clients append it always (XTLS/Xray-core#6307).
+    #[rstest]
+    #[case::both_elsewhere(
+        Some("/api/v1/telemetry/ingest"),
+        Placement::Elsewhere,
+        Placement::Elsewhere,
+        PathForms::WithAndWithoutSlash
+    )]
+    #[case::a_path_ending_in_a_slash(
+        Some("/video/download/"),
+        Placement::Elsewhere,
+        Placement::Elsewhere,
+        PathForms::WithSlash
+    )]
+    #[case::no_path(
+        None,
+        Placement::Elsewhere,
+        Placement::Elsewhere,
+        PathForms::WithSlash
+    )]
+    #[case::session_id_in_the_path(
+        Some("/api/v1/vless/de"),
+        Placement::Path,
+        Placement::Elsewhere,
+        PathForms::WithSlash
+    )]
+    #[case::seq_in_the_path(
+        Some("/api/v1/vless/de"),
+        Placement::Elsewhere,
+        Placement::Path,
+        PathForms::WithSlash
+    )]
+    fn only_a_slashless_path_with_both_elsewhere_is_requested_bare(
+        #[case] path: Option<&str>,
+        #[case] session_id: Placement,
+        #[case] seq: Placement,
+        #[case] expected: PathForms,
+    ) {
+        let sut = xhttp_channel(path, session_id, seq);
+
+        let forms = sut.xhttp_path_forms();
+
+        assert_eq!(forms, expected);
+    }
+
+    #[rstest]
+    #[case::unset(None, Placement::Path)]
+    #[case::empty(Some(""), Placement::Path)]
+    #[case::named(Some("path"), Placement::Path)]
+    #[case::cookie(Some("cookie"), Placement::Elsewhere)]
+    fn xray_takes_an_unset_or_empty_placement_for_the_path(
+        #[case] value: Option<&str>,
+        #[case] expected: Placement,
+    ) {
+        let placement = Placement::from_setting(value);
+
+        assert_eq!(placement, expected);
     }
 
     #[test]
