@@ -82,7 +82,7 @@ pub fn classify(
         ),
         (Some(got), Some(want)) if got == want => {
             let exit = format!("exit {got} ({})", expect.name);
-            downloaded(name, exit, &outcome.download, target)
+            downloaded(name, exit, &outcome.downloads, target)
         }
         (Some(got), Some(want)) => CheckResult::fail(
             name,
@@ -95,39 +95,77 @@ pub fn classify(
 /// 16-20 KB, widened for the window sizes either side.
 const FREEZE: std::ops::RangeInclusive<u64> = 14 * KIB..=34 * KIB;
 
-/// A right exit, with what the download through it showed. A failed download
-/// from a target that answered no channel at all says nothing about this
-/// tunnel; the `download target` row names it instead.
+/// A right exit, with what the downloads through it showed. One download
+/// that went wrong is enough to warn: a path that holds some transfers and
+/// lets the others through is the finding the repeat is there for. A target
+/// that answered no channel at all failed every download, and that says
+/// nothing about this tunnel; the `download target` row names it instead.
 fn downloaded(
     name: String,
     exit: String,
-    download: &Download,
+    downloads: &[Download],
     target: &Target,
 ) -> CheckResult {
-    match download {
-        Download::NotRun => CheckResult::ok(name, exit),
-        Download::Failed(_) if target.is_unreachable() => {
-            CheckResult::ok(name, exit)
+    if target.is_unreachable() {
+        return CheckResult::ok(name, exit);
+    }
+    let attempts = downloads.len();
+    let wrong: Vec<String> = downloads.iter().filter_map(went_wrong).collect();
+    match (attempts, wrong.as_slice()) {
+        (1, [why]) => {
+            CheckResult::warn(name, format!("exit ok, download {why}"))
         }
-        Download::Complete { bytes, elapsed } => CheckResult::ok(
+        (_, [_, ..]) => CheckResult::warn(
             name,
             format!(
-                "{exit}, {} in {:.1} s",
-                size(*bytes),
-                elapsed.as_secs_f64()
+                "exit ok, {} of {attempts} downloads went wrong: {}",
+                wrong.len(),
+                wrong.join("; ")
             ),
         ),
-        Download::Stalled { bytes, of, .. } => CheckResult::warn(
-            name,
-            format!("exit ok, download stalled at {}", progress(*bytes, *of)),
-        ),
-        Download::TimedOut { bytes, of } => CheckResult::warn(
-            name,
-            format!("exit ok, download timed out at {}", progress(*bytes, *of)),
-        ),
-        Download::Failed(why) => {
-            CheckResult::warn(name, format!("exit ok, download failed: {why}"))
+        (_, []) => completed(name, exit, downloads),
+    }
+}
+
+/// Every download completed: how big they were and how long the slowest
+/// one took.
+fn completed(
+    name: String,
+    exit: String,
+    downloads: &[Download],
+) -> CheckResult {
+    let slowest = downloads
+        .iter()
+        .filter_map(|download| match download {
+            Download::Complete { bytes, elapsed } => Some((*bytes, *elapsed)),
+            _ => None,
+        })
+        .max_by_key(|&(_, elapsed)| elapsed);
+    let detail = match (downloads.len(), slowest) {
+        (_, None) => exit,
+        (1, Some((bytes, elapsed))) => {
+            format!("{exit}, {} in {:.1} s", size(bytes), elapsed.as_secs_f64())
         }
+        (attempts, Some((bytes, elapsed))) => format!(
+            "{exit}, {attempts} downloads of {}, slowest {:.1} s",
+            size(bytes),
+            elapsed.as_secs_f64()
+        ),
+    };
+    CheckResult::ok(name, detail)
+}
+
+/// What went wrong with one download, or `None` when it completed.
+fn went_wrong(download: &Download) -> Option<String> {
+    match download {
+        Download::Complete { .. } => None,
+        Download::Stalled { bytes, of, .. } => {
+            Some(format!("stalled at {}", progress(*bytes, *of)))
+        }
+        Download::TimedOut { bytes, of } => {
+            Some(format!("timed out at {}", progress(*bytes, *of)))
+        }
+        Download::Failed(why) => Some(format!("failed: {why}")),
     }
 }
 
@@ -156,8 +194,8 @@ pub enum Target {
 }
 
 impl Target {
-    /// From the downloads of the channels whose exit was right. No download
-    /// at all is no evidence against the target.
+    /// From every download attempt of the channels whose exit was right. No
+    /// download at all is no evidence against the target.
     pub fn of<'a>(downloads: impl IntoIterator<Item = &'a Download>) -> Self {
         let mut first = None;
         for download in downloads {
@@ -641,7 +679,7 @@ mod tests {
         let outcome = ProbeOutcome {
             exit_ip: got.and_then(parse_ip),
             stderr_tail: stderr.into(),
-            download: Download::NotRun,
+            downloads: Vec::new(),
         };
 
         let result = classify(
@@ -659,12 +697,12 @@ mod tests {
 
     const MIB: u64 = 1_048_576;
 
-    fn right_exit(download: Download, target: &Target) -> CheckResult {
+    fn right_exit(downloads: Vec<Download>, target: &Target) -> CheckResult {
         let s = snapshot(json!({"protocol": "vless"}));
         let outcome = ProbeOutcome {
             exit_ip: parse_ip("192.0.2.20"),
             stderr_tail: String::new(),
-            download,
+            downloads,
         };
         classify(
             &s.channels[0],
@@ -681,7 +719,6 @@ mod tests {
         Severity::Ok,
         "exit 192.0.2.20 (beta), 1.0 MB in 2.4 s"
     )]
-    #[case::not_run(Download::NotRun, Severity::Ok, "exit 192.0.2.20 (beta)")]
     #[case::stalled_at_the_freeze(
         Download::Stalled { bytes: 17 * 1024, of: Some(MIB), after: Duration::from_secs(10) },
         Severity::Warn,
@@ -707,16 +744,98 @@ mod tests {
         Severity::Warn,
         "exit ok, download failed: HTTP 503"
     )]
-    fn a_right_exit_is_judged_by_its_download(
+    fn a_right_exit_is_judged_by_its_one_download(
         #[case] download: Download,
         #[case] expected: Severity,
         #[case] detail: &str,
     ) {
-        let result = right_exit(download, &Target::Answering);
+        let result = right_exit(vec![download], &Target::Answering);
 
         assert_eq!(
             (result.severity, result.detail.as_str()),
             (expected, detail)
+        );
+    }
+
+    #[test]
+    fn a_right_exit_without_a_download_is_ok_on_its_exit_alone() {
+        let result = right_exit(Vec::new(), &Target::Answering);
+
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (Severity::Ok, "exit 192.0.2.20 (beta)")
+        );
+    }
+
+    fn complete_in(millis: u64) -> Download {
+        Download::Complete {
+            bytes: MIB,
+            elapsed: Duration::from_millis(millis),
+        }
+    }
+
+    fn stalled_at(bytes: u64) -> Download {
+        Download::Stalled {
+            bytes,
+            of: Some(MIB),
+            after: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn downloads_that_all_completed_name_the_slowest() {
+        let downloads =
+            vec![complete_in(1200), complete_in(3100), complete_in(1800)];
+
+        let result = right_exit(downloads, &Target::Answering);
+
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (
+                Severity::Ok,
+                "exit 192.0.2.20 (beta), 3 downloads of 1.0 MB, slowest 3.1 s"
+            )
+        );
+    }
+
+    /// The finding this repeat exists for: a path that holds the tail of
+    /// some transfers and lets the others through warns in every run, not
+    /// in every other one.
+    #[test]
+    fn one_download_of_three_going_wrong_warns_with_the_count() {
+        let downloads = vec![
+            complete_in(1200),
+            stalled_at(1011 * 1024),
+            complete_in(1800),
+        ];
+
+        let result = right_exit(downloads, &Target::Answering);
+
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (
+                Severity::Warn,
+                "exit ok, 1 of 3 downloads went wrong: stalled at 1011 KB of 1.0 MB"
+            )
+        );
+    }
+
+    #[test]
+    fn every_download_that_went_wrong_is_named_in_order() {
+        let downloads = vec![
+            Download::Failed("no answer within 10s".into()),
+            complete_in(1800),
+            stalled_at(17 * 1024),
+        ];
+
+        let result = right_exit(downloads, &Target::Answering);
+
+        assert_eq!(
+            (result.severity, result.detail.as_str()),
+            (
+                Severity::Warn,
+                "exit ok, 2 of 3 downloads went wrong: failed: no answer within 10s; stalled at 17 KB of 1.0 MB (matches the 16-20 KB freeze)"
+            )
         );
     }
 
@@ -726,7 +845,13 @@ mod tests {
             first: "HTTP 503".into(),
         };
 
-        let result = right_exit(Download::Failed("HTTP 503".into()), &target);
+        let result = right_exit(
+            vec![
+                Download::Failed("HTTP 503".into()),
+                Download::Failed("HTTP 503".into()),
+            ],
+            &target,
+        );
 
         assert_eq!(
             (result.severity, result.detail.as_str()),
@@ -742,11 +867,11 @@ mod tests {
         let outcome = ProbeOutcome {
             exit_ip: parse_ip("203.0.113.7"),
             stderr_tail: String::new(),
-            download: Download::Stalled {
+            downloads: vec![Download::Stalled {
                 bytes: 17 * 1024,
                 of: None,
                 after: Duration::from_secs(10),
-            },
+            }],
         };
 
         let result = classify(
@@ -811,7 +936,7 @@ mod tests {
 
     #[test]
     fn no_download_at_all_is_no_evidence_against_the_target() {
-        let target = Target::of(&[Download::NotRun]);
+        let target = Target::of(&[] as &[Download]);
 
         assert_eq!(target, Target::Answering);
     }

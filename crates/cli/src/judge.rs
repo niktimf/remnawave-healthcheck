@@ -228,14 +228,14 @@ fn download_target(
     let ProbeStage::Done(list) = probes else {
         return Target::Answering;
     };
-    Target::of(list.iter().filter_map(|(_, result)| match result {
+    Target::of(list.iter().flat_map(|(_, result)| match result {
         ProbeResult::Probed { expect, outcome }
             if outcome.exit_ip.is_some()
                 && outcome.exit_ip == egress.get(expect.as_str()).copied() =>
         {
-            Some(&outcome.download)
+            outcome.downloads.as_slice()
         }
-        ProbeResult::Probed { .. } | ProbeResult::Decided(_) => None,
+        ProbeResult::Probed { .. } | ProbeResult::Decided(_) => &[],
     }))
 }
 
@@ -322,7 +322,7 @@ mod tests {
                 outcome: ProbeOutcome {
                     exit_ip: parse_ip(exit),
                     stderr_tail: String::new(),
-                    download: Download::NotRun,
+                    downloads: Vec::new(),
                 },
             },
         )])
@@ -618,21 +618,21 @@ mod tests {
         assert_eq!(Report::of(&results).outcome(), Outcome::Ok);
     }
 
-    /// Two channels out at the right exit, each with its own download.
+    /// Two channels out at the right exit, each with its own downloads.
     fn two_downloads(
-        first: Download,
-        second: Download,
+        first: Vec<Download>,
+        second: Vec<Download>,
     ) -> (Snapshot, Collected) {
         let mut s = snapshot();
         let mut second_channel = s.channels[0].clone();
         second_channel.remark = "beta backup".into();
         s.channels.push(second_channel);
-        let probed = |download| ProbeResult::Probed {
+        let probed = |downloads| ProbeResult::Probed {
             expect: "beta".into(),
             outcome: ProbeOutcome {
                 exit_ip: parse_ip("192.0.2.20"),
                 stderr_tail: String::new(),
-                download,
+                downloads,
             },
         };
         let collected = Collected {
@@ -656,8 +656,8 @@ mod tests {
     #[test]
     fn a_target_no_channel_could_download_is_one_row() {
         let (s, collected) = two_downloads(
-            Download::Failed("HTTP 503".into()),
-            Download::Failed("HTTP 503".into()),
+            vec![Download::Failed("HTTP 503".into())],
+            vec![Download::Failed("HTTP 503".into())],
         );
         let sut = judge();
 
@@ -684,11 +684,11 @@ mod tests {
     fn a_target_that_answered_some_channels_leaves_the_failure_on_its_channel()
     {
         let (s, collected) = two_downloads(
-            Download::Complete {
+            vec![Download::Complete {
                 bytes: 1_048_576,
                 elapsed: std::time::Duration::from_secs(2),
-            },
-            Download::Failed("connection reset".into()),
+            }],
+            vec![Download::Failed("connection reset".into())],
         );
         let sut = judge();
 
@@ -703,13 +703,40 @@ mod tests {
         );
     }
 
+    /// Any one download that got through, even a later attempt of a channel
+    /// whose first one failed, is proof the target answers.
+    #[test]
+    fn a_target_that_answered_a_later_attempt_is_answering() {
+        let (s, collected) = two_downloads(
+            vec![
+                Download::Failed("HTTP 503".into()),
+                Download::Complete {
+                    bytes: 1_048_576,
+                    elapsed: std::time::Duration::from_secs(2),
+                },
+            ],
+            vec![Download::Failed("HTTP 503".into())],
+        );
+        let sut = judge();
+
+        let results = sut.verdicts(&s, Utc::now(), collected);
+
+        assert!(results.iter().all(|r| r.name != "download target"));
+        let failed =
+            by_name(&results, "channel beta backup (beta.example.com:443)");
+        assert_eq!(
+            (failed.severity, failed.detail.as_str()),
+            (Severity::Warn, "exit ok, download failed: HTTP 503")
+        );
+    }
+
     /// A channel that came out at the wrong exit says nothing about the
     /// target: only a channel at the right exit could have reached it.
     #[test]
     fn a_failed_download_behind_a_wrong_exit_does_not_condemn_the_target() {
         let (s, mut collected) = two_downloads(
-            Download::Failed("HTTP 503".into()),
-            Download::Failed("HTTP 503".into()),
+            vec![Download::Failed("HTTP 503".into())],
+            vec![Download::Failed("HTTP 503".into())],
         );
         let ProbeStage::Done(list) = &mut collected.probes else {
             unreachable!()

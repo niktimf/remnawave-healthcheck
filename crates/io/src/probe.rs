@@ -9,6 +9,7 @@ use remnawave_healthcheck_core::model::{Download, ProbeOutcome, parse_ip};
 use reqwest::Url;
 use serde_json::{Value, json};
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -110,20 +111,24 @@ fn free_port() -> std::io::Result<u16> {
 /// silence long before the total bound runs out.
 pub const DOWNLOAD_SILENCE: Duration = Duration::from_secs(10);
 
-/// What to download through a tunnel once it is shown to come out, and the
-/// bounds on that download.
+/// What to download through a tunnel once it is shown to come out, the
+/// bounds on each download, and how many to run.
 #[derive(Debug, Clone)]
 pub struct DownloadTarget {
     pub url: Url,
-    /// The whole download.
+    /// One whole download.
     pub total: Duration,
     /// The longest wait for the next byte.
     pub silence: Duration,
+    /// Downloads per tunnel, one after another. A CDN edge that holds the
+    /// tail of some responses lets the others through, so a single
+    /// download warns in one run and passes in the next.
+    pub attempts: NonZeroUsize,
 }
 
 /// Run Xray with the outbound, ask the echo endpoint through the local SOCKS
-/// port, download `download` when the echo answered, kill Xray. Nothing is
-/// left running or on disk when this returns.
+/// port, download `download` as many times as it says when the echo
+/// answered, kill Xray. Nothing is left running or on disk when this returns.
 pub async fn probe(
     xray_bin: &Path,
     outbound: &Value,
@@ -137,7 +142,7 @@ pub async fn probe(
         Err(reason) => ProbeOutcome {
             exit_ip: None,
             stderr_tail: reason,
-            download: Download::NotRun,
+            downloads: Vec::new(),
         },
     }
 }
@@ -153,6 +158,9 @@ async fn attempt(
     let xray = Xray::start_in(scratch_base, xray_bin, outbound)?;
     let client = socks_client(xray.port(), Duration::from_secs(8))
         .map_err(|e| format!("socks client: {e}"))?;
+    let downloader = socks_proxy(xray.port())
+        .and_then(|proxy| unpooled().proxy(proxy).build())
+        .map_err(|e| format!("socks client: {e}"))?;
 
     let deadline = Instant::now() + timeout;
     let mut exit_ip = None;
@@ -164,9 +172,9 @@ async fn attempt(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     // Only a tunnel that came out has a path worth timing.
-    let download = match (exit_ip, download) {
-        (Some(_), Some(target)) => fetch(&client, target).await,
-        _ => Download::NotRun,
+    let downloads = match (exit_ip, download) {
+        (Some(_), Some(target)) => fetch_each(&downloader, target).await,
+        _ => Vec::new(),
     };
     let stderr = xray.stop().await;
     let mut stderr_tail = String::new();
@@ -177,8 +185,29 @@ async fn attempt(
     Ok(ProbeOutcome {
         exit_ip,
         stderr_tail,
-        download,
+        downloads,
     })
+}
+
+/// Every attempt `target` asks for, one after another. Run in turn rather
+/// than at once: they time the path, and parallel ones would share it. The
+/// client must open a connection per request (`unpooled`): through Xray a
+/// connection is a tunnel session, and the repeat is there to try new ones.
+pub(crate) async fn fetch_each(
+    client: &reqwest::Client,
+    target: &DownloadTarget,
+) -> Vec<Download> {
+    let mut downloads = Vec::with_capacity(target.attempts.get());
+    for _ in 0..target.attempts.get() {
+        downloads.push(fetch(client, target).await);
+    }
+    downloads
+}
+
+/// A client that keeps no connection after its response, so every request
+/// opens one of its own.
+fn unpooled() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().pool_max_idle_per_host(0)
 }
 
 /// Read `target` to the end, counting bytes. Stops at the first `silence`
@@ -378,6 +407,8 @@ pub(crate) fn tail(text: &str, lines: usize, chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn the_outbound_is_used_verbatim_behind_a_local_socks_inbound() {
@@ -451,10 +482,68 @@ mod tests {
             url,
             total,
             silence,
+            attempts: NonZeroUsize::MIN,
         }
     }
 
     const MIB: usize = 1_048_576;
+
+    /// A keep-alive server: it answers one request on each connection it
+    /// accepts and then holds the connection open without reading it, so a
+    /// second request sent down a used connection never gets an answer.
+    /// Counts the connections it accepted.
+    async fn serve_once_per_connection(body: usize) -> (Url, Arc<AtomicUsize>) {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(answer_and_hold(socket, body));
+            }
+        });
+        (url.parse().unwrap(), accepted)
+    }
+
+    async fn answer_and_hold(
+        mut socket: tokio::net::TcpStream,
+        body: usize,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await?;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body}\r\n\r\n");
+        socket.write_all(head.as_bytes()).await?;
+        socket.write_all(&vec![0; body]).await?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    /// A repeat down a used connection would ride the tunnel session of the
+    /// attempt before it, and a path that holds only some sessions would
+    /// look the same every time.
+    #[tokio::test]
+    async fn every_attempt_downloads_on_a_connection_of_its_own() {
+        let (url, accepted) = serve_once_per_connection(64 * 1024).await;
+        let sut = DownloadTarget {
+            attempts: NonZeroUsize::new(3).unwrap(),
+            ..target(url, Duration::from_secs(5), Duration::from_millis(500))
+        };
+        let client = unpooled().build().unwrap();
+
+        let downloads = fetch_each(&client, &sut).await;
+
+        assert_eq!(downloads.len(), 3, "{downloads:?}");
+        for download in &downloads {
+            assert!(
+                matches!(download, Download::Complete { bytes: 65_536, .. }),
+                "{downloads:?}"
+            );
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    }
 
     #[tokio::test]
     async fn a_file_read_to_its_length_is_complete() {

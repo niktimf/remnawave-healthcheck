@@ -507,22 +507,21 @@ pub struct TlsFacts {
 }
 
 /// Where a tunnel's traffic came out, plus xray's complaint when it did not,
-/// and how a download through it went.
+/// and how the downloads through it went.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeOutcome {
     pub exit_ip: Option<IpAddr>,
     pub stderr_tail: String,
-    pub download: Download,
+    /// One per attempt, in the order they ran. Empty when no exit came out
+    /// or with `--no-download`.
+    pub downloads: Vec<Download>,
 }
 
 /// A download through a tunnel that came out somewhere. The echo answer is
 /// a few dozen bytes; this is what shows a path that freezes or throttles a
 /// transfer after its first packets.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Download {
-    /// No exit came out, or `--no-download`.
-    #[default]
-    NotRun,
     Complete {
         bytes: u64,
         elapsed: Duration,

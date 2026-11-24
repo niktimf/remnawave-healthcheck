@@ -11,6 +11,7 @@ use remnawave_healthcheck_core::checks::usage::{DropRatio, UsageChecker};
 use remnawave_healthcheck_core::checks::youtube::ExpectedYoutube;
 use remnawave_healthcheck_io::probe::{DOWNLOAD_SILENCE, DownloadTarget};
 use remnawave_healthcheck_io::{Hwid, SshConfig};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -92,6 +93,10 @@ pub struct Args {
     /// Bound on each whole download; one with no byte for 10 s stops sooner
     #[arg(long, env = "REMNAWAVE_DOWNLOAD_TIMEOUT_SECS", default_value_t = 30)]
     pub download_timeout_secs: u64,
+    /// Downloads through each tunnel, one after another, each on a
+    /// connection of its own; one that goes wrong warns
+    #[arg(long, env = "REMNAWAVE_DOWNLOAD_ATTEMPTS", default_value = "3")]
+    pub download_attempts: NonZeroUsize,
     /// Container the node's Xray runs in
     #[arg(long, env = "REMNAWAVE_NODE_CONTAINER", default_value = "remnanode")]
     pub node_container: String,
@@ -337,6 +342,7 @@ fn download(args: &Args, url: &reqwest::Url) -> Option<DownloadTarget> {
         url: url.clone(),
         total: Duration::from_secs(args.download_timeout_secs),
         silence: DOWNLOAD_SILENCE,
+        attempts: args.download_attempts,
     })
 }
 
@@ -467,15 +473,20 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_run_downloads_a_megabyte_within_thirty_seconds() {
+    fn a_bare_run_downloads_a_megabyte_three_times_within_thirty_seconds_each()
+    {
         let args = args(&[]);
 
         let config = Config::from_args(args).unwrap();
 
         let download = config.download.unwrap();
         assert_eq!(
-            (download.url.as_str(), download.total.as_secs()),
-            ("https://speed.cloudflare.com/__down?bytes=1048576", 30)
+            (
+                download.url.as_str(),
+                download.total.as_secs(),
+                download.attempts.get()
+            ),
+            ("https://speed.cloudflare.com/__down?bytes=1048576", 30, 3)
         );
     }
 
